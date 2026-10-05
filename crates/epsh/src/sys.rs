@@ -144,9 +144,7 @@ pub fn getuid() -> u32 {
 
 /// Set the process file-mode creation mask. Returns the previous mask.
 pub fn umask(mask: u32) -> u32 {
-    rustix::process::umask(Mode::from_bits_retain(mask as _))
-        .bits()
-        .into()
+    rustix::process::umask(Mode::from_bits_retain(mask as _)).bits()
 }
 
 /// Exit the process, flushing Rust's stdout first.

@@ -198,6 +198,8 @@ These live in the interactive shell layer, not in epsh:
 Run these commands from the workspace root. The epsh crate lives in `crates/epsh`.
 
 ```sh
+make ci                      # fail-fast format, lint, build, tests, conformance
+sh scripts/test-local-ci.sh   # build tooling regression tests with stubbed commands
 cargo test --workspace
 cargo test -p epsh --test api_stability # API surface regression tests
 cargo test -p epsh --test embedding     # embedding API tests (43)
@@ -206,3 +208,5 @@ cargo build && perl check.pl \
   -p ./target/debug/epsh \
   -s check-epsh.t              # mksh conformance
 ```
+
+The CI target stops at the first failure; it does not skip known test failures.

@@ -3,7 +3,25 @@
 set -e
 
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-EPSH="${1:-$DIR/../../../../target/debug/epsh}"
+if [ -n "${1:-}" ]; then
+    EPSH="$1"
+elif [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    EPSH="$CARGO_TARGET_DIR/debug/epsh"
+else
+    ROOT=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) || ROOT=
+    if [ -z "$ROOT" ] || ! grep -q '^\[workspace\]' "$ROOT/Cargo.toml" 2>/dev/null; then
+        ROOT="$DIR"
+        while ! grep -q '^\[workspace\]' "$ROOT/Cargo.toml" 2>/dev/null; do
+            PARENT=$(dirname "$ROOT")
+            if [ "$PARENT" = "$ROOT" ]; then
+                echo "Cannot locate the Cargo workspace root; set CARGO_TARGET_DIR or pass a binary." >&2
+                exit 1
+            fi
+            ROOT="$PARENT"
+        done
+    fi
+    EPSH="$ROOT/target/debug/epsh"
+fi
 DASH="${2:-dash}"
 
 printf "%-25s %10s %10s %8s\n" "TEST" "EPSH" "DASH" "RATIO"

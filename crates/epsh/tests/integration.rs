@@ -2096,7 +2096,7 @@ mod raw_bytes {
     }
 }
 
-// Multiple jobs use separate lines to isolate wait from same-line ampersand parsing.
+// Retain newline-separated wait coverage alongside the same-line asynchronous_lists tests.
 mod wait_jobs {
     use super::*;
 
@@ -2168,6 +2168,88 @@ mod wait_jobs {
         assert_output(
             "(exit 5) &\nparent=$!\n{ (exit 9) & wait $!; exit $?; } &\nnested=$!; wait $nested; echo $?; wait $parent; echo $?",
             "9\n5\n",
+        );
+    }
+}
+
+mod asynchronous_lists {
+    use super::*;
+
+    fn run(script: &str) -> (String, String, i32) {
+        let output = epsh()
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args(["-c", script])
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+            output.status.code().unwrap_or(128),
+        )
+    }
+
+    fn assert_output(script: &str, expected: &str) {
+        let (stdout, stderr, code) = run(script);
+        assert_eq!(stdout, expected, "script: {script:?}");
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+
+    #[test]
+    fn two_sleep_jobs_finish() {
+        assert_output("sleep 0.1 & sleep 0.1 & wait; echo done", "done\n");
+    }
+
+    #[test]
+    fn assignments_before_background_jobs_stay_in_parent() {
+        assert_output(
+            "a=parent_a; b=parent_b; a=1 & b=2 & wait; printf '%s %s\\n' \"$a\" \"$b\"",
+            "parent_a parent_b\n",
+        );
+    }
+
+    #[test]
+    fn distinct_pids_and_individual_statuses_on_one_line() {
+        let (stdout, stderr, code) = run(
+            "(exit 7) & first=$!; (exit 9) & second=$!; printf '%s %s\\n' \"$first\" \"$second\"; wait $first; echo $?; wait $second; echo $?",
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        let mut lines = stdout.lines();
+        let pids: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(
+            pids.len(),
+            2,
+            "two parent-visible PIDs expected: {stdout:?}"
+        );
+        let first: u32 = pids[0].parse().unwrap();
+        let second: u32 = pids[1].parse().unwrap();
+        assert!(first > 0 && second > 0);
+        assert_ne!(first, second);
+        assert_eq!(lines.collect::<Vec<_>>(), ["7", "9"]);
+    }
+
+    #[test]
+    fn both_background_echoes_produce_output() {
+        let (stdout, stderr, code) = run("echo a & echo b & wait");
+        assert_eq!(code, 0, "{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        let mut lines: Vec<_> = stdout.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["a", "b"]);
+    }
+
+    #[test]
+    fn and_or_list_is_backgrounded_without_previous_assignment() {
+        assert_output("x=parent; false || x=child & wait; echo $x", "parent\n");
+    }
+
+    #[test]
+    fn compound_newlines_keep_foreground_state() {
+        assert_output(
+            "{ a=parent_a\nb=parent_b\na=1 &\nb=2 &\nwait\nprintf '%s %s\\n' \"$a\" \"$b\"; }",
+            "parent_a parent_b\n",
         );
     }
 }

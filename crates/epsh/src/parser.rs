@@ -223,7 +223,9 @@ impl Parser {
     }
 
     fn parse_command_list(&mut self, allow_newline_sep: bool) -> Result<Command, ShellError> {
-        let mut cmd = self.parse_and_or()?;
+        // Keep prior list items separate so `&` applies only to this AND-OR list.
+        let mut prior: Option<Command> = None;
+        let mut current = self.parse_and_or()?;
 
         loop {
             let (tok, _span) = self.peek()?;
@@ -231,11 +233,6 @@ impl Parser {
                 Token::Semi => {
                     self.next()?;
                     self.skip_newlines()?;
-                    let (next_tok, _) = self.peek()?;
-                    if is_command_start(&next_tok) {
-                        let right = self.parse_and_or()?;
-                        cmd = Command::Sequence(Box::new(cmd), Box::new(right));
-                    }
                 }
                 Token::Newline if allow_newline_sep => {
                     self.next()?;
@@ -250,32 +247,33 @@ impl Parser {
                         }
                     }
                     self.skip_newlines()?;
-                    let (next_tok, _) = self.peek()?;
-                    if is_command_start(&next_tok) {
-                        let right = self.parse_and_or()?;
-                        cmd = Command::Sequence(Box::new(cmd), Box::new(right));
-                    }
                 }
                 Token::Amp => {
                     self.next()?;
-                    cmd = Command::Background {
-                        cmd: Box::new(cmd),
+                    current = Command::Background {
+                        cmd: Box::new(current),
                         redirs: Vec::new(),
                     };
                     if allow_newline_sep {
                         self.skip_newlines()?;
                     }
-                    let (next_tok, _) = self.peek()?;
-                    if is_command_start(&next_tok) {
-                        let right = self.parse_and_or()?;
-                        cmd = Command::Sequence(Box::new(cmd), Box::new(right));
-                    }
                 }
                 _ => break,
             }
+            let (next_tok, _) = self.peek()?;
+            if is_command_start(&next_tok) {
+                prior = Some(match prior {
+                    Some(left) => Command::Sequence(Box::new(left), Box::new(current)),
+                    None => current,
+                });
+                current = self.parse_and_or()?;
+            }
         }
 
-        Ok(cmd)
+        Ok(match prior {
+            Some(left) => Command::Sequence(Box::new(left), Box::new(current)),
+            None => current,
+        })
     }
 
     /// and_or = pipeline { ('&&' | '||') linebreak pipeline }
@@ -1787,6 +1785,22 @@ mod tests {
             Command::Background { .. } => {}
             other => panic!("expected Background, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn background_separators_wrap_only_current_and_or() {
+        let program = parse("a; b && c & d &");
+        let Command::Sequence(prior, last) = &program.commands[0] else {
+            panic!("expected a sequential list: {:?}", program.commands[0]);
+        };
+        assert!(matches!(last.as_ref(), Command::Background { cmd, .. }
+            if matches!(cmd.as_ref(), Command::Simple { .. })));
+        let Command::Sequence(first, middle) = prior.as_ref() else {
+            panic!("expected prior foreground and background items: {prior:?}");
+        };
+        assert!(matches!(first.as_ref(), Command::Simple { .. }));
+        assert!(matches!(middle.as_ref(), Command::Background { cmd, .. }
+            if matches!(cmd.as_ref(), Command::And(_, _))));
     }
 
     #[test]

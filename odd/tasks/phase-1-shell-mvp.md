@@ -45,7 +45,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - `crates/epsh/src/builtins.rs` `builtin_wait` uses `waitpid(-1)` and ignores its arguments.
   - Track background child PIDs in the shell; `wait` waits for those only; support `wait <pid>` with POSIX exit status.
   - Accept: RED test where a host child survives `wait`; GREEN; api_stability unchanged.
-- [ ] **T1b — Parser: several `&` lists on one line** (route: delegated → `codex-impl`; found during T1)
+- [x] **T1b — Parser: several `&` lists on one line** (route: delegated → `codex-impl`; found during T1)
   - `crates/epsh/src/parser.rs:261-271` mishandles `a & b &` on the same line; also `sys.rs:103-108` maps negative PIDs incorrectly.
   - Accept: RED integration tests for `sleep 0.1 & sleep 0.1 & wait; echo done` and two `$!` values; GREEN.
 - [x] **T2 — `crates/shell` skeleton + minimal REPL** (route: delegated → `codex-impl`)
@@ -76,5 +76,10 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T2 (`dc389bc` epsh: `epsh::cli` shared dispatch + `Shell::eval_repl_line`/`finish_repl`; `05d551a` so1sh crate): REPL with PS1, state persists, `exit n`/EOF statuses; 12 PTY + 5 CLI tests (rexpect 0.7.1, MIT/Apache-2.0, dev-only). Workspace 473 green (orchestrator spot-check).
   Native review: high risk, user granted, approved, acknowledged. WARNINGs -> T2b (errors end the REPL); SIGINT kills the shell -> T4. Suggestions: hardcoded prefix `cli.rs:19`, API surface addition not covered by api_stability.
 
+- T1b (`24b23f7`): parser wrapped the whole accumulated sequential list in `Background` on `&` (`x=1; cmd &` ran `x=1` in a subshell); now `&` binds to the current AND-OR list only. Compared with dash (6 scripts). Workspace 480 green (orchestrator spot-check). `sys.rs` negative-PID mapping unreachable (crate-private, positive callers only) -> left unchanged.
+  Native review: high risk, user granted, approved, acknowledged; 4 suggestions only.
+
 ## Progress / Next step
-- Next: T1b running on `codex-impl`; then T2b, T3.
+- PAUSED by the user on 2026-10-05 after T1b. Both agents told to stand by.
+- Resume with: T2b (interactive shell survives errors) on `codex-impl`, then T3, T4, T5, T6.
+- Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

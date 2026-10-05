@@ -16,6 +16,89 @@ fn parse(src: &str) -> Program {
     Parser::new(src).parse().unwrap()
 }
 
+// Tests that change FDs or reap arbitrary children need a private process.
+fn isolated_test(name: &str) -> bool {
+    if std::env::var("EPSH_EMBEDDING_CHILD").as_deref() == Ok(name) {
+        return false;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("EPSH_EMBEDDING_CHILD", name)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{name}: {out:?}");
+    true
+}
+
+mod hermeticity {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn fd_tests_preserve_host_descriptors() {
+        if isolated_test("hermeticity::fd_tests_preserve_host_descriptors") {
+            return;
+        }
+        let marker = fs::File::open("/dev/null").unwrap();
+        // SAFETY: this test is alone in its child process; fd 50 is private.
+        assert_eq!(unsafe { libc::dup2(marker.as_raw_fd(), 50) }, 50);
+        super::redirection_failures::failed_redirection_restores_earlier_descriptors();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: stat points to writable storage; an absent fd reports EBADF.
+        let result = unsafe { libc::fstat(50, stat.as_mut_ptr()) };
+        // SAFETY: close reports EBADF if the baseline test closed fd 50.
+        unsafe { libc::close(50) };
+        assert_eq!(result, 0, "FD test closed another test's descriptor");
+    }
+
+    #[test]
+    fn builtin_probe_preserves_host_children() {
+        if isolated_test("hermeticity::builtin_probe_preserves_host_children") {
+            return;
+        }
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        super::builtin_list::builtin_names_matches_try_builtin();
+        let waited = child.wait();
+        // stdout remains visible even if a broken probe leaves stderr redirected.
+        println!("host child wait result: {waited:?}");
+        assert_eq!(
+            waited
+                .expect("builtin probe reaped another test's child")
+                .code(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn output_sinks_ignore_ambient_path() {
+        let dir = tempdir().unwrap();
+        let impostor = dir.path().join("nonexistent_cmd_xyz");
+        fs::write(&impostor, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&impostor, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in [
+            "output_sinks::capture_stderr",
+            "output_sinks::separate_stdout_stderr",
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("PATH", dir.path())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "ambient PATH affected {name}: {out:?}"
+            );
+        }
+    }
+}
+
 mod builder {
     use super::*;
 
@@ -210,8 +293,10 @@ mod output_sinks {
 
     #[test]
     fn capture_stderr() {
+        let dir = tempdir().unwrap();
         let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder().stderr_sink(stderr.clone()).build();
+        shell.set_var("PATH", dir.path().to_str().unwrap()).unwrap();
         // Shell error messages go through write_err → stderr_sink
         shell.run_program(&parse("nonexistent_cmd_xyz"));
         let err = String::from_utf8_lossy(&stderr.lock().unwrap()).to_string();
@@ -229,12 +314,14 @@ mod output_sinks {
 
     #[test]
     fn separate_stdout_stderr() {
+        let dir = tempdir().unwrap();
         let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
         let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder()
             .stdout_sink(stdout.clone())
             .stderr_sink(stderr.clone())
             .build();
+        shell.set_var("PATH", dir.path().to_str().unwrap()).unwrap();
         // echo goes to stdout_sink, error message goes to stderr_sink
         shell.run_program(&parse("echo out; nonexistent_cmd_xyz"));
         assert_eq!(
@@ -382,7 +469,10 @@ mod builtin_list {
     }
 
     #[test]
-    fn builtin_names_matches_try_builtin() {
+    pub(super) fn builtin_names_matches_try_builtin() {
+        if isolated_test("builtin_list::builtin_names_matches_try_builtin") {
+            return;
+        }
         // Every name in BUILTIN_NAMES should be recognized by try_builtin
         let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder().stdout_sink(stdout).build();
@@ -559,7 +649,10 @@ mod redirection_failures {
     }
 
     #[test]
-    fn failed_redirection_restores_earlier_descriptors() {
+    pub(super) fn failed_redirection_restores_earlier_descriptors() {
+        if isolated_test("redirection_failures::failed_redirection_restores_earlier_descriptors") {
+            return;
+        }
         let dir = tempdir().unwrap();
         let marker = fs::File::open(dir.path()).unwrap();
         let marker_stat = rustix::fs::fstat(&marker).unwrap();
@@ -625,6 +718,9 @@ mod redirect_open_handler {
 
     #[test]
     fn provider_owns_writable_opens_in_order() {
+        if isolated_test("redirect_open_handler::provider_owns_writable_opens_in_order") {
+            return;
+        }
         let dir = tempdir().unwrap();
         let opened = dir.path().join("provided");
         let requests = Requests::default();
@@ -663,6 +759,9 @@ mod redirect_open_handler {
 
     #[test]
     fn provider_error_restores_earlier_redirections() {
+        if isolated_test("redirect_open_handler::provider_error_restores_earlier_redirections") {
+            return;
+        }
         let dir = tempdir().unwrap();
         let opened = dir.path().join("provided");
         let requests = Requests::default();

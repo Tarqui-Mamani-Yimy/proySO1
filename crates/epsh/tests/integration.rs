@@ -1,9 +1,11 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn epsh() -> Command {
     let bin = env!("CARGO_BIN_EXE_epsh");
-    Command::new(bin)
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null());
+    cmd
 }
 
 /// Run a script in a specific working directory.
@@ -539,10 +541,10 @@ mod redirections {
 
     #[test]
     fn append_redirect() {
-        assert_output(
-            "f=/tmp/epsh-test-$$; echo a > $f; echo b >> $f; cat $f; rm $f",
-            "a\nb\n",
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(dir.path(), "echo a > output; echo b >> output; cat output");
+        assert_eq!(stdout, "a\nb\n");
+        assert_eq!(code, 0);
     }
 
     #[test]
@@ -1044,26 +1046,28 @@ mod exec_redirects {
 
     #[test]
     fn exec_output_redirect() {
-        // After exec > file, output goes to the file, not terminal
-        let tmp = format!("/tmp/epsh_test_exec_out_{}", std::process::id());
-        let _ = std::fs::remove_file(&tmp);
-        let (stdout, _, code) = run(&format!("exec > {tmp}; echo hello"));
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(dir.path(), "exec > output; echo hello");
         assert_eq!(code, 0);
         assert_eq!(stdout, "");
-        let contents = std::fs::read_to_string(&tmp).unwrap();
-        assert_eq!(contents, "hello\n");
-        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            std::fs::read(dir.path().join("output")).unwrap(),
+            b"hello\n"
+        );
     }
 
     #[test]
     fn exec_append_redirect() {
-        let tmp = format!("/tmp/epsh_test_exec_app_{}", std::process::id());
-        let _ = std::fs::remove_file(&tmp);
-        let (_, _, code) = run(&format!("echo first > {tmp}; exec >> {tmp}; echo second"));
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, code) = run_in(
+            dir.path(),
+            "echo first > output; exec >> output; echo second",
+        );
         assert_eq!(code, 0);
-        let contents = std::fs::read_to_string(&tmp).unwrap();
-        assert_eq!(contents, "first\nsecond\n");
-        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            std::fs::read(dir.path().join("output")).unwrap(),
+            b"first\nsecond\n"
+        );
     }
 
     #[test]
@@ -1073,14 +1077,13 @@ mod exec_redirects {
 
     #[test]
     fn exec_close_fd() {
-        let tmp = format!("/tmp/epsh_test_exec_close_{}", std::process::id());
-        let _ = std::fs::remove_file(&tmp);
-        let (stdout, _, code) = run(&format!(
-            "exec 3>{tmp}; echo via_fd3 >&3; exec 3>&-; cat {tmp}"
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(
+            dir.path(),
+            "exec 3>output; echo via_fd3 >&3; exec 3>&-; cat output",
+        );
         assert_eq!(code, 0);
         assert_eq!(stdout, "via_fd3\n");
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -1304,8 +1307,10 @@ mod dot_return {
 
     #[test]
     fn return_exits_dot_script() {
-        let (stdout, _, code) = run(
-            "echo 'echo before; return 0; echo after' > /tmp/epsh_dot_ret_$$.sh; . /tmp/epsh_dot_ret_$$.sh; echo continued; rm -f /tmp/epsh_dot_ret_$$.sh",
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(
+            dir.path(),
+            "echo 'echo before; return 0; echo after' > source.sh; . ./source.sh; echo continued",
         );
         assert_eq!(stdout, "before\ncontinued\n");
         assert_eq!(code, 0);
@@ -1313,8 +1318,10 @@ mod dot_return {
 
     #[test]
     fn return_with_status_from_dot_script() {
-        let (stdout, _, code) = run(
-            "echo 'return 42' > /tmp/epsh_dot_ret2_$$.sh; . /tmp/epsh_dot_ret2_$$.sh; echo \"rc=$?\"; rm -f /tmp/epsh_dot_ret2_$$.sh",
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(
+            dir.path(),
+            "echo 'return 42' > source.sh; . ./source.sh; echo \"rc=$?\"",
         );
         assert_eq!(stdout, "rc=42\n");
         assert_eq!(code, 0);
@@ -1327,18 +1334,24 @@ mod fd_numbers {
     #[test]
     fn three_digit_fd_redirect() {
         // Use fd 100 — redirect output, then write to it
-        assert_output(
-            "exec 100>/tmp/epsh_fd100_$$.txt; echo hello >&100; exec 100>&-; cat /tmp/epsh_fd100_$$.txt; rm -f /tmp/epsh_fd100_$$.txt",
-            "hello\n",
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(
+            dir.path(),
+            "exec 100>output; echo hello >&100; exec 100>&-; cat output",
         );
+        assert_eq!(stdout, "hello\n");
+        assert_eq!(code, 0);
     }
 
     #[test]
     fn two_digit_fd_redirect() {
-        assert_output(
-            "exec 10>/tmp/epsh_fd10_$$.txt; echo hi >&10; exec 10>&-; cat /tmp/epsh_fd10_$$.txt; rm -f /tmp/epsh_fd10_$$.txt",
-            "hi\n",
+        let dir = tempfile::tempdir().unwrap();
+        let (stdout, _, code) = run_in(
+            dir.path(),
+            "exec 10>output; echo hi >&10; exec 10>&-; cat output",
         );
+        assert_eq!(stdout, "hi\n");
+        assert_eq!(code, 0);
     }
 }
 
@@ -1993,11 +2006,13 @@ mod raw_bytes {
         fs::copy(env!("CARGO_BIN_EXE_show_argv"), &tool).unwrap();
         let out = run_script_os(
             tmp.path(),
-            "type tool >/dev/null && command -v tool >/dev/null && tool >/dev/null && echo path-ok",
+            "type tool >/dev/null && command -v tool && tool marker",
             &[(OsString::from("PATH"), dir.as_os_str().to_os_string())],
         );
         assert_eq!(out.status.code().unwrap(), 0);
-        assert_eq!(String::from_utf8(out.stdout).unwrap(), "path-ok\n");
+        let mut expected = tool.as_os_str().as_bytes().to_vec();
+        expected.extend_from_slice(b"\n6d61726b6572\n");
+        assert_eq!(out.stdout, expected);
     }
 
     #[test]

@@ -48,10 +48,14 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - [ ] **T1b — Parser: several `&` lists on one line** (route: delegated → `codex-impl`; found during T1)
   - `crates/epsh/src/parser.rs:261-271` mishandles `a & b &` on the same line; also `sys.rs:103-108` maps negative PIDs incorrectly.
   - Accept: RED integration tests for `sleep 0.1 & sleep 0.1 & wait; echo done` and two `$!` values; GREEN.
-- [ ] **T2 — `crates/shell` skeleton + minimal REPL** (route: delegated → `codex-impl`)
+- [x] **T2 — `crates/shell` skeleton + minimal REPL** (route: delegated → `codex-impl`)
   - New workspace member, binary `so1sh`. Loop: print prompt, read a line, run it with epsh, keep `$?`, exit on `exit` and on EOF (Ctrl-D).
   - Non-TTY stdin keeps epsh script semantics.
   - Accept: PTY test types `echo hi`, sees `hi` and a new prompt; `exit 3` returns status 3.
+- [ ] **T2b — Interactive shells survive shell errors** (route: delegated → `codex-impl`; review WARNINGs on T2)
+  - `eval_repl_line` returns `Break` for generic runtime errors and Cancelled/Stopped (`crates/epsh/src/eval.rs:930-942`), so e.g. `${x?msg}` or a special-builtin error ends the session. POSIX 2.8.1: an interactive shell must not exit on these errors.
+  - Only `exit` (and errexit when set) should end the REPL; errors set `$?` and return to the prompt. Document the `Break` contract.
+  - Accept: PTY tests for `${nope?missing}` then `echo after`, and a redirection error on a special builtin.
 - [ ] **T3 — Line editor with persistent history** (route: delegated → `codex-impl`)
   - reedline: history file, Ctrl-R search, multiline input when the parser reports incomplete input (open quote, `if` without `fi`).
   - Accept: PTY tests for history recall across sessions and a multiline `if`.
@@ -69,5 +73,8 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T1 (`57611af`): background job PIDs tracked per shell, cleared in forked children; `wait` waits only for those; `wait <pid>` returns its status, 127 if unknown. Tests 147/16/50/239/4 green (orchestrator spot-check, stdin=/dev/null); make ci only regression-37.
   Native review: high risk, user granted, approved, acknowledged. Advisory: EINTR retry makes `wait` non-interruptible by trapped signals (POSIX expects >128) -> Phase 2 traps work; operand validation and unknown-PID diagnostics are silent.
 
+- T2 (`dc389bc` epsh: `epsh::cli` shared dispatch + `Shell::eval_repl_line`/`finish_repl`; `05d551a` so1sh crate): REPL with PS1, state persists, `exit n`/EOF statuses; 12 PTY + 5 CLI tests (rexpect 0.7.1, MIT/Apache-2.0, dev-only). Workspace 473 green (orchestrator spot-check).
+  Native review: high risk, user granted, approved, acknowledged. WARNINGs -> T2b (errors end the REPL); SIGINT kills the shell -> T4. Suggestions: hardcoded prefix `cli.rs:19`, API surface addition not covered by api_stability.
+
 ## Progress / Next step
-- Next: T2 running on `codex-impl`; then T1b.
+- Next: T1b running on `codex-impl`; then T2b, T3.

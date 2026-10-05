@@ -6,7 +6,7 @@ strings and scripts for Rust applications, including coding agents.
 ## Architecture
 
 ```
-src/
+crates/epsh/src/
   lib.rs          Public API, module declarations
   main.rs         CLI binary: epsh [-c cmd] [-e] [script.sh]
   ast.rs          AST types: Command, Word, WordPart, Redir, ParamExpr
@@ -83,14 +83,14 @@ assert!(!is_builtin("rm"));
 ## Testing
 
 ```sh
-cargo test
-cargo test --test api_stability                         # API surface regression
-cargo test --test embedding                             # embedding API tests
-cargo test --test integration                           # shell behavior tests
+cargo test --workspace
+cargo test -p epsh --test api_stability                      # API surface regression
+cargo test -p epsh --test embedding                          # embedding API tests
+cargo test -p epsh --test integration                        # shell behavior tests
 cargo build && perl check.pl -p ./target/debug/epsh \
-  -s check-epsh.t                                       # mksh conformance
-sh tests/stress/run.sh ./target/debug/epsh dash         # performance vs dash
-perl filter-tests.pl check.t > check-epsh.t             # regenerate filtered tests
+  -s check-epsh.t                                            # mksh conformance
+sh crates/epsh/tests/stress/run.sh ./target/debug/epsh dash  # performance vs dash
+perl filter-tests.pl check.t > check-epsh.t                  # regenerate filtered tests
 ```
 
 ## Performance vs dash

@@ -2,9 +2,9 @@
 # Stress test runner — compares epsh vs dash
 set -e
 
-EPSH="${1:-./target/debug/epsh}"
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+EPSH="${1:-$DIR/../../../../target/debug/epsh}"
 DASH="${2:-dash}"
-DIR="$(dirname "$0")"
 
 printf "%-25s %10s %10s %8s\n" "TEST" "EPSH" "DASH" "RATIO"
 printf "%-25s %10s %10s %8s\n" "----" "----" "----" "-----"

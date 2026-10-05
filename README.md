@@ -195,11 +195,13 @@ These live in the interactive shell layer, not in epsh:
 
 ## Testing
 
+Run these commands from the workspace root. The epsh crate lives in `crates/epsh`.
+
 ```sh
-cargo test
-cargo test --test api_stability # API surface regression tests
-cargo test --test embedding     # embedding API tests (31)
-cargo test --test integration   # shell behavior tests (122)
+cargo test --workspace
+cargo test -p epsh --test api_stability # API surface regression tests
+cargo test -p epsh --test embedding     # embedding API tests (43)
+cargo test -p epsh --test integration   # shell behavior tests (226)
 cargo build && perl check.pl \
   -p ./target/debug/epsh \
   -s check-epsh.t              # mksh conformance

@@ -41,29 +41,29 @@ The shell's internal data model should distinguish:
 ## Why The Current Model Is Wrong
 
 Today `epsh` uses `String` for most shell data and a PUA encoding shim in
-`src/encoding.rs` to preserve invalid bytes in some paths. That is a useful
+`crates/epsh/src/encoding.rs` to preserve invalid bytes in some paths. That is a useful
 bridge, but it is not a correct runtime model.
 
 Current correctness gaps:
 
 - `execvp` converts shell strings with `CString::new(a.as_bytes())`, which sends
   UTF-8 bytes for PUA codepoints instead of the original bytes.
-  - `src/builtins.rs`
+  - `crates/epsh/src/builtins.rs`
 - external spawn uses `String` argv/env directly
-  - `src/eval.rs`
+  - `crates/epsh/src/eval.rs`
 - environment import uses `std::env::vars()`, which assumes UTF-8
-  - `src/var.rs`
+  - `crates/epsh/src/var.rs`
 - CLI argv import uses `std::env::args()`, which assumes UTF-8
-  - `src/main.rs`
+  - `crates/epsh/src/main.rs`
 - glob drops non-UTF-8 names with `to_str()`
-  - `src/glob.rs`
+  - `crates/epsh/src/glob.rs`
 - path-based builtins and tests operate on `&str` paths
-  - `src/redirect.rs`
-  - `src/builtins.rs`
-  - `src/test_cmd.rs`
+  - `crates/epsh/src/redirect.rs`
+  - `crates/epsh/src/builtins.rs`
+  - `crates/epsh/src/test_cmd.rs`
 - `PWD` is written with `to_string_lossy()`, which is not semantically correct
   for shell state
-  - `src/builtins.rs`
+  - `crates/epsh/src/builtins.rs`
 
 ## Desired Invariants
 
@@ -193,8 +193,8 @@ Keep parser-facing syntax names as `String`.
 
 Fix argv/env correctness for external commands:
 
-- replace `std::env::args()` with `args_os()` in `src/main.rs`
-- replace `std::env::vars()` with `vars_os()` or raw Unix env handling in `src/var.rs`
+- replace `std::env::args()` with `args_os()` in `crates/epsh/src/main.rs`
+- replace `std::env::vars()` with `vars_os()` or raw Unix env handling in `crates/epsh/src/var.rs`
 - feed `Command::new`, `.args`, and `.env` with `OsStr` / `OsString`
 - build `CString` for direct `execvp` from raw shell bytes, not UTF-8 string bytes
 
@@ -284,11 +284,11 @@ stable representation, preferably hex.
 
 Suggested fixtures:
 
-- `tests/fixtures/show_argv.rs`
+- `crates/epsh/tests/fixtures/show_argv.rs`
   - prints each argument as lowercase hex, one line per arg
-- `tests/fixtures/show_env.rs`
+- `crates/epsh/tests/fixtures/show_env.rs`
   - prints selected environment values as lowercase hex
-- `tests/fixtures/stat_path.rs`
+- `crates/epsh/tests/fixtures/stat_path.rs`
   - checks whether the path passed in argv exists and reports the raw bytes it saw
 
 If keeping fixtures as Rust binaries is awkward, a small Perl helper is also fine
@@ -381,7 +381,7 @@ still under transition.
 
 These should succeed for matching file kinds.
 
-This directly measures fixes in `src/test_cmd.rs`.
+This directly measures fixes in `crates/epsh/src/test_cmd.rs`.
 
 ### 9. `.` on non-UTF-8 path
 

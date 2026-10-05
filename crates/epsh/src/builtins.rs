@@ -715,17 +715,44 @@ impl Shell {
         Err(())
     }
 
-    fn builtin_wait(&mut self, _args: &[String]) -> ExitStatus {
-        // Wait for all background children
-        loop {
-            let mut status = 0i32;
-            // SAFETY: -1 waits for any child process; standard POSIX usage.
-            let pid = sys::waitpid(-1, &mut status, 0);
-            if pid <= 0 {
-                break;
+    fn builtin_wait(&mut self, args: &[String]) -> ExitStatus {
+        if args.len() == 1 {
+            for pid in self.background_pids.clone() {
+                self.wait_background_pid(pid);
             }
+            return ExitStatus::SUCCESS;
         }
-        ExitStatus::SUCCESS
+
+        let mut status = ExitStatus::NOT_FOUND;
+        for arg in args.iter().skip(1) {
+            status = match arg.parse::<i32>() {
+                Ok(pid) if pid > 0 && arg.bytes().all(|b| b.is_ascii_digit()) => {
+                    self.wait_background_pid(pid)
+                }
+                _ => ExitStatus::NOT_FOUND,
+            };
+        }
+        status
+    }
+
+    fn wait_background_pid(&mut self, pid: i32) -> ExitStatus {
+        let Some(index) = self.background_pids.iter().position(|&job| job == pid) else {
+            return ExitStatus::NOT_FOUND;
+        };
+        self.background_pids.remove(index);
+        // Wait only for a registered job; never consume an embedder's children.
+        let status = loop {
+            match rustix::process::waitpid(
+                rustix::process::Pid::from_raw(pid),
+                rustix::process::WaitOptions::empty(),
+            ) {
+                Ok(Some((_, status))) => break ExitStatus::from_wait(status.as_raw()),
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => break ExitStatus::NOT_FOUND,
+            }
+        };
+        self.child_pids.retain(|&child| child != pid);
+        status
     }
 
     fn builtin_trap(&mut self, args: &[String]) -> ExitStatus {

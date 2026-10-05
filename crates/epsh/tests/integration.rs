@@ -2095,3 +2095,79 @@ mod raw_bytes {
         );
     }
 }
+
+// Multiple jobs use separate lines to isolate wait from same-line ampersand parsing.
+mod wait_jobs {
+    use super::*;
+
+    #[test]
+    fn wait_pid_success() {
+        assert_output("sleep 0.1 & wait $!; echo $?", "0\n");
+    }
+
+    #[test]
+    fn wait_pid_exit_status() {
+        assert_output("(exit 7) & wait $!; echo $?", "7\n");
+    }
+
+    #[test]
+    fn wait_multiple_returns_last_operand_status() {
+        assert_output(
+            "(exit 7) &\na=$!\n(exit 9) &\nb=$!; wait $a $b; echo $?",
+            "9\n",
+        );
+    }
+
+    #[test]
+    fn wait_one_preserves_other_job_status() {
+        assert_output(
+            "(exit 7) &\na=$!\n(exit 9) &\nb=$!; wait $b; echo $?; wait $a; echo $?",
+            "9\n7\n",
+        );
+    }
+
+    #[test]
+    fn wait_all_returns_zero_and_discards_statuses() {
+        assert_output(
+            "(exit 7) &\na=$!\n(exit 9) &\nb=$!; wait; echo $?; wait $a; echo $?; wait $b; echo $?",
+            "0\n127\n127\n",
+        );
+    }
+
+    #[test]
+    fn wait_unknown_pid() {
+        assert_output("wait $$; echo $?; wait 0; echo $?", "127\n127\n");
+    }
+
+    #[test]
+    fn wait_unknown_operand_does_not_skip_later_jobs() {
+        assert_output(
+            "(exit 7) &\na=$!\nwait $$ $a; echo $?\n(exit 9) &\nb=$!; wait $b $$; echo $?",
+            "7\n127\n",
+        );
+    }
+
+    #[test]
+    fn wait_subshell_and_substitution_do_not_consume_parent_jobs() {
+        assert_output(
+            "(exit 7) & p=$!; (wait $p; echo $?); echo \"$(wait $p; echo $?)\"; wait $p; echo $?",
+            "127\n127\n7\n",
+        );
+    }
+
+    #[test]
+    fn wait_pipeline_does_not_consume_parent_jobs() {
+        assert_output(
+            "(exit 7) & p=$!; { wait $p; echo $?; } | cat; wait $p; echo $?",
+            "127\n7\n",
+        );
+    }
+
+    #[test]
+    fn wait_nested_background_job() {
+        assert_output(
+            "(exit 5) &\nparent=$!\n{ (exit 9) & wait $!; exit $?; } &\nnested=$!; wait $nested; echo $?; wait $parent; echo $?",
+            "9\n5\n",
+        );
+    }
+}

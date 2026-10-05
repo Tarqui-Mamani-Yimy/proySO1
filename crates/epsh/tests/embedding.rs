@@ -125,6 +125,62 @@ mod hermeticity {
     }
 }
 
+mod wait_jobs {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn host_child() -> std::process::Child {
+        Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn wait_all_preserves_host_child() {
+        if isolated_test("wait_jobs::wait_all_preserves_host_child") {
+            return;
+        }
+        let mut host = host_child();
+        let mut shell = Shell::new();
+        assert_eq!(shell.run_script("(exit 11) & wait"), 0);
+        assert_eq!(
+            host.wait().expect("shell reaped the host child").code(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn wait_host_pid_is_unknown() {
+        if isolated_test("wait_jobs::wait_host_pid_is_unknown") {
+            return;
+        }
+        let mut host = host_child();
+        let mut shell = Shell::new();
+        let status = shell.run_script(&format!("wait {}", host.id()));
+        assert_eq!(
+            host.wait().expect("shell reaped the host child").code(),
+            Some(7)
+        );
+        assert_eq!(status, 127);
+    }
+
+    #[test]
+    fn shells_do_not_reap_each_others_jobs() {
+        if isolated_test("wait_jobs::shells_do_not_reap_each_others_jobs") {
+            return;
+        }
+        let mut owner = Shell::new();
+        let mut other = Shell::builder().build();
+        assert_eq!(owner.run_script("(exit 11) &"), 0);
+        assert_eq!(other.run_script("wait"), 0);
+        assert_eq!(owner.run_script("wait $!"), 11);
+    }
+}
+
 mod builder {
     use super::*;
 

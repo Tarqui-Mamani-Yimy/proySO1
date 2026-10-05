@@ -293,6 +293,8 @@ pub struct Shell {
     pub(crate) stderr_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     /// PIDs of currently running child processes (for cancellation cleanup).
     pub(crate) child_pids: Vec<i32>,
+    /// Unconsumed asynchronous jobs owned by this shell execution environment.
+    pub(crate) background_pids: Vec<i32>,
     /// Optional execution deadline. When exceeded, shell aborts with TimedOut.
     timeout: Option<std::time::Instant>,
     /// Optional callback that replaces eval_external for spawning processes.
@@ -540,6 +542,7 @@ impl ShellBuilder {
             stdout_sink: self.stdout_sink,
             stderr_sink: self.stderr_sink,
             child_pids: Vec::new(),
+            background_pids: Vec::new(),
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
             redirect_open_handler: self.redirect_open_handler,
@@ -580,6 +583,7 @@ impl Shell {
             stdout_sink: None,
             stderr_sink: None,
             child_pids: Vec::new(),
+            background_pids: Vec::new(),
             timeout: None,
             external_handler: None,
             redirect_open_handler: None,
@@ -776,7 +780,13 @@ impl Shell {
             // SAFETY: pid is a valid child PID; reaping after kill.
             sys::waitpid(pid, &mut status, 0);
         }
+        self.clear_child_tracking();
+    }
+
+    /// Forget child ownership after cleanup or when entering a new process.
+    fn clear_child_tracking(&mut self) {
         self.child_pids.clear();
+        self.background_pids.clear();
     }
 
     /// Build the xtrace prefix string ($PS4, default "+ ").
@@ -1648,6 +1658,7 @@ impl Shell {
                 }
 
                 if pid == 0 {
+                    self.clear_child_tracking();
                     // Child: join pipeline process group
                     // First child creates the group (pgid==0 → setpgid(0,0))
                     // Subsequent children join it
@@ -1792,6 +1803,7 @@ impl Shell {
             }
 
             if pid == 0 {
+                self.clear_child_tracking();
                 // Child — isolate in own process group
                 let _ = rustix::process::setpgid(None, None);
                 let parent_exit_trap = self
@@ -1836,6 +1848,7 @@ impl Shell {
             }
 
             if pid == 0 {
+                self.clear_child_tracking();
                 let _ = rustix::process::setpgid(None, None);
                 let _saved = match self.setup_redirections(redirs) {
                     Ok(s) => s,
@@ -1850,6 +1863,7 @@ impl Shell {
             }
 
             self.child_pids.push(pid);
+            self.background_pids.push(pid);
             self.last_bg_pid = Some(pid as u32);
             // Don't wait — background process
             Ok(ExitStatus::SUCCESS)
@@ -1954,6 +1968,7 @@ impl Shell {
             }
 
             if pid == 0 {
+                self.clear_child_tracking();
                 // Child: redirect stdout to write end of pipe
                 let _ = rustix::process::setpgid(None, None);
                 self.in_forked_child = true;

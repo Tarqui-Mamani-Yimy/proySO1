@@ -2011,6 +2011,7 @@ mod raw_bytes {
         );
         assert_eq!(out.status.code().unwrap(), 0);
         let mut expected = tool.as_os_str().as_bytes().to_vec();
+        // show_argv prints the hex encoding of the argument "marker".
         expected.extend_from_slice(b"\n6d61726b6572\n");
         assert_eq!(out.stdout, expected);
     }

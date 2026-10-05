@@ -16,6 +16,21 @@ fn parse(src: &str) -> Program {
     Parser::new(src).parse().unwrap()
 }
 
+fn check_child_test(name: &str, out: &std::process::Output) -> Result<(), String> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let ran_one = stdout.lines().any(|line| line == "running 1 test");
+    let passed_one = stdout
+        .lines()
+        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    if out.status.success() && ran_one && passed_one {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: expected exactly one test to pass: {out:?}"
+        ))
+    }
+}
+
 // Tests that change FDs or reap arbitrary children need a private process.
 fn isolated_test(name: &str) -> bool {
     if std::env::var("EPSH_EMBEDDING_CHILD").as_deref() == Ok(name) {
@@ -27,7 +42,7 @@ fn isolated_test(name: &str) -> bool {
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
-    assert!(out.status.success(), "{name}: {out:?}");
+    check_child_test(name, &out).unwrap();
     true
 }
 
@@ -35,6 +50,20 @@ mod hermeticity {
     use super::*;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn exact_child_filter_rejects_missing_test() {
+        let name = "hermeticity::this_test_does_not_exist";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("running 0 tests"));
+        let error = check_child_test(name, &out).unwrap_err();
+        assert!(error.contains("exactly one test"), "{error}");
+    }
 
     #[test]
     fn fd_tests_preserve_host_descriptors() {
@@ -91,10 +120,7 @@ mod hermeticity {
                 .stdin(std::process::Stdio::null())
                 .output()
                 .unwrap();
-            assert!(
-                out.status.success(),
-                "ambient PATH affected {name}: {out:?}"
-            );
+            check_child_test(name, &out).unwrap();
         }
     }
 }

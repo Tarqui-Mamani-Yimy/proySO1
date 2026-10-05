@@ -36,6 +36,8 @@ pub mod arith;
 pub mod ast;
 /// Shell builtins and [`builtins::BUILTIN_NAMES`].
 pub mod builtins;
+/// Shared command-line dispatch for shell binaries.
+pub mod cli;
 /// Byte-preserving encoding for non-UTF-8 shell data.
 pub mod encoding;
 /// Error types: [`error::ShellError`], [`error::ExitStatus`].

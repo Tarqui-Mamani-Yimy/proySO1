@@ -1,5 +1,6 @@
 use fxhash::FxHashMap;
 use std::io::{Read, Write};
+use std::ops::ControlFlow;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -878,6 +879,43 @@ impl Shell {
     /// This is the library-facing entry point — parse once with `Parser`,
     /// then execute via `run_program`.
     pub fn run_program(&mut self, program: &crate::ast::Program) -> ExitStatus {
+        match self.run_program_inner(program) {
+            ControlFlow::Continue(_) => {
+                self.run_exit_trap();
+                self.exit_status
+            }
+            ControlFlow::Break(status) => status,
+        }
+    }
+
+    /// Evaluate one REPL line without finishing the session after a normal command.
+    ///
+    /// `Continue` carries the last command status; `Break` requests termination
+    /// (including `exit` and `errexit`). EXIT traps run on termination, not per line.
+    /// Syntax errors update `$?` to 2 and allow the next line to be evaluated.
+    pub fn eval_repl_line(&mut self, source: &str) -> ControlFlow<ExitStatus, ExitStatus> {
+        match Parser::new(source).parse() {
+            Ok(program) => self.run_program_inner(&program),
+            Err(error) => {
+                self.err_msg(&format!("epsh: {error}"));
+                self.exit_status = ExitStatus::MISUSE;
+                ControlFlow::Continue(self.exit_status)
+            }
+        }
+    }
+
+    /// Finish a REPL at EOF, running the EXIT trap while retaining the last status.
+    /// Do not call this after `eval_repl_line` returns `Break`.
+    pub fn finish_repl(&mut self) -> ExitStatus {
+        let status = self.exit_status;
+        self.run_exit_trap();
+        status
+    }
+
+    fn run_program_inner(
+        &mut self,
+        program: &crate::ast::Program,
+    ) -> ControlFlow<ExitStatus, ExitStatus> {
         for cmd in &program.commands {
             match self.eval_command(cmd) {
                 Ok(status) => {
@@ -885,30 +923,29 @@ impl Shell {
                 }
                 Err(ShellError::Exit(n)) => {
                     self.run_exit_trap();
-                    return n;
+                    return ControlFlow::Break(n);
                 }
                 Err(ShellError::Cancelled) | Err(ShellError::TimedOut) => {
                     self.kill_children();
-                    return ExitStatus::from_signal(2); // 130 = SIGINT
+                    return ControlFlow::Break(ExitStatus::from_signal(2)); // 130 = SIGINT
                 }
                 Err(ShellError::Stopped { .. }) => {
                     // A foreground process was stopped (SIGTSTP). Return 148
                     // (128 + SIGTSTP) so the embedder can detect and save the job.
                     // Do not print anything — the embedder handles the UI.
-                    return ExitStatus::from(148);
+                    return ControlFlow::Break(ExitStatus::from(148));
                 }
                 Err(e) => {
                     self.err_msg(&format!("epsh: {e}"));
                     self.exit_status = ExitStatus::MISUSE;
                     self.run_exit_trap();
-                    return self.exit_status;
+                    return ControlFlow::Break(self.exit_status);
                 }
             }
             self.run_pending_traps();
         }
 
-        self.run_exit_trap();
-        self.exit_status
+        ControlFlow::Continue(self.exit_status)
     }
 
     /// Check for pending signals and run their trap handlers.

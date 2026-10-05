@@ -42,11 +42,17 @@ to add crates without touching the engine.
     (src, tests, fixtures, Cargo.toml). `Cargo.lock`, `rust-toolchain.toml`, target dir stay at root.
   - Update paths in Makefile, Dockerfile, AGENTS.md, README, tests/stress, check.pl invocations.
   - Accept: same test results as T2; `./target/debug/epsh` still produced.
-- [ ] **T4 — Local CI entry point** (route: delegated → `codex-impl`)
+- [x] **T4 — Local CI entry point** (route: delegated → `codex-impl`)
   - `make ci` runs fmt check, clippy (deny warnings), `cargo test --workspace`, conformance.
   - Accept: `make ci` exits 0 (or fails only on T2-recorded pre-existing issues).
-- [ ] **T5 — Independent verification** (route: delegated → `agy-research`)
+- [x] **T5 — Independent verification** (route: delegated → `agy-research`)
   - Re-run T2 suite on the T3/T4 commits; review diff read-only.
+- [ ] **T6 — Fix deterministic baseline failures and make tests hermetic** (route: delegated → `codex-impl`; approved by user 2026-10-05)
+  - Fix `exec_redirects::exec_read_write` (`read line <&4` reads stdin instead of fd 4) — real redirection bug.
+  - Fix `raw_bytes::cd_into_invalid_utf8_directory_and_use_relative_path` and `raw_bytes::glob_matches_invalid_utf8_filenames` (FromUtf8Error on non-UTF-8 paths): decide whether the bug is in epsh or in the test, with evidence.
+  - Make the suite hermetic: results must not depend on the caller's stdin or on shared `/tmp` names (exec_close_fd, path_lookup_*, output_sinks::*).
+  - Accept: `cargo test --workspace` fully green, identical for codex-impl and agy-research environments; strict TDD (RED observed first).
+  - Out of scope: `regression-37` (`time -p`) is environmental — POSIX `time` is an external utility and `/usr/bin/time` is not installed here.
 
 ## Verification evidence
 - T1: root commit `da10eb0` "begin" (by the user, includes `.atl/`), then `7b66dc1` adds `.gitignore` + this document. `git status` clean after commit. Note: `.atl/` is already tracked, so the ignore rule does not untrack it.
@@ -67,6 +73,11 @@ to add crates without touching the engine.
   Advisory (non-blocking) findings to fold into T4: dead `exclude` entries `crates/epsh/Cargo.toml:11`;
   duplicated LICENSE `crates/epsh/LICENSE`; magic relative target path `crates/epsh/tests/stress/run.sh:6`;
   test cwd shift after move (`crates/epsh/Cargo.toml`).
+- T5 (agy-research, 5 runs on `6d087a6`): 3 deterministic failures (exec_read_write, 2x raw_bytes invalid UTF-8); exec_close_fd / separate_stdout_stderr / path_lookup passed 5/5. Codex's environment shows the opposite for exec_read_write vs exec_close_fd -> tests depend on caller environment (likely inherited stdin).
+- T4 (codex-impl, `b23afaa` + review correction `543b413`): `make ci` (fmt check, clippy -D warnings, build, test, check.pl; fail-fast); stress/run.sh resolves workspace target dir; portable bump-version sed; `scripts/test-local-ci.sh` checks; LICENSE kept (needed by `cargo package`).
+  clippy -D warnings PASS; tests same 3 failures; check.pl 167/168.
+  Native review: risk high, user granted; correction required (CRITICAL R3/R4: `.into()` removal broke u16 mode_t on macOS/BSD) -> fixed in `543b413` with `u32::from` + scoped allow; targeted validation approved; acknowledged (lineage review-f01800a753e87178). Darwin cross-check not run (target not installed).
+  Advisory: `make ci` duplicates test step (Makefile:13-15).
 
 ## Progress / Next step
-- Next: T5 (flakiness characterization) running on `agy-research`; then T4 (`make ci` + advisory cleanups).
+- Next: T6 on `codex-impl`, then verification by `agy-research`.

@@ -1,14 +1,26 @@
-# epsh — Embeddable POSIX Shell
+# so1Shell — Interactive Shell on epsh
 
-Non-interactive, embeddable POSIX shell in Rust + libc. It executes command
-strings and scripts for Rust applications, including coding agents.
+The workspace contains `epsh`, the non-interactive, embeddable POSIX engine,
+and `so1sh` (working name), a minimal interactive shell using that engine.
+`so1sh` uses a plain one-line reader on a TTY, with `PS1` (default `$ `),
+persistent variables/cwd/functions, and status-aware `exit` and EOF.
+Piped input, `-c`, and script arguments use the shared epsh CLI dispatcher.
+Line editing, multiline input, rc files, and interactive job control are not
+implemented yet.
 
 ## Architecture
 
 ```
+Cargo.toml        Virtual workspace: crates/epsh and crates/shell
+crates/shell/
+  src/main.rs     so1sh binary, selects the REPL for TTY input
+  src/repl.rs     Plain byte-preserving line reader and prompt
+  tests/repl.rs   PTY end-to-end interactive tests (rexpect)
+  tests/cli.rs    Non-interactive CLI compatibility tests
 crates/epsh/src/
   lib.rs          Public API, module declarations
-  main.rs         CLI binary: epsh [-c cmd] [-e] [script.sh]
+  main.rs         Thin epsh CLI binary entry point
+  cli.rs          Shared option/script/stdin dispatch for epsh and so1sh
   ast.rs          AST types: Command, Word, WordPart, Redir, ParamExpr
   lexer.rs        Single-pass lexer with unified word-part builder
   parser.rs       Recursive-descent parser, heredoc body reading
@@ -84,6 +96,9 @@ assert!(!is_builtin("rm"));
 
 ```sh
 cargo test --workspace
+cargo test -p so1sh --test repl                        # PTY REPL tests
+cargo run -p so1sh                                     # interactive on a TTY
+make ci                                               # both crates + conformance
 cargo test -p epsh --test api_stability                      # API surface regression
 cargo test -p epsh --test embedding                          # embedding API tests
 cargo test -p epsh --test integration                        # shell behavior tests

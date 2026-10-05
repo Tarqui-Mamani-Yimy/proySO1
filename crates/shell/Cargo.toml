@@ -1,0 +1,14 @@
+[package]
+name = "so1sh"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Interactive shell built on the epsh POSIX engine"
+publish = false
+
+[dependencies]
+epsh = { path = "../epsh" }
+
+[dev-dependencies]
+rexpect = "0.7.1"
+tempfile = "3"

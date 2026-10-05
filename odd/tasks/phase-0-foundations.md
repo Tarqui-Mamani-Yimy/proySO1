@@ -47,7 +47,7 @@ to add crates without touching the engine.
   - Accept: `make ci` exits 0 (or fails only on T2-recorded pre-existing issues).
 - [x] **T5 — Independent verification** (route: delegated → `agy-research`)
   - Re-run T2 suite on the T3/T4 commits; review diff read-only.
-- [ ] **T6 — Fix deterministic baseline failures and make tests hermetic** (route: delegated → `codex-impl`; approved by user 2026-10-05)
+- [x] **T6 — Fix deterministic baseline failures and make tests hermetic** (route: delegated → `codex-impl`; approved by user 2026-10-05)
   - Fix `exec_redirects::exec_read_write` (`read line <&4` reads stdin instead of fd 4) — real redirection bug.
   - Fix `raw_bytes::cd_into_invalid_utf8_directory_and_use_relative_path` and `raw_bytes::glob_matches_invalid_utf8_filenames` (FromUtf8Error on non-UTF-8 paths): decide whether the bug is in epsh or in the test, with evidence.
   - Make the suite hermetic: results must not depend on the caller's stdin or on shared `/tmp` names (exec_close_fd, path_lookup_*, output_sinks::*).
@@ -78,6 +78,18 @@ to add crates without touching the engine.
   clippy -D warnings PASS; tests same 3 failures; check.pl 167/168.
   Native review: risk high, user granted; correction required (CRITICAL R3/R4: `.into()` removal broke u16 mode_t on macOS/BSD) -> fixed in `543b413` with `u32::from` + scoped allow; targeted validation approved; acknowledged (lineage review-f01800a753e87178). Darwin cross-check not run (target not installed).
   Advisory: `make ci` duplicates test step (Makefile:13-15).
+- T6 (codex-impl writes; orchestrator commits because `~/.codex/rules/orquestador-deny.rules` forbids git add/commit for Codex):
+  - `d4cf178` fix: redirection fd closed when open() returned the target fd (dup2 no-op + drop). Review approved.
+  - `93f0f85` test: invalid-UTF-8 tests wrongly decoded stdout; epsh was correct. Review approved.
+  - `63e7aaa` test: hermetic tests (child-process isolation for fixed-fd / waitpid(-1) tests, private PATH, null stdin, tempdirs). Review approved.
+  - `984c457` test: reject vacuous `--exact` child runs (review WARNINGs on `63e7aaa`). Review approved.
+  - Verification: codex-impl, orchestrator and agy-research (`/tmp/so1shell-t6-verify.md`) all 442/442 green (parallel, serial, stdin=/dev/null).
+    `make ci`: fmt, clippy -D warnings, build, tests PASS; check.pl 167/168 (regression-37, `/usr/bin/time` absent).
+  - Engine bug found, NOT fixed (backlog for Phase 1): `wait` builtin calls `waitpid(-1)` (`crates/epsh/src/builtins.rs:723`) and can reap the embedder's children.
+  - Open advisory suggestions (non-blocking): fcntl error handling note in `redirect.rs:22-27`, test-helper duplication, comments in embedding.rs.
+
+## Phase 0 result
+- All tasks done on `chore/phase-0-workspace` (9 commits over `main`). Not pushed or merged: delivery is the user's decision.
 
 ## Progress / Next step
-- Next: T6 on `codex-impl`, then verification by `agy-research`.
+- Next: user decides merge of `chore/phase-0-workspace` into `main`; then Phase 1 (shell MVP) feature document.

@@ -85,7 +85,7 @@ to add crates without touching the engine.
   - `984c457` test: reject vacuous `--exact` child runs (review WARNINGs on `63e7aaa`). Review approved.
   - Verification: codex-impl, orchestrator and agy-research (`/tmp/so1shell-t6-verify.md`) all 442/442 green (parallel, serial, stdin=/dev/null).
     `make ci`: fmt, clippy -D warnings, build, tests PASS; check.pl 167/168 (regression-37, `/usr/bin/time` absent).
-  - Engine bug found, NOT fixed (backlog for Phase 1): `wait` builtin calls `waitpid(-1)` (`crates/epsh/src/builtins.rs:723`) and can reap the embedder's children.
+  - Engine bug found, fixed in Phase 1 T1 (`57611af`): `wait` builtin calls `waitpid(-1)` (`crates/epsh/src/builtins.rs:723`) and can reap the embedder's children.
   - Open advisory suggestions (non-blocking): fcntl error handling note in `redirect.rs:22-27`, test-helper duplication, comments in embedding.rs.
 
 ## Phase 0 result

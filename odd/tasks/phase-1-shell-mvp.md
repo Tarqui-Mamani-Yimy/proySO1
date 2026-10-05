@@ -41,10 +41,13 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 
 ## Tasks
 
-- [ ] **T1 — `wait` only reaps the shell's own children** (route: delegated → `codex-impl`)
+- [x] **T1 — `wait` only reaps the shell's own children** (route: delegated → `codex-impl`)
   - `crates/epsh/src/builtins.rs` `builtin_wait` uses `waitpid(-1)` and ignores its arguments.
   - Track background child PIDs in the shell; `wait` waits for those only; support `wait <pid>` with POSIX exit status.
   - Accept: RED test where a host child survives `wait`; GREEN; api_stability unchanged.
+- [ ] **T1b — Parser: several `&` lists on one line** (route: delegated → `codex-impl`; found during T1)
+  - `crates/epsh/src/parser.rs:261-271` mishandles `a & b &` on the same line; also `sys.rs:103-108` maps negative PIDs incorrectly.
+  - Accept: RED integration tests for `sleep 0.1 & sleep 0.1 & wait; echo done` and two `$!` values; GREEN.
 - [ ] **T2 — `crates/shell` skeleton + minimal REPL** (route: delegated → `codex-impl`)
   - New workspace member, binary `so1sh`. Loop: print prompt, read a line, run it with epsh, keep `$?`, exit on `exit` and on EOF (Ctrl-D).
   - Non-TTY stdin keeps epsh script semantics.
@@ -63,7 +66,8 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - `make ci` + manual smoke script through a PTY; report.
 
 ## Verification evidence
-_(filled per task)_
+- T1 (`57611af`): background job PIDs tracked per shell, cleared in forked children; `wait` waits only for those; `wait <pid>` returns its status, 127 if unknown. Tests 147/16/50/239/4 green (orchestrator spot-check, stdin=/dev/null); make ci only regression-37.
+  Native review: high risk, user granted, approved, acknowledged. Advisory: EINTR retry makes `wait` non-interruptible by trapped signals (POSIX expects >128) -> Phase 2 traps work; operand validation and unknown-PID diagnostics are silent.
 
 ## Progress / Next step
-- Next: T1 on `codex-impl`.
+- Next: T2 running on `codex-impl`; then T1b.

@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -14,6 +14,19 @@ pub(crate) struct SavedFd {
     pub(crate) saved_copy: Option<RawFd>,
     /// The target was not open before the redirection, so restoration closes it.
     pub(crate) was_closed: bool,
+}
+
+/// Install an opened descriptor without closing it when open reused the target.
+fn install_redirection_fd(file: OwnedFd, target_fd: RawFd) -> crate::error::Result<()> {
+    if file.as_raw_fd() == target_fd {
+        // No dup2 means no automatic CLOEXEC clearing; the shell owns this fd now.
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())
+            .map_err(|e| ShellError::Io(e.into()))?;
+        let _ = file.into_raw_fd();
+    } else {
+        sys::dup2(file.as_raw_fd(), target_fd);
+    }
+    Ok(())
 }
 
 impl Shell {
@@ -100,8 +113,7 @@ impl Shell {
                         self.err_msg(&format!("{filename}: {e}"));
                         ShellError::Io(e)
                     })?;
-                    // SAFETY: file fd is valid from File::open; target_fd is the redirect target.
-                    sys::dup2(file.as_raw_fd(), target_fd);
+                    install_redirection_fd(file.into(), target_fd)?;
                 }
                 RedirKind::Output(word)
                 | RedirKind::Clobber(word)
@@ -121,8 +133,7 @@ impl Shell {
                             self.err_msg(&format!("{filename}: {e}"));
                             ShellError::Io(e)
                         })?;
-                    // SAFETY: file is an open descriptor owned for this call; target_fd is the redirect target.
-                    sys::dup2(file.as_raw_fd(), target_fd);
+                    install_redirection_fd(file, target_fd)?;
                 }
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;

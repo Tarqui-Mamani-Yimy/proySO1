@@ -1085,14 +1085,87 @@ mod exec_redirects {
 
     #[test]
     fn exec_read_write() {
-        let tmp = format!("/tmp/epsh_test_exec_rw_{}", std::process::id());
-        let _ = std::fs::remove_file(&tmp);
-        let (stdout, _, code) = run(&format!(
-            "echo content > {tmp}; exec 4<>{tmp}; read line <&4; echo $line"
-        ));
-        assert_eq!(code, 0);
-        assert_eq!(stdout, "content\n");
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let out = epsh()
+            .stdin(std::process::Stdio::null())
+            .current_dir(temp.path())
+            .args([
+                "-c",
+                "exec 3<&0; exec 4<&0; exec 4>&-; echo content > data; exec 4<>data; \
+                 read line <&4; status=$?; printf '%s|%s\\n' \"$status\" \"$line\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"0|content\n");
+    }
+
+    #[test]
+    fn exec_input_keeps_descriptor_when_open_reuses_target() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("data"), b"content\n").unwrap();
+        let out = epsh()
+            .stdin(std::process::Stdio::null())
+            .current_dir(temp.path())
+            .args([
+                "-c",
+                "exec 3<&0; exec 4<&0; exec 4>&-; exec 4<data; \
+                 read line <&4; status=$?; printf '%s|%s\\n' \"$status\" \"$line\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"0|content\n");
+    }
+
+    #[test]
+    fn exec_output_keeps_descriptor_when_open_reuses_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = epsh()
+            .stdin(std::process::Stdio::null())
+            .current_dir(temp.path())
+            .args([
+                "-c",
+                "exec 3<&0; exec 4<&0; exec 4>&-; exec 4>data; echo content >&4",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("data")).unwrap(),
+            b"content\n"
+        );
+    }
+    #[test]
+    fn exec_open_descriptor_is_inherited_by_external_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = epsh()
+            .stdin(std::process::Stdio::null())
+            .current_dir(temp.path())
+            .args([
+                "-c",
+                "exec 3<&0; exec 4<&0; exec 4>&-; exec 4>data; /bin/sh -c 'printf child >&4'",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(temp.path().join("data")).unwrap(), b"child");
     }
 }
 

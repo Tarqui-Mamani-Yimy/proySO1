@@ -143,8 +143,10 @@ pub fn getuid() -> u32 {
 }
 
 /// Set the process file-mode creation mask. Returns the previous mask.
+#[allow(clippy::useless_conversion)]
 pub fn umask(mask: u32) -> u32 {
-    rustix::process::umask(Mode::from_bits_retain(mask as _)).bits()
+    // mode_t is u16 on macOS/FreeBSD but u32 on Linux.
+    u32::from(rustix::process::umask(Mode::from_bits_retain(mask as _)).bits())
 }
 
 /// Exit the process, flushing Rust's stdout first.

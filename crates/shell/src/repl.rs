@@ -82,6 +82,19 @@ fn history_path(shell: &Shell) -> Option<PathBuf> {
         })
 }
 
+fn startup_rc_command(shell: &Shell) -> Option<&'static str> {
+    if shell
+        .get_var_bytes("SO1SH_RC")
+        .is_some_and(|v| !v.is_empty())
+    {
+        return Some(". \"$SO1SH_RC\"");
+    }
+    let home = shell.get_var_bytes("HOME").filter(|v| !v.is_empty())?;
+    let path = home.to_path_buf().join(".so1shrc");
+    // Only a missing default is silent; let '.' diagnose other access failures.
+    (!matches!(path.try_exists(), Ok(false))).then_some(". \"$HOME/.so1shrc\"")
+}
+
 /// Reedline owns editing/history; epsh owns parsing, evaluation, and exit semantics.
 pub fn run(shell: &mut Shell) -> i32 {
     match read_lines(shell) {
@@ -103,6 +116,18 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     };
     shell.opts_mut().interactive = true;
+    if let Some(command) = startup_rc_command(shell) {
+        // Quoted variable expansion preserves path bytes without interpreting
+        // the filename as shell syntax. Reuse '.' and normal REPL error/exit flow.
+        let result = shell.eval_repl_line(command);
+        shell.discard_stopped_jobs();
+        if let Some(terminal) = &terminal {
+            terminal.reclaim()?;
+        }
+        if let ControlFlow::Break(status) = result {
+            return Ok(status.code());
+        }
+    }
     let mut editor = Reedline::create().with_validator(Box::new(ShellValidator));
     if let Some(path) = history_path(shell) {
         match FileBackedHistory::with_file(reedline::HISTORY_SIZE, path) {

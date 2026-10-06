@@ -20,7 +20,13 @@ reaped, and their output relays joined. Terminal ownership and cooked modes are
 restored after each job. Startup waits for foreground permission instead of
 stealing the tty, and exit returns it to its original owner. Without a controlling
 tty, one diagnostic is printed and editing continues without terminal job control.
-Rc files are not implemented yet; job resume (`fg`/`bg`/`jobs`) is Phase 2.
+Before the first interactive prompt, startup sources non-empty `$SO1SH_RC`, or
+the existing `$HOME/.so1shrc` when HOME is non-empty. It runs through `.` in the
+persistent shell, so prompts, variables, functions and cwd can be configured.
+Missing defaults are silent; explicit missing files and rc errors are reported
+with normal REPL recovery (including `set -e` semantics). `exit` in the rc ends
+the session. Piped input, `-c`, and script arguments never source an rc file.
+Job resume (`fg`/`bg`/`jobs`) is Phase 2.
 
 ## Architecture
 
@@ -28,7 +34,7 @@ Rc files are not implemented yet; job resume (`fg`/`bg`/`jobs`) is Phase 2.
 Cargo.toml        Virtual workspace: crates/epsh and crates/shell
 crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
-  src/repl.rs     Reedline editor, parser-backed validator, prompts and history
+  src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests

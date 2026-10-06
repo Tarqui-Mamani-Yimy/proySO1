@@ -98,3 +98,45 @@ fn invalid_cli_arguments_keep_epsh_diagnostics() {
     assert_eq!(missing_script.status.code(), Some(127));
     assert!(missing_script.stderr.starts_with(b"epsh: missing.sh:"));
 }
+
+#[test]
+fn non_interactive_modes_ignore_startup_rc_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let rc = dir.path().join("rc");
+    std::fs::write(&rc, "echo forbidden; exit 42\n").unwrap();
+    std::fs::write(dir.path().join(".so1shrc"), "echo forbidden; exit 42\n").unwrap();
+    std::fs::write(dir.path().join("script.sh"), "echo script\n").unwrap();
+    for explicit in [false, true] {
+        let configured = || {
+            let mut command = command(&dir);
+            command.env("HOME", dir.path());
+            if explicit {
+                command.env("SO1SH_RC", &rc);
+            }
+            command
+        };
+        assert_output(
+            configured().args(["-c", "echo command"]).output().unwrap(),
+            0,
+            b"command\n",
+        );
+        assert_output(
+            configured().arg("script.sh").output().unwrap(),
+            0,
+            b"script\n",
+        );
+        let mut child = configured()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"echo piped\n")
+            .unwrap();
+        assert_output(child.wait_with_output().unwrap(), 0, b"piped\n");
+    }
+}

@@ -800,3 +800,156 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
     submit(&mut session, "exit");
     exited(&mut session, 0);
 }
+
+mod startup_rc {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn session(dir: &TempDir, rc: Option<&OsStr>, home: Option<&OsStr>) -> PtySession {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .env("SO1SH_HISTFILE", dir.path().join("history"))
+            .current_dir(dir.path());
+        if let Some(rc) = rc {
+            command.env("SO1SH_RC", rc);
+        }
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let mut session = spawn_command(command, Some(3000)).unwrap();
+        session.process_mut().set_kill_timeout(Some(1000));
+        session
+    }
+
+    #[test]
+    fn default_file_configures_prompts_variables_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            dir.path().join(".so1shrc"),
+            "PS1='rc> '; PS2='rc-more> '; x=5; cd sub\n",
+        )
+        .unwrap();
+        // An empty override falls back to the default file.
+        let mut session = session(&dir, Some(OsStr::new("")), Some(dir.path().as_os_str()));
+        session.exp_string("rc> ").unwrap();
+        submit(&mut session, "echo $x; pwd");
+        assert_no_output(&session.exp_string("5\r\n").unwrap());
+        session
+            .exp_string(&format!("{}/sub\r\n", dir.path().display()))
+            .unwrap();
+        session.exp_string("rc> ").unwrap();
+        session.send_line("if true; then").unwrap();
+        session.exp_string("rc-more> ").unwrap();
+        session.send_line("echo continued").unwrap();
+        session.exp_string("rc-more> ").unwrap();
+        submit(&mut session, "fi");
+        session.exp_string("\r\ncontinued\r\n").unwrap();
+        session.exp_string("rc> ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn explicit_file_preserves_path_bytes_and_defines_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir
+            .path()
+            .join(OsStr::from_bytes(b"rc '; echo injected; # \xff"));
+        std::fs::write(&rc, "greet() { echo from-rc; }\n").unwrap();
+        // The explicit file overrides the default, even with shell metacharacters.
+        std::fs::write(dir.path().join(".so1shrc"), "echo wrong-file; exit 9\n").unwrap();
+        let mut session = session(&dir, Some(rc.as_os_str()), Some(dir.path().as_os_str()));
+        assert_no_output(&session.exp_string("$ ").unwrap());
+        submit(&mut session, "greet");
+        assert_no_output(&session.exp_string("from-rc\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    fn error_then_prompt(mut session: PtySession, diagnostic: &str) {
+        session.exp_string(diagnostic).unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo $?");
+        assert_no_output(&session.exp_string("2\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo after");
+        assert_no_output(&session.exp_string("after\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    fn rc_error(source: &str, diagnostic: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join("rc");
+        std::fs::write(&rc, source).unwrap();
+        error_then_prompt(session(&dir, Some(rc.as_os_str()), None), diagnostic);
+    }
+
+    #[test]
+    fn syntax_error_keeps_session_working() {
+        rc_error("if true; then\n", "syntax error");
+    }
+
+    #[test]
+    fn runtime_error_keeps_session_working() {
+        rc_error("echo ${nope?rc-missing}; echo forbidden\n", "rc-missing");
+    }
+
+    #[test]
+    fn missing_explicit_file_reports_error_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join("missing-rc");
+        std::fs::write(dir.path().join(".so1shrc"), "exit 9\n").unwrap();
+        error_then_prompt(
+            session(&dir, Some(rc.as_os_str()), Some(dir.path().as_os_str())),
+            ".:",
+        );
+    }
+
+    #[test]
+    fn exit_in_file_ends_session_before_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join("rc");
+        std::fs::write(&rc, "exit 3\n").unwrap();
+        let mut session = session(&dir, Some(rc.as_os_str()), None);
+        exited(&mut session, 3);
+    }
+
+    #[test]
+    fn return_in_file_keeps_session_and_skips_rest_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join("rc");
+        std::fs::write(&rc, "x=before; return 7; x=forbidden\n").unwrap();
+        let mut session = session(&dir, Some(rc.as_os_str()), None);
+        assert_no_output(&session.exp_string("$ ").unwrap());
+        submit(&mut session, "echo $? $x");
+        assert_no_output(&session.exp_string("7 before\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn missing_default_and_unset_or_empty_home_are_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut absent = session(&dir, None, Some(dir.path().as_os_str()));
+        assert_no_output(&absent.exp_string("$ ").unwrap());
+        submit(&mut absent, "exit");
+        exited(&mut absent, 0);
+        // A local dotfile must not be sourced through a relative empty HOME.
+        std::fs::write(dir.path().join(".so1shrc"), "exit 9\n").unwrap();
+        for home in [None, Some(OsStr::new(""))] {
+            let mut session = session(&dir, Some(OsStr::new("")), home);
+            assert_no_output(&session.exp_string("$ ").unwrap());
+            submit(&mut session, "exit");
+            exited(&mut session, 0);
+        }
+    }
+}

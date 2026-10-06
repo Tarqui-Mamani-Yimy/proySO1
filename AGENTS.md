@@ -11,7 +11,11 @@ the session. History paths retain OS bytes. Reedline accepts Unicode strings:
 invalid UTF-8 in PS1/PS2 is replaced for display only, and interactive input
 is Unicode-only; engine variables and non-interactive byte handling are unchanged.
 Piped input, `-c`, and script arguments use the shared epsh CLI dispatcher.
-Rc files and interactive job control are not implemented yet.
+Foreground jobs use their own process group and terminal; Ctrl-C/Ctrl-\\/Ctrl-Z
+return to the prompt with status 130/131/148. Stopped jobs are reported and
+terminated with SIGTERM + SIGCONT, escalating to SIGKILL after 200 ms, then
+reaped. Terminal ownership and cooked modes are restored after each job.
+Rc files are not implemented yet; job resume (`fg`/`bg`/`jobs`) is Phase 2.
 
 ## Architecture
 
@@ -20,6 +24,7 @@ Cargo.toml        Virtual workspace: crates/epsh and crates/shell
 crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
   src/repl.rs     Reedline editor, parser-backed validator, prompts and history
+  src/terminal.rs Interactive-only process group, signal policy and tty modes
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/epsh/src/
@@ -91,6 +96,8 @@ let mut ish = Shell::builder()
     .external_handler(handler)   // you own fork/exec/wait
     .build();
 // ShellError::Stopped { pid, pgid } propagates when a process is stopped
+// Frontends without job resume may opt into cleanup; host jobs are never adopted.
+ish.discard_stopped_jobs();
 
 // Builtin detection for permission systems / prompt coloring
 assert!(is_builtin("echo"));

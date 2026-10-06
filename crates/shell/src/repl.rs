@@ -89,6 +89,8 @@ pub fn run(shell: &mut Shell) -> i32 {
 }
 
 fn read_lines(shell: &mut Shell) -> io::Result<i32> {
+    let terminal = crate::terminal::Terminal::new()?;
+    shell.opts_mut().interactive = true;
     let mut editor = Reedline::create().with_validator(Box::new(ShellValidator));
     if let Some(path) = history_path(shell) {
         match FileBackedHistory::with_file(reedline::HISTORY_SIZE, path) {
@@ -103,7 +105,11 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                 if let Err(error) = editor.sync_history() {
                     eprintln!("so1sh: history: {error}");
                 }
-                if let ControlFlow::Break(status) = shell.eval_repl_line(&source) {
+                terminal.restore()?; // Never launch a child with editor raw modes.
+                let result = shell.eval_repl_line(&source);
+                shell.discard_stopped_jobs();
+                terminal.restore()?;
+                if let ControlFlow::Break(status) = result {
                     return Ok(status.code());
                 }
             }

@@ -380,3 +380,139 @@ fn ctrl_c_discards_prompt_input_without_exiting() {
     submit(&mut session, "exit");
     exited(&mut session, 0);
 }
+
+// Always clean up test jobs, including baseline failures before shell recovery.
+struct TestJobs(Vec<i32>);
+impl Drop for TestJobs {
+    fn drop(&mut self) {
+        for &pid in &self.0 {
+            // SAFETY: only PIDs created by this test's private shell are targeted.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
+    let (mut session, dir) = session();
+    session.exp_string("$ ").unwrap();
+    let command = if pipeline {
+        "sh -c 'echo $$ > first; echo first-ready >&2; exec sleep 100' | sh -c 'echo $$ > last; echo last-ready >&2; exec cat'"
+    } else {
+        "sh -c 'echo $$ > first; echo first-ready >&2; exec sleep 100'"
+    };
+    submit(&mut session, command);
+    if pipeline {
+        session.exp_regex("(?:first|last)-ready\\r\\n").unwrap();
+        session.exp_regex("(?:first|last)-ready\\r\\n").unwrap();
+    } else {
+        session.exp_string("first-ready\r\n").unwrap();
+    }
+    let names = if pipeline {
+        vec!["first", "last"]
+    } else {
+        vec!["first"]
+    };
+    let mut jobs = TestJobs(
+        names
+            .iter()
+            .map(|name| {
+                std::fs::read_to_string(dir.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let tty = session.process().get_file_handle().unwrap();
+    use std::os::fd::AsRawFd;
+    assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, jobs.0[0]);
+    session
+        .send(std::str::from_utf8(&[signal]).unwrap())
+        .unwrap();
+    session.flush().unwrap();
+    if status == 148 {
+        session.exp_string("stopped").unwrap();
+    }
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo $?");
+    assert_no_output(&session.exp_string(&format!("{status}\r\n")).unwrap());
+    session.exp_string("$ ").unwrap();
+    // Exited/stopped jobs must have been terminated and reaped, not orphaned.
+    for &pid in &jobs.0 {
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "job {pid} is still alive"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+    jobs.0.clear(); // Never signal an already reaped PID that could be reused.
+    submit(&mut session, "echo after");
+    assert_no_output(&session.exp_string("after\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn foreground_ctrl_c_returns_status_130() {
+    foreground_signal(false, 0x03, 130);
+}
+#[test]
+fn foreground_ctrl_backslash_returns_status_131() {
+    foreground_signal(false, 0x1c, 131);
+}
+#[test]
+fn foreground_ctrl_z_is_reported_and_cleaned_up() {
+    foreground_signal(false, 0x1a, 148);
+}
+#[test]
+fn pipeline_ctrl_c_terminates_every_stage() {
+    foreground_signal(true, 0x03, 130);
+}
+#[test]
+fn pipeline_ctrl_z_cleans_up_every_stage() {
+    foreground_signal(true, 0x1a, 148);
+}
+
+#[test]
+fn children_see_cooked_modes_and_job_mode_changes_are_restored() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    for command in ["stty -a", "stty -icanon -isig; stty -a"] {
+        submit(&mut session, command);
+        let output = session.exp_string("$ ").unwrap();
+        let plain = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+        if command == "stty -a" {
+            assert!(plain.contains("icanon"));
+            assert!(!plain.contains("-icanon"), "{plain}");
+            assert!(!plain.contains("-isig"), "{plain}");
+        }
+    }
+    submit(&mut session, "stty -a");
+    let output = session.exp_string("$ ").unwrap();
+    assert!(!output.contains("-icanon"), "{output}");
+    assert!(!output.contains("-isig"), "{output}");
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn terminal_control_does_not_reopen_redirected_closed_stdin() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(
+        &mut session,
+        "sh -c 'test -t 0 && echo reopened-tty || echo stdin-closed' 0<&-",
+    );
+    session.exp_string("stdin-closed\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}

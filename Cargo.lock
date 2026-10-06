@@ -709,6 +709,7 @@ name = "so1sh"
 version = "0.1.0"
 dependencies = [
  "epsh",
+ "libc",
  "reedline",
  "rexpect",
  "strip-ansi-escapes",

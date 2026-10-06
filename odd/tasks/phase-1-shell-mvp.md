@@ -59,7 +59,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - [x] **T3 — Line editor with persistent history** (route: delegated → `codex-impl`)
   - reedline: history file, Ctrl-R search, multiline input when the parser reports incomplete input (open quote, `if` without `fi`).
   - Accept: PTY tests for history recall across sessions and a multiline `if`.
-- [ ] **T3b — Line editor follow-ups from review** (route: delegated → `codex-impl`, after T4)
+- [x] **T3b — Line editor follow-ups from review** (route: delegated → `codex-impl`, after T4)
   - R3-001: `parse_interactive` treats any syntax error after EOF as incomplete; `echo >` + Enter waits for continuation instead of reporting `syntax error near newline` (orchestrator PTY probe: no error printed). Fix and test.
   - R3-002: no tests for history I/O failure paths (unwritable or directory `SO1SH_HISTFILE`).
   - R3-003: treat empty `HOME` / `SO1SH_HISTFILE` as unset.
@@ -100,6 +100,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T4 (`28c3d89` epsh foreground job lifecycle + `discard_stopped_jobs`; `324d273` so1sh terminal ownership, ignored job-control signals at prompt, cooked modes restored): Ctrl-C 130, Ctrl-\\ 131, Ctrl-Z reports Stopped + discard, 148. Workspace 517 green (orchestrator spot-check); epsh verified alone. Codex disclosed initially invalid signal REDs (unflushed rexpect control bytes) and re-proved them against the baseline.
   Native review: high risk, user granted, 4 lenses approved, acknowledged. 8 WARNINGs -> T4b.
 
+- T3b (`a601d55` epsh: forbidden line endings reported immediately, e.g. `echo >` like dash; `30a3fc9` shell: empty HOME/HISTFILE unset, Enter-newline validation for empty heredoc delimiter and backslash-newline, history I/O failure and exact Ctrl-R PTY tests). Workspace 527 green; epsh verified alone. History/Ctrl-R tests passed before the fix (coverage, disclosed by Codex).
+  Native review: high risk, user granted, approved, acknowledged; 1 WARNING (`parser.rs:84`) + 3 suggestions.
+
 ## Progress / Next step
-- T3b running on `codex-impl`; then T4b (high priority), T5, T6.
+- T4b running on `codex-impl` (high priority); then T5, T6.
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

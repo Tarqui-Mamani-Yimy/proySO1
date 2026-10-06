@@ -566,6 +566,239 @@ mod builtin_list {
     }
 }
 
+mod embedder_builtins {
+    use super::*;
+    use epsh::shell_bytes::ShellBytes;
+
+    fn register_hello(shell: &mut Shell) {
+        shell
+            .register_embedder_builtin("hello", |_shell, _argv| Ok(ExitStatus::SUCCESS))
+            .unwrap();
+    }
+
+    #[test]
+    fn callback_receives_argv_and_writes_to_configured_sinks() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr.clone())
+            .build();
+        shell
+            .register_embedder_builtin("hello", |shell, argv| {
+                assert_eq!(
+                    argv,
+                    &[ShellBytes::from("hello"), ShellBytes::from("world")]
+                );
+                shell.write_stdout(b"hello world\n");
+                shell.write_stderr(b"hello diagnostic\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+
+        assert_eq!(
+            shell.run_program(&parse("hello world")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"hello world\n");
+        assert_eq!(*stderr.lock().unwrap(), b"hello diagnostic\n");
+        assert!(shell.is_embedder_builtin_registered("hello"));
+        assert!(!is_builtin("hello"));
+    }
+
+    #[test]
+    fn argv_preserves_non_utf8_bytes() {
+        let captured = Arc::new(Mutex::new(Vec::<ShellBytes>::new()));
+        let captured_args = captured.clone();
+        let mut shell = Shell::new();
+        shell
+            .register_embedder_builtin("hello", move |_shell, argv| {
+                captured_args.lock().unwrap().extend_from_slice(argv);
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+        let invalid = ShellBytes::from_vec(vec![0xff]);
+        let encoded = epsh::encoding::bytes_to_str(invalid.as_bytes());
+
+        assert_eq!(
+            shell.run_program(&parse(&format!("hello {encoded}"))),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![ShellBytes::from("hello"), invalid]
+        );
+    }
+
+    #[test]
+    fn redirections_and_pipelines_reach_embedder_builtins() {
+        if isolated_test("embedder_builtins::redirections_and_pipelines_reach_embedder_builtins") {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let mut shell = Shell::builder().cwd(temp.path().to_path_buf()).build();
+        shell
+            .register_embedder_builtin("hello", |shell, argv| {
+                shell.write_stdout(argv[1].as_bytes());
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+
+        assert_eq!(
+            shell.run_program(&parse("hello redirected > direct.out")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(
+            fs::read(temp.path().join("direct.out")).unwrap(),
+            b"redirected"
+        );
+        assert_eq!(
+            shell.run_program(&parse("hello piped | cat > pipeline.out")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(
+            fs::read(temp.path().join("pipeline.out")).unwrap(),
+            b"piped"
+        );
+    }
+
+    #[test]
+    fn command_substitution_runs_embedder_builtin() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        shell
+            .register_embedder_builtin("hello", |shell, argv| {
+                shell.write_stdout(argv[1].as_bytes());
+                shell.write_stdout(b"\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+
+        let command = parse("hello substituted");
+        assert_eq!(
+            shell.command_subst(&command.commands[0]).unwrap(),
+            "substituted"
+        );
+        assert!(stdout.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn command_v_and_type_recognize_embedder_builtins() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        register_hello(&mut shell);
+
+        assert_eq!(
+            shell.run_program(&parse("command -v hello; type hello")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(
+            *stdout.lock().unwrap(),
+            b"hello\nhello is a shell builtin\n"
+        );
+    }
+
+    #[test]
+    fn function_takes_precedence_over_embedder_builtin() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        shell
+            .register_embedder_builtin("hello", |shell, _argv| {
+                shell.write_stdout(b"embedder\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+
+        assert_eq!(
+            shell.run_program(&parse("hello() { echo function; }; hello")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"function\n");
+    }
+
+    #[test]
+    fn function_takes_precedence_over_regular_epsh_builtin() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+
+        assert_eq!(
+            shell.run_program(&parse("echo() { command echo function; }; echo")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"function\n");
+    }
+
+    #[test]
+    fn regular_builtin_shadowing_requires_explicit_opt_in() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        assert!(
+            shell
+                .register_embedder_builtin("echo", |_shell, _argv| Ok(ExitStatus::SUCCESS))
+                .is_err()
+        );
+        assert!(
+            shell
+                .register_embedder_builtin_shadowing_regular("echo", |shell, _argv| {
+                    shell.write_stdout(b"embedder echo\n");
+                    Ok(ExitStatus::SUCCESS)
+                })
+                .is_ok()
+        );
+        assert!(
+            shell
+                .register_embedder_builtin_shadowing_regular("exit", |_shell, _argv| {
+                    Ok(ExitStatus::SUCCESS)
+                })
+                .is_err()
+        );
+        assert!(
+            shell
+                .register_embedder_builtin("times", |_shell, _argv| { Ok(ExitStatus::SUCCESS) })
+                .is_err()
+        );
+        assert_eq!(
+            shell.run_program(&parse("echo ordinary?")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"embedder echo\n");
+    }
+
+    #[test]
+    fn command_prefix_invokes_registered_builtin() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        shell
+            .register_embedder_builtin("hello", |shell, argv| {
+                shell.write_stdout(argv[1].as_bytes());
+                shell.write_stdout(b"\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+        assert_eq!(
+            shell.run_program(&parse("command hello dispatched")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"dispatched\n");
+    }
+
+    #[test]
+    fn callback_shell_errors_propagate_through_normal_error_handling() {
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stderr_sink(stderr.clone()).build();
+        shell
+            .register_embedder_builtin("hello", |_shell, _argv| {
+                Err(epsh::error::ShellError::Runtime {
+                    msg: "callback failed".into(),
+                    span: Default::default(),
+                })
+            })
+            .unwrap();
+        assert_eq!(shell.run_program(&parse("hello")), ExitStatus::MISUSE);
+        assert_eq!(*stderr.lock().unwrap(), b"epsh: callback failed\n");
+    }
+}
+
 mod external_handler {
     use super::*;
     use epsh::eval::ExternalHandler;

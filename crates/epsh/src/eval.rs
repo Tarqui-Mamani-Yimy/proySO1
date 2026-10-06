@@ -191,6 +191,19 @@ pub type ExternalHandler = Box<
         + Send,
 >;
 
+/// Callback for application-provided shell builtins.
+///
+/// The argv slice includes the command name at index 0 and preserves arbitrary
+/// shell bytes. Implementations can use [`Shell::write_stdout`] and
+/// [`Shell::write_stderr`] to honor configured output sinks.
+pub type EmbedderBuiltinHandler =
+    dyn Fn(&mut Shell, &[ShellBytes]) -> crate::error::Result<ExitStatus> + Send + Sync + 'static;
+
+struct RegisteredEmbedderBuiltin {
+    handler: Arc<EmbedderBuiltinHandler>,
+    shadows_regular_builtin: bool,
+}
+
 thread_local! {
     static EXTERNAL_COMMAND_CWD: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
@@ -308,6 +321,8 @@ pub struct Shell {
     /// Optional callback that replaces eval_external for spawning processes.
     /// Lets embedders control process creation (job control, sandboxing, etc.).
     external_handler: Option<ExternalHandler>,
+    /// Application-provided builtins, separate from epsh's stable builtin set.
+    embedder_builtins: FxHashMap<String, RegisteredEmbedderBuiltin>,
     /// Optional provider that opens writable redirection targets.
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
     /// PID of the last background command ($!).
@@ -505,6 +520,7 @@ pub struct ShellBuilder {
     timeout: Option<std::time::Duration>,
     env_clear: bool,
     external_handler: Option<ExternalHandler>,
+    embedder_builtins: FxHashMap<String, RegisteredEmbedderBuiltin>,
     redirect_open_handler: Option<RedirectOpenHandler>,
 }
 
@@ -531,6 +547,7 @@ impl ShellBuilder {
             timeout: None,
             env_clear: false,
             external_handler: None,
+            embedder_builtins: FxHashMap::default(),
             redirect_open_handler: None,
         }
     }
@@ -646,6 +663,7 @@ impl ShellBuilder {
             interrupted: None,
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
+            embedder_builtins: self.embedder_builtins,
             redirect_open_handler: self.redirect_open_handler,
             last_bg_pid: None,
             pending_stdin: None,
@@ -690,6 +708,7 @@ impl Shell {
             interrupted: None,
             timeout: None,
             external_handler: None,
+            embedder_builtins: FxHashMap::default(),
             redirect_open_handler: None,
             last_bg_pid: None,
             pending_stdin: None,
@@ -806,13 +825,11 @@ impl Shell {
         self.stderr_sink = Some(sink);
     }
 
-    /// Write a string to stdout (sink or fd 1).
-    /// Decodes PUA-encoded bytes back to raw bytes for non-UTF-8 preservation.
-    pub(crate) fn write_out(&self, s: &str) {
-        let data = crate::encoding::str_to_bytes(s);
+    /// Write bytes to stdout, honoring an installed output sink.
+    pub fn write_stdout(&self, data: &[u8]) {
         if let Some(ref sink) = self.stdout_sink {
             if let Ok(mut w) = sink.lock() {
-                let _ = w.write_all(&data);
+                let _ = w.write_all(data);
             }
         } else {
             // SAFETY: fd 1 (stdout) is always valid; data pointer and length are from a live Vec.
@@ -820,17 +837,28 @@ impl Shell {
         }
     }
 
-    /// Write a string to stderr (sink or fd 2).
-    pub(crate) fn write_err(&self, s: &str) {
-        let data = crate::encoding::str_to_bytes(s);
+    /// Write bytes to stderr, honoring an installed error sink.
+    pub fn write_stderr(&self, data: &[u8]) {
         if let Some(ref sink) = self.stderr_sink {
             if let Ok(mut w) = sink.lock() {
-                let _ = w.write_all(&data);
+                let _ = w.write_all(data);
             }
         } else {
             // SAFETY: fd 2 (stderr) is always valid; data pointer and length are from a live Vec.
             sys::write(2, data.as_ptr() as *const _, data.len());
         }
+    }
+
+    /// Write shell text to stdout, decoding preserved non-UTF-8 bytes.
+    pub(crate) fn write_out(&self, s: &str) {
+        let data = crate::encoding::str_to_bytes(s);
+        self.write_stdout(&data);
+    }
+
+    /// Write shell text to stderr, decoding preserved non-UTF-8 bytes.
+    pub(crate) fn write_err(&self, s: &str) {
+        let data = crate::encoding::str_to_bytes(s);
+        self.write_stderr(&data);
     }
 
     /// Write a formatted error message to stderr.
@@ -1062,6 +1090,128 @@ impl Shell {
     ///   assignments
     pub fn set_external_handler(&mut self, handler: ExternalHandler) {
         self.external_handler = Some(handler);
+    }
+
+    /// Register an application builtin without shadowing an epsh builtin.
+    ///
+    /// POSIX special builtins cannot be registered. Registration also fails
+    /// when `name` is an epsh builtin; use
+    /// [`Shell::register_embedder_builtin_shadowing_regular`] to explicitly
+    /// replace a regular (non-special) epsh builtin.
+    pub fn register_embedder_builtin<F>(
+        &mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) -> std::result::Result<(), String>
+    where
+        F: Fn(&mut Shell, &[ShellBytes]) -> crate::error::Result<ExitStatus>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_embedder_builtin_inner(name.into(), handler, false)
+    }
+
+    /// Register an application builtin that explicitly shadows a regular
+    /// epsh builtin of the same name. POSIX special builtins are never
+    /// shadowable. Functions still take precedence over this registration.
+    pub fn register_embedder_builtin_shadowing_regular<F>(
+        &mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) -> std::result::Result<(), String>
+    where
+        F: Fn(&mut Shell, &[ShellBytes]) -> crate::error::Result<ExitStatus>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_embedder_builtin_inner(name.into(), handler, true)
+    }
+
+    fn register_embedder_builtin_inner<F>(
+        &mut self,
+        name: String,
+        handler: F,
+        shadows_regular_builtin: bool,
+    ) -> std::result::Result<(), String>
+    where
+        F: Fn(&mut Shell, &[ShellBytes]) -> crate::error::Result<ExitStatus>
+            + Send
+            + Sync
+            + 'static,
+    {
+        if name.is_empty() {
+            return Err("embedder builtin name cannot be empty".into());
+        }
+        if crate::builtins::is_special_builtin(&name) {
+            return Err(format!("cannot register POSIX special builtin: {name}"));
+        }
+        if self.embedder_builtins.contains_key(&name) {
+            return Err(format!("embedder builtin already registered: {name}"));
+        }
+        if crate::builtins::is_builtin(&name) && !shadows_regular_builtin {
+            return Err(format!(
+                "epsh builtin {name} requires explicit shadowing opt-in"
+            ));
+        }
+        self.embedder_builtins.insert(
+            name,
+            RegisteredEmbedderBuiltin {
+                handler: Arc::new(handler),
+                shadows_regular_builtin,
+            },
+        );
+        Ok(())
+    }
+
+    /// Return whether an application builtin with `name` is registered.
+    pub fn is_embedder_builtin_registered(&self, name: &str) -> bool {
+        self.embedder_builtins.contains_key(name)
+    }
+
+    pub(crate) fn embedder_builtin_shadows_regular(&self, name: &str) -> bool {
+        self.embedder_builtins
+            .get(name)
+            .is_some_and(|builtin| builtin.shadows_regular_builtin)
+    }
+
+    pub(crate) fn run_embedder_builtin(
+        &mut self,
+        name: &str,
+        args: &[String],
+    ) -> crate::error::Result<Option<ExitStatus>> {
+        let Some(handler) = self
+            .embedder_builtins
+            .get(name)
+            .map(|builtin| builtin.handler.clone())
+        else {
+            return Ok(None);
+        };
+        let argv = args
+            .iter()
+            .map(|argument| ShellBytes::from_str_lossless(argument))
+            .collect::<Vec<_>>();
+        handler(self, &argv).map(Some)
+    }
+
+    pub(crate) fn try_builtin_with_embedder(
+        &mut self,
+        name: &str,
+        args: &[String],
+        assigns: &[Assignment],
+        span: Span,
+    ) -> crate::error::Result<Option<ExitStatus>> {
+        if crate::builtins::is_special_builtin(name) {
+            return self.try_builtin(name, args, assigns, &[], span);
+        }
+        if self.embedder_builtin_shadows_regular(name) {
+            return self.run_embedder_builtin(name, args);
+        }
+        if let Some(status) = self.try_builtin(name, args, assigns, &[], span)? {
+            return Ok(Some(status));
+        }
+        self.run_embedder_builtin(name, args)
     }
 
     /// Install a provider that owns the open of writable redirections
@@ -1712,20 +1862,33 @@ impl Shell {
 
         // Every outcome, including builtin errors, falls through to the
         // descriptor restoration below.
-        let result = match self.try_builtin(cmd_name, &expanded_args, assigns, &[], span) {
-            Ok(Some(status)) => Ok(status),
-            Err(e) => Err(e),
-            Ok(None) => {
-                if let Some(func_body) = self.functions.get(cmd_name).cloned() {
-                    self.ev_exit = false; // function body may have multiple commands
-                    self.eval_function(&func_body, &expanded_args, assigns, &[], span)
-                } else if self.external_handler.is_some() {
-                    self.call_external_handler(&expanded_args, assigns)
-                } else {
-                    self.eval_external(&expanded_args, assigns, &[], span)
-                }
+        let result = (|| {
+            if crate::builtins::is_special_builtin(cmd_name) {
+                return match self.try_builtin_with_embedder(
+                    cmd_name,
+                    &expanded_args,
+                    assigns,
+                    span,
+                )? {
+                    Some(status) => Ok(status),
+                    None => Err(ShellError::CommandNotFound(cmd_name.clone())),
+                };
             }
-        };
+            if let Some(func_body) = self.functions.get(cmd_name).cloned() {
+                self.ev_exit = false; // function body may have multiple commands
+                return self.eval_function(&func_body, &expanded_args, assigns, &[], span);
+            }
+            if let Some(status) =
+                self.try_builtin_with_embedder(cmd_name, &expanded_args, assigns, span)?
+            {
+                return Ok(status);
+            }
+            if self.external_handler.is_some() {
+                self.call_external_handler(&expanded_args, assigns)
+            } else {
+                self.eval_external(&expanded_args, assigns, &[], span)
+            }
+        })();
 
         if is_exec {
             // exec redirections are permanent — close saved copies instead of restoring
@@ -2404,6 +2567,9 @@ impl Shell {
                 sys::close(fds[0]);
                 sys::dup2(fds[1], 1);
                 sys::close(fds[1]);
+                // Command-substitution stdout belongs to the pipe, not a
+                // parent-provided sink copied across fork.
+                self.stdout_sink = None;
 
                 let status = match self.eval_command(cmd) {
                     Ok(s) => s,

@@ -98,6 +98,27 @@ fn shell_public_methods() {
 }
 
 #[test]
+fn embedder_builtin_api_is_additive() {
+    let handler: Box<eval::EmbedderBuiltinHandler> = Box::new(|shell, argv| {
+        shell.write_stdout(argv[1].as_bytes());
+        shell.write_stderr(b"diagnostic\n");
+        Ok(error::ExitStatus::SUCCESS)
+    });
+    let mut shell = eval::Shell::new();
+    shell
+        .register_embedder_builtin("host_hello", handler)
+        .unwrap();
+    assert!(shell.is_embedder_builtin_registered("host_hello"));
+    assert!(!builtins::is_builtin("host_hello"));
+
+    let shadowing: Box<eval::EmbedderBuiltinHandler> =
+        Box::new(|_shell, _argv| Ok(error::ExitStatus::SUCCESS));
+    shell
+        .register_embedder_builtin_shadowing_regular("host_regular", shadowing)
+        .unwrap();
+}
+
+#[test]
 fn shell_accessor_methods() {
     let mut shell = eval::Shell::new();
 

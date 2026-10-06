@@ -257,6 +257,27 @@ primitives for an interactive shell to be built on top:
 Everything else (prompt, history, line editing, `fg`/`bg`/`jobs`) is the
 interactive shell's responsibility.
 
+### Embedder Builtins
+
+Applications can register shell-local builtins on a `Shell` instance with
+`register_embedder_builtin(name, callback)`. The callback receives `&mut Shell`
+and byte-preserving `argv` (`argv[0]` is the command name), and returns the
+normal `Result<ExitStatus, ShellError>`. Use `Shell::write_stdout` and
+`Shell::write_stderr` for output so configured stdout/stderr sinks are honored;
+redirections are installed before the callback runs. Registered names are
+reported by `command -v`, `command -V`, and `type`. Query registrations with
+`Shell::is_embedder_builtin_registered`; `builtins::is_builtin` and
+`BUILTIN_NAMES` continue to describe epsh's builtins only.
+
+Lookup follows POSIX command precedence: special builtins first, then shell
+functions, then regular epsh builtins, embedder builtins, and PATH. A function
+can therefore take precedence over an embedder builtin. By default, registering
+an epsh builtin name fails. Applications may explicitly opt into shadowing a
+regular epsh builtin with `register_embedder_builtin_shadowing_regular`; POSIX
+special builtins are never shadowable. The existing `ExternalHandler` remains a
+fallback for otherwise-unresolved names before epsh's PATH executor, preserving
+its established catch-all behavior.
+
 ## Agent Discoverability and Shell Terminology
 
 Coding agents navigate by filenames and text search. Keep names distinctive,

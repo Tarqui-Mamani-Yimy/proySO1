@@ -642,7 +642,7 @@ impl Shell {
                     // -V: verbose, like `type`
                     if self.functions.contains_key(name.as_str()) {
                         self.write_out(&format!("{name} is a function\n"));
-                    } else if is_builtin(name) {
+                    } else if is_builtin(name) || self.is_embedder_builtin_registered(name) {
                         self.write_out(&format!("{name} is a shell builtin\n"));
                     } else if let Ok(path) = self.which(name) {
                         self.write_out(&format!("{name} is {path}\n"));
@@ -652,7 +652,10 @@ impl Shell {
                     }
                 } else {
                     // -v: terse — print path, or name for builtins/functions
-                    if self.functions.contains_key(name.as_str()) || is_builtin(name) {
+                    if self.functions.contains_key(name.as_str())
+                        || is_builtin(name)
+                        || self.is_embedder_builtin_registered(name)
+                    {
                         self.write_out(&format!("{name}\n"));
                     } else if let Ok(path) = self.which(name) {
                         self.write_out(&format!("{path}\n"));
@@ -668,7 +671,7 @@ impl Shell {
 
         // `command` bypasses functions but NOT builtins. External commands use
         // the embedder's handler when one is installed, like ordinary lookup.
-        if let Some(status) = self.try_builtin(&new_args[0], &new_args, &[], &[], span)? {
+        if let Some(status) = self.try_builtin_with_embedder(&new_args[0], &new_args, &[], span)? {
             Ok(status)
         } else if self.has_external_handler() {
             self.call_external_handler(&new_args, &[])
@@ -682,7 +685,7 @@ impl Shell {
         for name in &args[1..] {
             if self.functions.contains_key(name.as_str()) {
                 self.write_out(&format!("{name} is a function\n"));
-            } else if is_builtin(name) {
+            } else if is_builtin(name) || self.is_embedder_builtin_registered(name) {
                 self.write_out(&format!("{name} is a shell builtin\n"));
             } else if let Ok(path) = self.which(name) {
                 self.write_out(&format!("{name} is {path}\n"));
@@ -1213,6 +1216,15 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "export", "readonly", "unset", "set", "shift", "eval", ".", "source", "test", "[", "read",
     "local", "exec", "command", "type", "wait", "trap", "kill", "umask", "getopts",
 ];
+
+const POSIX_SPECIAL_BUILTIN_NAMES: &[&str] = &[
+    ":", ".", "break", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set",
+    "shift", "times", "trap", "unset",
+];
+
+pub(crate) fn is_special_builtin(name: &str) -> bool {
+    POSIX_SPECIAL_BUILTIN_NAMES.contains(&name)
+}
 
 /// Check if a command name is a shell builtin.
 pub fn is_builtin(name: &str) -> bool {

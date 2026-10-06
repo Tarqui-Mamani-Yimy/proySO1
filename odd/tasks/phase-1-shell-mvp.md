@@ -56,9 +56,14 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - `eval_repl_line` returns `Break` for generic runtime errors and Cancelled/Stopped (`crates/epsh/src/eval.rs:930-942`), so e.g. `${x?msg}` or a special-builtin error ends the session. POSIX 2.8.1: an interactive shell must not exit on these errors.
   - Only `exit` (and errexit when set) should end the REPL; errors set `$?` and return to the prompt. Document the `Break` contract.
   - Accept: PTY tests for `${nope?missing}` then `echo after`, and a redirection error on a special builtin.
-- [ ] **T3 — Line editor with persistent history** (route: delegated → `codex-impl`)
+- [x] **T3 — Line editor with persistent history** (route: delegated → `codex-impl`)
   - reedline: history file, Ctrl-R search, multiline input when the parser reports incomplete input (open quote, `if` without `fi`).
   - Accept: PTY tests for history recall across sessions and a multiline `if`.
+- [ ] **T3b — Line editor follow-ups from review** (route: delegated → `codex-impl`, after T4)
+  - R3-001: `parse_interactive` treats any syntax error after EOF as incomplete; `echo >` + Enter waits for continuation instead of reporting `syntax error near newline` (orchestrator PTY probe: no error printed). Fix and test.
+  - R3-002: no tests for history I/O failure paths (unwritable or directory `SO1SH_HISTFILE`).
+  - R3-003: treat empty `HOME` / `SO1SH_HISTFILE` as unset.
+  - R3-004/R3-005 (suggestions): empty heredoc delimiter needs two Enters; Ctrl-R test does not prove submission semantics.
 - [ ] **T4 — Foreground jobs and signals** (route: delegated → `codex-impl`)
   - Shell ignores SIGINT/SIGQUIT/SIGTSTP/SIGTTOU at the prompt; children run in their own process group with the terminal (epsh `interactive(true)`).
   - Ctrl-C kills the foreground command, not the shell; status 130.
@@ -82,6 +87,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T2b (`91118c0`): REPL survives expansion errors, special-builtin errors (redirection, invalid break/continue operands, missing `.` file) per POSIX 2.8.1; only `exit`/errexit end the session; Cancelled -> 130, Stopped -> 148, both continue. Private `special_builtin_failed` marker; public `ShellError` unchanged. Workspace 497 green (orchestrator spot-check); orchestrator PTY probe: `local` scope is unwound after an error inside a function.
   Native review: high risk, user granted, approved, acknowledged. WARNINGs to revisit: sticky `special_builtin_failed` side channel (`eval.rs:289`), partial context restore in `eval_repl_line` (`eval.rs:906-913`), stopped child not adopted (`eval.rs:957-962`) -> Phase 2 job control.
 
+- T3 (`c239849` epsh `Parser::parse_interactive`; `4c3d06b` so1sh reedline 0.52.1 MIT): PS1/PS2, persistent history (`$SO1SH_HISTFILE` or `~/.so1sh_history`), Ctrl-R, multiline via parser-backed validator, Ctrl-C clears line, Ctrl-D exits. epsh verified alone after its commit. Workspace 508 green (orchestrator spot-check). Limitation: reedline is Unicode-only (invalid PS1 bytes shown as U+FFFD).
+  Native review: medium risk (slice budget), user granted, consolidated review approved, acknowledged. WARNINGs -> T3b.
+
 ## Progress / Next step
-- Resumed 2026-10-05. Next: T3 (reedline) on `codex-impl`, then T4, T5, T6.
+- T4 running on `codex-impl`; then T3b, T5, T6.
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

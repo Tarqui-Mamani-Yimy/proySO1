@@ -107,6 +107,8 @@ pub fn run(shell: &mut Shell) -> i32 {
 }
 
 fn read_lines(shell: &mut Shell) -> io::Result<i32> {
+    let jobs = crate::jobs::register(shell)
+        .map_err(|error| io::Error::other(format!("so1sh: jobs builtin: {error}")))?;
     let terminal = match crate::terminal::Terminal::acquire() {
         Ok(terminal) => Some(terminal),
         Err(error) => {
@@ -120,7 +122,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         // Quoted variable expansion preserves path bytes without interpreting
         // the filename as shell syntax. Reuse '.' and normal REPL error/exit flow.
         let result = shell.eval_repl_line(command);
-        shell.discard_stopped_jobs();
+        crate::jobs::sync(shell, &jobs);
         if let Some(terminal) = &terminal {
             terminal.reclaim()?;
         }
@@ -146,7 +148,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                     terminal.reclaim()?;
                 }
                 let result = shell.eval_repl_line(&source);
-                shell.discard_stopped_jobs();
+                crate::jobs::sync(shell, &jobs);
                 if let Some(terminal) = &terminal {
                     terminal.reclaim()?;
                 }

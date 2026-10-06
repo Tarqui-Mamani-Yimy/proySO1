@@ -15,8 +15,11 @@ Empty history variables are treated as unset; without a usable HOME, history
 stays in memory. History I/O errors are reported without ending the session.
 Foreground jobs use their own process group and terminal; Ctrl-C/Ctrl-\\ abort
 the remaining interactive line (including builtin loops), returning with 130/131.
-Ctrl-Z reports status 148; stopped jobs are killed without resuming user code,
-reaped, and their output relays joined. Terminal ownership and cooked modes are
+Ctrl-Z reports status 148 and keeps the stopped job in the job table
+(`[n]+  Stopped  cmd`); `cmd &` registers a job and prints `[n] pgid`. The
+`jobs` builtin (registered through the embedder builtin hook) lists jobs, with
+`-l` for process groups and `%n`, `%+`, `%%`, `%-`, `%string`, `%?string` specs.
+Job state changes are polled with waitpid on the job's own pids only. Terminal ownership and cooked modes are
 restored after each job. Startup waits for foreground permission instead of
 stealing the tty, and exit returns it to its original owner. Without a controlling
 tty, one diagnostic is printed and editing continues without terminal job control.
@@ -29,7 +32,7 @@ persistent shell, so prompts, variables, functions and cwd can be configured.
 Missing defaults are silent; explicit missing files and rc errors are reported
 with normal REPL recovery (including `set -e` semantics). `exit` in the rc ends
 the session. Piped input, `-c`, and script arguments never source an rc file.
-Job resume (`fg`/`bg`/`jobs`) is Phase 2.
+Job resume (`fg`/`bg`) and done/stopped notifications are later Phase 2 tasks.
 
 ## Architecture
 
@@ -39,6 +42,7 @@ crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
+  src/jobs.rs     Job table, job specs and the `jobs` builtin
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/epsh/src/

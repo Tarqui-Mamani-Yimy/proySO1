@@ -4,6 +4,44 @@ use rexpect::process::WaitStatus;
 use rexpect::session::{PtySession, spawn_command};
 use tempfile::TempDir;
 
+struct ProcessGroupCleanup(Option<libc::pid_t>);
+
+impl ProcessGroupCleanup {
+    fn new(pgid: libc::pid_t) -> Self {
+        Self(Some(pgid))
+    }
+
+    fn terminate(&self) {
+        if let Some(pgid) = self.0 {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+fn background_pgid(launch: &[u8]) -> libc::pid_t {
+    let plain = String::from_utf8(strip_ansi_escapes::strip(launch)).unwrap();
+    plain
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|pair| {
+            (pair[0] == "[1]")
+                .then(|| pair[1].parse::<libc::pid_t>().ok())
+                .flatten()
+        })
+        .expect("background launch should report job number and process group")
+}
+
+impl Drop for ProcessGroupCleanup {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 fn session() -> (PtySession, TempDir) {
     session_with(&[], None)
 }
@@ -559,6 +597,7 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
             })
             .collect(),
     );
+    let mut cleanup = (status == 148).then(|| ProcessGroupCleanup::new(jobs.0[0]));
     let tty = session.process().get_file_handle().unwrap();
     use std::os::fd::AsRawFd;
     assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, jobs.0[0]);
@@ -567,13 +606,32 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
         .unwrap();
     session.flush().unwrap();
     if status == 148 {
-        session.exp_string("stopped").unwrap();
+        let stopped = session.exp_string("$ ").unwrap();
+        let stopped = String::from_utf8(strip_ansi_escapes::strip(stopped)).unwrap();
+        assert!(stopped.contains("Stopped"), "{stopped:?}");
+    } else {
+        session.exp_string("$ ").unwrap();
+    }
+    submit(&mut session, "echo $?");
+    let status_output = session.exp_string(&format!("{status}\r\n")).unwrap();
+    if status != 148 {
+        assert_no_output(&status_output);
     }
     session.exp_string("$ ").unwrap();
-    submit(&mut session, "echo $?");
-    assert_no_output(&session.exp_string(&format!("{status}\r\n")).unwrap());
-    session.exp_string("$ ").unwrap();
-    // Exited/stopped jobs must have been terminated and reaped, not orphaned.
+    if let Some(cleanup) = &cleanup {
+        for &pid in &jobs.0 {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "stopped job {pid} vanished"
+            );
+        }
+        cleanup.terminate();
+        submit(&mut session, "jobs");
+        let _ = session.exp_string("$ ").unwrap();
+    }
+    // Interrupted jobs are terminated/reaped, and stopped-job fixtures are
+    // explicitly killed and reaped below so tests cannot leak a child.
     for &pid in &jobs.0 {
         assert_eq!(
             unsafe { libc::kill(pid, 0) },
@@ -585,9 +643,15 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
             Some(libc::ESRCH)
         );
     }
+    if let Some(cleanup) = &mut cleanup {
+        cleanup.disarm();
+    }
     jobs.0.clear(); // Never signal an already reaped PID that could be reused.
     submit(&mut session, "echo after");
-    assert_no_output(&session.exp_string("after\r\n").unwrap());
+    let after = session.exp_string("after\r\n").unwrap();
+    if status != 148 {
+        assert_no_output(&after);
+    }
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -602,15 +666,119 @@ fn foreground_ctrl_backslash_returns_status_131() {
     foreground_signal(false, 0x1c, 131);
 }
 #[test]
-fn foreground_ctrl_z_is_reported_and_cleaned_up() {
+fn foreground_ctrl_z_is_reported_and_cleaned_up_by_test() {
     foreground_signal(false, 0x1a, 148);
+}
+
+#[test]
+fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
+    use std::os::fd::AsRawFd;
+
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let pgid = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if pgid != shell_group {
+            break pgid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no foreground job");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    let stopped = session.exp_string("$ ").unwrap();
+    let stopped = String::from_utf8(strip_ansi_escapes::strip(stopped)).unwrap();
+    assert!(stopped.contains("[1]+  Stopped  sleep 100"), "{stopped:?}");
+
+    submit(&mut session, "jobs");
+    let listing = session.exp_string("$ ").unwrap();
+    let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+    assert!(listing.contains("[1]+ Stopped  sleep 100"), "{listing:?}");
+
+    cleanup.terminate();
+    submit(&mut session, "jobs");
+    session.exp_string("$ ").unwrap();
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn background_job_is_registered_and_listed_as_running() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sleep 100 &");
+    let launch = session.exp_string("$ ").unwrap();
+    let pgid = background_pgid(launch.as_bytes());
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    let launch = String::from_utf8(strip_ansi_escapes::strip(launch)).unwrap();
+    assert!(launch.contains(&format!("[1] {pgid}")), "{launch:?}");
+
+    submit(&mut session, "jobs -l");
+    let listing = session.exp_string("$ ").unwrap();
+    let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+    assert!(
+        listing.contains(&format!("[1]+ {pgid} Running  sleep 100")),
+        "{listing:?}"
+    );
+
+    cleanup.terminate();
+    submit(&mut session, "jobs");
+    session.exp_string("$ ").unwrap();
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn finished_background_job_is_reported_done() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sleep 0.1 &");
+    let launch = session.exp_string("$ ").unwrap();
+    let mut cleanup = ProcessGroupCleanup::new(background_pgid(launch.as_bytes()));
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    submit(&mut session, "jobs");
+    let listing = session.exp_string("$ ").unwrap();
+    let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+    assert!(listing.contains("[1]  Done(0)"), "{listing:?}");
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn jobs_resolves_prefix_job_spec() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sleep 100 &");
+    let launch = session.exp_string("$ ").unwrap();
+    let mut cleanup = ProcessGroupCleanup::new(background_pgid(launch.as_bytes()));
+
+    submit(&mut session, "jobs %sleep");
+    let listing = session.exp_string("$ ").unwrap();
+    let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+    assert!(listing.contains("[1]+ Running  sleep 100"), "{listing:?}");
+
+    cleanup.terminate();
+    submit(&mut session, "jobs");
+    session.exp_string("$ ").unwrap();
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
 }
 #[test]
 fn pipeline_ctrl_c_terminates_every_stage() {
     foreground_signal(true, 0x03, 130);
 }
 #[test]
-fn pipeline_ctrl_z_cleans_up_every_stage() {
+fn pipeline_ctrl_z_is_retained_and_cleaned_up_by_test() {
     foreground_signal(true, 0x1a, 148);
 }
 

@@ -80,7 +80,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - R4-unbounded-ttin-spin / R3-ttin-spin-orphaned-group: `Terminal::acquire` busy-loops forever when started in an orphaned background group (SIGTTIN stop is discarded) (`terminal.rs:65-74`); bound it (sleep/backoff, orphan detection, fall back to no job control).
   - R3-terminal-modes-before-foreground: modes saved with tcgetattr before the shell is in the foreground (`terminal.rs:48-51`); save them after acquiring the terminal.
   - R2-dead-wuntraced-branch (`eval.rs:849-851`), polling interval constants (`eval.rs:939`): clean up.
-- [ ] **T5 — Startup rc file** (route: delegated → `codex-impl`)
+- [x] **T5 — Startup rc file** (route: delegated → `codex-impl`)
   - Source `$SO1SH_RC` or `~/.so1shrc` at startup when interactive; errors reported, not fatal.
   - Accept: PTY test with an rc that sets PS1 and an alias-free function.
 - [ ] **T6 — Phase verification** (route: orchestrator + fresh Claude verifier subagent; Antigravity session closed by the user on 2026-10-05)
@@ -114,6 +114,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   Native review: high risk, user granted, 4 lenses approved, acknowledged; 6 WARNINGs -> T4c (two are safety-critical).
   Lesson: PTY probes must answer reedline's cursor-position query (ESC[6n) or the editor blocks.
 
+- T5 (`f3f5173`): interactive so1sh sources `$SO1SH_RC` or `~/.so1shrc` through `.` before the first prompt (errors recover per T2b; exit ends the shell; missing explicit rc reported, missing default silent; non-interactive never reads it). Workspace 550 green (orchestrator spot-check).
+  Native review: high risk, user granted, approved, acknowledged. WARNING: a relative `SO1SH_RC` without a slash is searched in PATH by `.` (`repl.rs:90`) -> resolve relative to cwd or document. Suggestions: rc + `set -e` untested, duplicated post-eval tail.
+
 ## Progress / Next step
-- T5 running on `codex-impl`; then T4c (high priority), then T6 (orchestrator + Claude verifier).
+- T4c running on `codex-impl` (high priority); then T6 (orchestrator + Claude verifier). Small follow-up: relative SO1SH_RC PATH search.
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

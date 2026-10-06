@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::ast::*;
 
+const INTERACTIVE_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
 fn is_dot_navigation(path: &Path) -> bool {
     let mut has_component = false;
     for component in path.components() {
@@ -372,7 +374,9 @@ impl ForegroundTerminal {
             let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
             let group = libc::tcgetpgrp(fd);
             let mut modes = std::mem::zeroed();
-            if group == -1 || libc::tcgetattr(fd, &mut modes) == -1 {
+            // A frontend can fall back while /dev/tty still exists. Never hand
+            // that terminal to a job unless this shell has foreground permission.
+            if group == -1 || group != libc::getpgrp() || libc::tcgetattr(fd, &mut modes) == -1 {
                 return None;
             }
             Some(Self { file, group, modes })
@@ -849,13 +853,11 @@ impl Shell {
         if self.opts.interactive {
             return self.wait_interactive_child(pid, pgid);
         }
-        let wuntraced = if self.opts.interactive { 1 } else { 0 };
-
         // If no cancel flag or timeout, just block
         if self.cancel.is_none() && self.timeout.is_none() {
             let mut status = 0i32;
             // SAFETY: pid is a valid child PID obtained from fork().
-            sys::waitpid(pid, &mut status, wuntraced);
+            sys::waitpid(pid, &mut status, 0);
             if sys::wifstopped(status) {
                 // Don't remove from child_pids — process is still alive
                 self.record_stopped_job(pgid, &[pid]);
@@ -870,7 +872,7 @@ impl Shell {
         std::thread::spawn(move || {
             let mut status = 0i32;
             // SAFETY: pid is a valid child PID obtained from fork().
-            sys::waitpid(pid, &mut status, wuntraced);
+            sys::waitpid(pid, &mut status, 0);
             let _ = tx.send(status);
         });
         loop {
@@ -936,7 +938,7 @@ impl Shell {
                 self.child_pids.retain(|&p| p != pid);
                 return Err(ShellError::Io(error));
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(INTERACTIVE_WAIT_POLL_INTERVAL);
         }
     }
 
@@ -950,7 +952,12 @@ impl Shell {
         // SAFETY: verify a live owned member still pins the original group.
         // Individual kills also cover a child that changed its own group.
         unsafe {
-            if pgid > 0 && members.iter().any(|&pid| libc::getpgid(pid) == pgid) {
+            // An owned child can rejoin us; group signalling must never kill
+            // this shell or an embedding application's other group members.
+            if pgid > 0
+                && pgid != libc::getpgrp()
+                && members.iter().any(|&pid| libc::getpgid(pid) == pgid)
+            {
                 libc::kill(-pgid, libc::SIGKILL);
             }
             for &pid in &members {

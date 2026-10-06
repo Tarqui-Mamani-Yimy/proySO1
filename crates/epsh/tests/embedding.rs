@@ -1286,6 +1286,59 @@ mod interactive_line_interrupts {
 mod interactive_wait {
     use super::*;
 
+    #[test]
+    fn cancel_and_timeout_never_signal_the_shell_group() {
+        if isolated_test("interactive_wait::cancel_and_timeout_never_signal_the_shell_group") {
+            return;
+        }
+        // Confine the baseline SIGKILL to this private test and its children.
+        assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+        let group = unsafe { libc::getpgrp() };
+        for timeout in [false, true] {
+            let mut host = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .args(["-c", "/bin/sleep 0.1; exit 7"])
+                .spawn()
+                .unwrap();
+            let mut shell = Shell::builder()
+                .env_clear()
+                .interactive(true)
+                .external_handler(Box::new(move |_, _| {
+                    // Runs in the engine-owned background fork, not the host.
+                    assert_eq!(unsafe { libc::setpgid(0, group) }, 0);
+                    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) }, 0);
+                    loop {
+                        unsafe { libc::pause() };
+                    }
+                }))
+                .build();
+            assert_eq!(shell.run_script("group-child & owned=$!"), 0);
+            let owned: i32 = shell.get_var("owned").unwrap().parse().unwrap();
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(owned, &mut status, libc::WUNTRACED) },
+                owned
+            );
+            assert!(libc::WIFSTOPPED(status));
+            assert_eq!(unsafe { libc::getpgid(owned) }, group);
+            if timeout {
+                shell.set_timeout(Duration::ZERO);
+            } else {
+                shell.set_cancel_flag(Arc::new(AtomicBool::new(true)));
+            }
+            assert_eq!(
+                shell.eval_repl_line(":"),
+                std::ops::ControlFlow::Continue(ExitStatus::from(130))
+            );
+            assert_eq!(unsafe { libc::kill(owned, 0) }, -1, "owned child survived");
+            assert_eq!(
+                host.wait().unwrap().code(),
+                Some(7),
+                "host child was killed"
+            );
+        }
+    }
+
     fn run_cancelled(pipeline: bool, timeout: bool) {
         let dir = tempdir().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));

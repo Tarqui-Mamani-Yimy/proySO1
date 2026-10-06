@@ -2,6 +2,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 
+const FOREGROUND_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const FOREGROUND_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Acquired foreground ownership and cooked modes, independent of redirected stdin.
 pub struct Terminal {
     file: File,
@@ -34,6 +37,7 @@ pub fn ignore_prompt_signals() -> io::Result<()> {
 
 impl Terminal {
     /// Wait for foreground permission with SIGTTIN before taking the terminal.
+    /// If stops are discarded (e.g. an orphaned group), back off and time out.
     /// Changes this process's group and prompt signal dispositions; Drop returns
     /// terminal ownership to the group observed before acquisition.
     pub fn acquire() -> io::Result<Self> {
@@ -42,10 +46,6 @@ impl Terminal {
         unsafe {
             let original_group = libc::tcgetpgrp(file.as_raw_fd());
             if original_group == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut modes = std::mem::zeroed();
-            if libc::tcgetattr(file.as_raw_fd(), &mut modes) == -1 {
                 return Err(io::Error::last_os_error());
             }
             // A parent may have ignored or blocked TTIN; restore stop semantics
@@ -61,6 +61,7 @@ impl Terminal {
             {
                 return Err(io::Error::last_os_error());
             }
+            let deadline = std::time::Instant::now() + FOREGROUND_WAIT_TIMEOUT;
             loop {
                 let foreground = libc::tcgetpgrp(file.as_raw_fd());
                 if foreground == -1 {
@@ -70,9 +71,18 @@ impl Terminal {
                 if foreground == group {
                     break;
                 }
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "foreground permission unavailable (possibly orphaned process group)",
+                    ));
+                }
                 if libc::kill(-group, libc::SIGTTIN) == -1 {
                     return Err(io::Error::last_os_error());
                 }
+                // A normal stop suspends us until resumed. An orphan's stop is
+                // discarded, so sleep to avoid a tight signal/syscall loop.
+                std::thread::sleep(FOREGROUND_WAIT_INTERVAL);
             }
             let pgid = libc::getpid();
             if libc::getpgrp() != pgid && libc::setpgid(0, pgid) == -1 {
@@ -80,6 +90,10 @@ impl Terminal {
             }
             ignore_prompt_signals()?;
             if libc::tcsetpgrp(file.as_raw_fd(), pgid) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut modes = std::mem::zeroed();
+            if libc::tcgetattr(file.as_raw_fd(), &mut modes) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self {

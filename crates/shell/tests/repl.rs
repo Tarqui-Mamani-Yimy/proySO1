@@ -801,6 +801,167 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
     exited(&mut session, 0);
 }
 
+#[test]
+fn background_startup_saves_modes_after_foreground_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-i")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("HOME", dir.path())
+        .env("PS1", "parent> ")
+        .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
+        .current_dir(dir.path());
+    let mut session = spawn_command(command, Some(3000)).unwrap();
+    session.process_mut().set_kill_timeout(Some(1000));
+    session.exp_string("parent> ").unwrap();
+    session.send_line("stty -icanon; PS1='$ ' \"$SO1SH_BIN\" & child=$!; echo $child > child; wait $child; stty icanon; echo ready-for-fg").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pid = loop {
+        if let Ok(raw) = std::fs::read_to_string(dir.path().join("child"))
+            && let Ok(pid) = raw.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "job did not start");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let mut child = TestJobs(vec![pid]);
+    session.exp_string("ready-for-fg\r\n").unwrap();
+    session.exp_string("parent> ").unwrap();
+    // The parent changed modes while so1sh was stopped in its acquisition loop.
+    session.send_line("fg").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "stty -a");
+    let output = session.exp_string("$ ").unwrap();
+    let output = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+    assert!(
+        output
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .any(|flag| flag == "icanon"),
+        "child inherited stale background modes: {output}"
+    );
+    submit(&mut session, "exit");
+    session.exp_string("parent> ").unwrap();
+    child.0.clear();
+    session.send_line("exit").unwrap();
+    exited(&mut session, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn orphaned_background_startup_falls_back_without_spinning() {
+    use std::os::fd::AsRawFd;
+    const NAME: &str = "orphaned_background_startup_falls_back_without_spinning";
+    if std::env::var("SO1SH_ORPHAN_TEST").as_deref() != Ok(NAME) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("SO1SH_ORPHAN_TEST", NAME)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(stdout.lines().any(|line| line == "running 1 test"));
+        assert!(stdout.contains("test result: ok. 1 passed; 0 failed;"));
+        return;
+    }
+    // Isolated Linux subreaper: reap the deliberately orphaned job, not PID 1.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+    struct Orphan(i32);
+    impl Drop for Orphan {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("rc"),
+        "/bin/sh -c 'owner=$(/bin/ps -o tpgid= -p $$); test \"$owner\" -eq \"$SO1SH_PARENT_PGID\"' || exit 9\nexit 3\n",
+    )
+    .unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-i")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("HOME", dir.path())
+        .env("PS1", "parent> ")
+        .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
+        .env("SO1SH_RC", dir.path().join("rc"))
+        .current_dir(dir.path());
+    let mut session = spawn_command(command, Some(3000)).unwrap();
+    session.process_mut().set_kill_timeout(Some(1000));
+    session.exp_string("parent> ").unwrap();
+    let tty = session.process().get_file_handle().unwrap();
+    let owner = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    session
+        .send_line(&format!("export SO1SH_PARENT_PGID={owner}"))
+        .unwrap();
+    session.exp_string("parent> ").unwrap();
+    let started = std::time::Instant::now();
+    // The subshell exits before the background job starts so1sh. Its new parent
+    // (this subreaper) belongs to another session, making its group orphaned.
+    session.send_line("( /bin/sh -c 'while [ ! -e ready ]; do /bin/sleep 0.01; done; exec \"$SO1SH_BIN\"' </dev/tty >/dev/tty 2>&1 & echo $! > child ); : > ready").unwrap();
+    let deadline = started + std::time::Duration::from_secs(2);
+    let pid = loop {
+        if let Ok(raw) = std::fs::read_to_string(dir.path().join("child"))
+            && let Ok(pid) = raw.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "job did not start");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let mut orphan = Orphan(pid);
+    assert_ne!(unsafe { libc::getpgid(pid) }, owner);
+    if let Err(error) = session.exp_string("so1sh: terminal:") {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert_eq!(
+            unsafe { libc::wait4(pid, std::ptr::null_mut(), 0, &mut usage) },
+            pid
+        );
+        orphan.0 = 0;
+        let cpu_micros = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1_000_000
+            + usage.ru_utime.tv_usec
+            + usage.ru_stime.tv_usec;
+        panic!("orphan startup used {cpu_micros}us CPU without fallback: {error:?}");
+    }
+    session
+        .exp_string("continuing without terminal job control\r\n")
+        .unwrap();
+    assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner);
+    let mut status = 0;
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::wait4(pid, &mut status, 0, &mut usage) }, pid);
+    orphan.0 = 0;
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        3,
+        "rc failed after fallback (9 means command stole tty)"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    let cpu_micros = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1_000_000
+        + usage.ru_utime.tv_usec
+        + usage.ru_stime.tv_usec;
+    assert!(cpu_micros < 250_000, "startup consumed {cpu_micros}us CPU");
+    session.send_line("exit").unwrap();
+    exited(&mut session, 0);
+}
+
 mod startup_rc {
     use super::*;
     use std::ffi::OsStr;

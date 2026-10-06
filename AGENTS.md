@@ -20,6 +20,9 @@ reaped, and their output relays joined. Terminal ownership and cooked modes are
 restored after each job. Startup waits for foreground permission instead of
 stealing the tty, and exit returns it to its original owner. Without a controlling
 tty, one diagnostic is printed and editing continues without terminal job control.
+If background stops are discarded, acquisition retries at 10 ms intervals and
+falls back after 1 second without foreground permission. Modes are captured only
+after foreground acquisition; fallback commands cannot take another owner's tty.
 Before the first interactive prompt, startup sources non-empty `$SO1SH_RC`, or
 the existing `$HOME/.so1shrc` when HOME is non-empty. It runs through `.` in the
 persistent shell, so prompts, variables, functions and cwd can be configured.

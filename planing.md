@@ -191,7 +191,7 @@ Licencia de so1Shell: **pendiente de decidir** (recomendado MIT o Apache-2.0, co
 |---|---|---|---|
 | (orquestador, pane `w3:p3`) | Claude Code / Opus 5.5 | Orquestador: plan, tareas `odd/tasks/`, decisiones, asignación vía `herdr agent prompt`, integración | Solo planificación y documentos de tareas |
 | `codex-impl` (pane `w3:p1`) | Codex / GPT-6.1-Sol (high) | Implementador único: código, tests, Cargo; TDD estricto; un commit convencional por unidad de trabajo en rama de feature | Sí (único escritor de código) |
-| `agy-research` (pane `w3:p4`) | Antigravity / Gemini 3.8 Flash (high) | Investigador y verificador: specs externas con fuentes; corre `cargo test`, `clippy`, `check.pl`; revisa diffs | No (solo lectura) |
+| ~~`agy-research`~~ | ~~Antigravity / Gemini 3.8 Flash~~ | Sesión cerrada por el usuario el 2026-10-05. La verificación independiente pasa a subagentes de Claude (solo lectura) lanzados por el orquestador | No |
 
 Reglas:
 - Un solo escritor sobre el mismo árbol de trabajo, para evitar conflictos.

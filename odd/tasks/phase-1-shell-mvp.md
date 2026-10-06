@@ -64,14 +64,21 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - R3-002: no tests for history I/O failure paths (unwritable or directory `SO1SH_HISTFILE`).
   - R3-003: treat empty `HOME` / `SO1SH_HISTFILE` as unset.
   - R3-004/R3-005 (suggestions): empty heredoc delimiter needs two Enters; Ctrl-R test does not prove submission semantics.
-- [ ] **T4 — Foreground jobs and signals** (route: delegated → `codex-impl`)
+- [x] **T4 — Foreground jobs and signals** (route: delegated → `codex-impl`)
   - Shell ignores SIGINT/SIGQUIT/SIGTSTP/SIGTTOU at the prompt; children run in their own process group with the terminal (epsh `interactive(true)`).
   - Ctrl-C kills the foreground command, not the shell; status 130.
   - Accept: PTY test `sleep 100` + Ctrl-C returns to the prompt with `$?` 130.
+- [ ] **T4b — Signal follow-ups from review** (route: delegated → `codex-impl`, after T3b; HIGH priority)
+  - R3-001 (confirmed by orchestrator PTY probe): Ctrl-C kills the child but does not abort the enclosing loop/list; `while true; do sleep 0.3; done` cannot be interrupted and the shell never returns to the prompt. A foreground child killed by SIGINT must abort the current line (like dash/bash).
+  - R4-001: `Terminal::new` calls tcsetpgrp without checking it is in the foreground (e.g. `so1sh &` steals the terminal); wait until foreground (SIGTTIN loop) and remember the original foreground group.
+  - R3-002: if `Terminal::new` fails (no controlling tty), fall back gracefully instead of failing the REPL.
+  - R2-003: interactive wait path bypasses cancel/timeout-aware wait and skips joining relay threads.
+  - R4-002: `discard_stopped_jobs` continues the job in the background after the terminal was taken back.
+  - R2-001/R2-002/R2-004: misleading `stopped_child_pending` name, raw close of OwnedFd gate pipe, `Terminal::new` side effects not obvious.
 - [ ] **T5 — Startup rc file** (route: delegated → `codex-impl`)
   - Source `$SO1SH_RC` or `~/.so1shrc` at startup when interactive; errors reported, not fatal.
   - Accept: PTY test with an rc that sets PS1 and an alias-free function.
-- [ ] **T6 — Phase verification** (route: delegated → `agy-research`)
+- [ ] **T6 — Phase verification** (route: orchestrator + fresh Claude verifier subagent; Antigravity session closed by the user on 2026-10-05)
   - `make ci` + manual smoke script through a PTY; report.
 
 ## Verification evidence
@@ -90,6 +97,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T3 (`c239849` epsh `Parser::parse_interactive`; `4c3d06b` so1sh reedline 0.52.1 MIT): PS1/PS2, persistent history (`$SO1SH_HISTFILE` or `~/.so1sh_history`), Ctrl-R, multiline via parser-backed validator, Ctrl-C clears line, Ctrl-D exits. epsh verified alone after its commit. Workspace 508 green (orchestrator spot-check). Limitation: reedline is Unicode-only (invalid PS1 bytes shown as U+FFFD).
   Native review: medium risk (slice budget), user granted, consolidated review approved, acknowledged. WARNINGs -> T3b.
 
+- T4 (`28c3d89` epsh foreground job lifecycle + `discard_stopped_jobs`; `324d273` so1sh terminal ownership, ignored job-control signals at prompt, cooked modes restored): Ctrl-C 130, Ctrl-\\ 131, Ctrl-Z reports Stopped + discard, 148. Workspace 517 green (orchestrator spot-check); epsh verified alone. Codex disclosed initially invalid signal REDs (unflushed rexpect control bytes) and re-proved them against the baseline.
+  Native review: high risk, user granted, 4 lenses approved, acknowledged. 8 WARNINGs -> T4b.
+
 ## Progress / Next step
-- T4 running on `codex-impl`; then T3b, T5, T6.
+- T3b running on `codex-impl`; then T4b (high priority), T5, T6.
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

@@ -58,8 +58,14 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - R4: a panicking embedder callback skips fd restoration (`eval.rs:1195`); add an unwind guard.
   - R3: functions now take precedence over regular epsh builtins (POSIX-correct, but a behavior change for scripts wrapping `cd`/`echo`); document it in AGENTS.md "Where we diverged"/changelog and add a test.
   - R3/R2: special-builtin names without an epsh implementation (e.g. `times`) now fail with CommandNotFound instead of falling back; decide and test; simplify the double dispatch.
-- [ ] **T2 — Job table and `jobs`** (codex-impl)
+- [x] **T2 — Job table and `jobs`** (codex-impl)
   - Ctrl-Z keeps the stopped job (no discard); `cmd &` registers a job; `jobs` lists `[n]+ Running/Stopped/Done  cmd`; `%n`, `%+`, `%-`, `%string` job specs.
+- [ ] **T2b — Job table follow-ups from review** (codex-impl, with T3/T4)
+  - R3/R4-poll-reaps: the job poller reaps a background job's wait status before the script's `wait $!` can collect it, so `wait` returns 127 instead of the job's status (`eval.rs:1233-1237`); keep the status available to `wait` (POSIX: `wait pid` must return a known job's status).
+  - R4-unreaped-job-stuck-running (`eval.rs:1211-1232`) and stopped-jobs entry not cleared on reap.
+  - Job table never prunes Done/Killed jobs (`jobs.rs:43-74`): remove after they are reported (with T4 notifications).
+  - Stopped jobs are never discarded on exit (`repl.rs:151`): handled by T4 (warn on exit, then HUP+CONT).
+  - Dual stopped-job tracking in epsh (`eval.rs:1118`); timing-dependent PTY tests (`repl.rs:742-750`).
 - [ ] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
   - Fix: SIGTTIN acquisition deadline must not count time spent stopped (`terminal.rs:74-79`).
@@ -83,5 +89,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T0b review: high risk, user granted, approved, acknowledged; WARNINGs -> T0c.
 - T0b (`c28731d`): `command` turns special-builtin usage failures into an ordinary status (POSIX/dash), so `{ command break foo; exit 5; }` exits 5; marker cleared by explicit exit and on success; relative-rc PTY test now has a PATH decoy. Workspace 571 green.
 
+- T2 (`252bbac` epsh owned-job info/state API polled per job pid; `0ce2047` shell job table + `jobs` builtin, Ctrl-Z keeps jobs, `[n] pgid` on `&`; AGENTS.md updated by orchestrator). Workspace 579 green; epsh verified alone. Codex's session restarted mid-report (user reopened it); its report matched the orchestrator's verification.
+  Native review: high risk, user granted, approved, acknowledged; 8 WARNINGs -> T2b.
+
 ## Progress / Next step
-- T2 running on `codex-impl`; T0b review pending; then T1b, T3.
+- T0c+T1b assigned to `codex-impl` but its turn was interrupted twice before any edit (cause unknown, asked the user); then T2b with T3/T4.

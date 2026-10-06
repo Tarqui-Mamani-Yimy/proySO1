@@ -102,7 +102,10 @@ impl fmt::Display for ShellError {
             ShellError::Syntax { msg, span } => write!(f, "{span}: syntax error: {msg}"),
             ShellError::CommandNotFound(name) => write!(f, "{name}: not found"),
             ShellError::Io(e) => write!(f, "{e}"),
-            ShellError::Runtime { msg, span } => write!(f, "{span}: {msg}"),
+            ShellError::Runtime { msg, span } if span.line > 0 && span.col > 0 => {
+                write!(f, "{span}: {msg}")
+            }
+            ShellError::Runtime { msg, .. } => write!(f, "{msg}"),
             ShellError::Cancelled => write!(f, "cancelled"),
             ShellError::TimedOut => write!(f, "timed out"),
             ShellError::Stopped { pid, pgid } => write!(f, "stopped (pid={pid}, pgid={pgid})"),

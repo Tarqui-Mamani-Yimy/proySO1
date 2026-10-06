@@ -46,6 +46,20 @@ fn assert_output(script: &str, expected_stdout: &str) {
     assert_eq!(code, 0, "script: {script:?}\nstderr: {stderr}");
 }
 
+#[test]
+fn runtime_parameter_errors_omit_unknown_source_positions() {
+    let (_, stderr, code) = run("echo ${nope?missing}");
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert_eq!(stderr, "epsh: nope: missing\n");
+}
+
+#[test]
+fn runtime_errors_keep_available_source_positions() {
+    let (_, stderr, code) = run("readonly X=1; X=2");
+    assert_eq!(code, 2, "stderr: {stderr}");
+    assert_eq!(stderr, "epsh: 1:18: X: readonly variable\n");
+}
+
 fn assert_status(script: &str, expected_code: i32) {
     let (_, _, code) = run(script);
     assert_eq!(code, expected_code, "script: {script:?}");

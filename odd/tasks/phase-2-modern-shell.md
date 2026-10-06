@@ -50,6 +50,9 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - [x] **T1 — Embedder builtin hook in epsh** (codex-impl)
   - Register builtins by name with a callback receiving the shell and argv; runs in-process with redirections applied; listed by `command -v`/`type`; does not override POSIX special builtins.
   - Accept: embedding + api_stability tests; existing behavior unchanged.
+- [ ] **T0c — Replace the sticky special-builtin failure flag** (codex-impl, with T1b)
+  - Third review in a row flags `special_builtin_failed` as a stale global side channel (T0b review R3/R4: the `command` arm converts any Exit to MISUSE while the flag is stale, and never resets it before dispatch or after conversion, `builtins.rs:675-682`).
+  - Redesign: carry the "recoverable special-builtin failure" cause in the error itself (private error variant or wrapper) instead of a shell-wide flag; remove the flag.
 - [ ] **T1b — Builtin hook follow-ups from review** (codex-impl, after T2)
   - R3-sink-vs-redirection: `write_stdout`/`write_stderr` prefer the sink even when the command's stdout is redirected (`hello > file` with a sink set writes to the sink, not the file); untested. Define and test the rule (redirection wins).
   - R4: a panicking embedder callback skips fd restoration (`eval.rs:1195`); add an unwind guard.
@@ -77,6 +80,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 
 - T1 (`0464e73`): `Shell::register_embedder_builtin` (+ explicit regular-builtin shadowing API, never special builtins), byte argv, sink-aware `write_stdout/stderr`, `command -v`/`type` discovery; lookup special -> functions -> epsh builtins -> embedder -> PATH. Also fixed: command-substitution children kept an inherited stdout sink, so builtin output bypassed the capture pipe. Workspace 568 green.
   Native review: high risk, user granted, approved, acknowledged. 5 WARNINGs -> T1b.
+- T0b review: high risk, user granted, approved, acknowledged; WARNINGs -> T0c.
 - T0b (`c28731d`): `command` turns special-builtin usage failures into an ordinary status (POSIX/dash), so `{ command break foo; exit 5; }` exits 5; marker cleared by explicit exit and on success; relative-rc PTY test now has a PATH decoy. Workspace 571 green.
 
 ## Progress / Next step

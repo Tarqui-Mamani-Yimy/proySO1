@@ -50,10 +50,10 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - [x] **T1 — Embedder builtin hook in epsh** (codex-impl)
   - Register builtins by name with a callback receiving the shell and argv; runs in-process with redirections applied; listed by `command -v`/`type`; does not override POSIX special builtins.
   - Accept: embedding + api_stability tests; existing behavior unchanged.
-- [ ] **T0c — Replace the sticky special-builtin failure flag** (codex-impl, with T1b)
+- [x] **T0c — Replace the sticky special-builtin failure flag** (codex-impl, with T1b)
   - Third review in a row flags `special_builtin_failed` as a stale global side channel (T0b review R3/R4: the `command` arm converts any Exit to MISUSE while the flag is stale, and never resets it before dispatch or after conversion, `builtins.rs:675-682`).
   - Redesign: carry the "recoverable special-builtin failure" cause in the error itself (private error variant or wrapper) instead of a shell-wide flag; remove the flag.
-- [ ] **T1b — Builtin hook follow-ups from review** (codex-impl, after T2)
+- [x] **T1b — Builtin hook follow-ups from review** (codex-impl, after T2)
   - R3-sink-vs-redirection: `write_stdout`/`write_stderr` prefer the sink even when the command's stdout is redirected (`hello > file` with a sink set writes to the sink, not the file); untested. Define and test the rule (redirection wins).
   - R4: a panicking embedder callback skips fd restoration (`eval.rs:1195`); add an unwind guard.
   - R3: functions now take precedence over regular epsh builtins (POSIX-correct, but a behavior change for scripts wrapping `cd`/`echo`); document it in AGENTS.md "Where we diverged"/changelog and add a test.
@@ -66,6 +66,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Job table never prunes Done/Killed jobs (`jobs.rs:43-74`): remove after they are reported (with T4 notifications).
   - Stopped jobs are never discarded on exit (`repl.rs:151`): handled by T4 (warn on exit, then HUP+CONT).
   - Dual stopped-job tracking in epsh (`eval.rs:1118`); timing-dependent PTY tests (`repl.rs:742-750`).
+- [ ] **T2c — Make `raw_bytes::path_lookup_handles_invalid_utf8_directories` hermetic** (codex-impl)
+  - Rare flake seen in Phase 0 T2, Phase 1 T4b and Phase 2 (full `cargo test --workspace` run after `492aa1a`); 0/15 failures in isolated reruns before and after `492aa1a` -> pre-existing, not caused by T0c/T1b. Find the shared state (tmp names, PATH, cwd) and isolate it.
 - [ ] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
   - Fix: SIGTTIN acquisition deadline must not count time spent stopped (`terminal.rs:74-79`).
@@ -92,5 +94,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T2 (`252bbac` epsh owned-job info/state API polled per job pid; `0ce2047` shell job table + `jobs` builtin, Ctrl-Z keeps jobs, `[n] pgid` on `&`; AGENTS.md updated by orchestrator). Workspace 579 green; epsh verified alone. Codex's session restarted mid-report (user reopened it); its report matched the orchestrator's verification.
   Native review: high risk, user granted, approved, acknowledged; 8 WARNINGs -> T2b.
 
+- T0c+T1b (`492aa1a`, one unit: changes interleave in eval.rs): shell-wide `special_builtin_failed` removed, replaced by internal `EvalError::RecoverableSpecialBuiltin`; embedder builtin output follows redirected fd 1/2 instead of the sink; RAII fd guard on callback panic; `times` implemented; function-over-builtin precedence documented. Orchestrator found 2 tests flaky under the parallel runner (fd-1 redirection test, process-group test) that Codex had reported green -> Codex isolated them; orchestrator verified 10/10 parallel runs green.
+  Process note: the orchestrator committed in the same command as a workspace run that showed the rare `path_lookup_handles_invalid_utf8_directories` flake; checked afterwards: 0/15 failures on both `492aa1a` and `0ce2047` -> pre-existing (T2c).
+
 ## Progress / Next step
-- T0c+T1b assigned to `codex-impl` but its turn was interrupted twice before any edit (cause unknown, asked the user); then T2b with T3/T4.
+- Next: T2c (flake) and T2b+T3 (fg/bg) on `codex-impl`; then T4.

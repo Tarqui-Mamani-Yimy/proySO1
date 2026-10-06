@@ -8,7 +8,9 @@ publish = false
 
 [dependencies]
 epsh = { path = "../epsh" }
+reedline = "0.52.1"
 
 [dev-dependencies]
 rexpect = "0.7.1"
+strip-ansi-escapes = "0.2"
 tempfile = "3"

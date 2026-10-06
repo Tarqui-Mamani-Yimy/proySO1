@@ -2,11 +2,16 @@
 
 The workspace contains `epsh`, the non-interactive, embeddable POSIX engine,
 and `so1sh` (working name), a minimal interactive shell using that engine.
-`so1sh` uses a plain one-line reader on a TTY, with `PS1` (default `$ `),
-persistent variables/cwd/functions, and status-aware `exit` and EOF.
+`so1sh` uses reedline on a TTY, with `PS1` (default `$ `), `PS2` (default
+`> `), persistent history, multiline input, and status-aware `exit` and EOF.
+Variables/cwd/functions persist; Ctrl-R searches history, Ctrl-C clears input.
+History uses `$SO1SH_HISTFILE`, otherwise `$HOME/.so1sh_history`; without either
+variable it stays in memory. History I/O errors are reported without ending
+the session. History paths retain OS bytes. Reedline accepts Unicode strings:
+invalid UTF-8 in PS1/PS2 is replaced for display only, and interactive input
+is Unicode-only; engine variables and non-interactive byte handling are unchanged.
 Piped input, `-c`, and script arguments use the shared epsh CLI dispatcher.
-Line editing, multiline input, rc files, and interactive job control are not
-implemented yet.
+Rc files and interactive job control are not implemented yet.
 
 ## Architecture
 
@@ -14,7 +19,7 @@ implemented yet.
 Cargo.toml        Virtual workspace: crates/epsh and crates/shell
 crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
-  src/repl.rs     Plain byte-preserving line reader and prompt
+  src/repl.rs     Reedline editor, parser-backed validator, prompts and history
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/epsh/src/

@@ -199,6 +199,44 @@ pub type ExternalHandler = Box<
 pub type EmbedderBuiltinHandler =
     dyn Fn(&mut Shell, &[ShellBytes]) -> crate::error::Result<ExitStatus> + Send + Sync + 'static;
 
+/// Initial state for a child job handed to an embedding frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildJobState {
+    Running,
+    Stopped,
+}
+
+/// Job ownership information for a child job launched or stopped by this shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildJobInfo {
+    pub pgid: i32,
+    pub pids: Vec<i32>,
+    pub command: String,
+    pub state: ChildJobState,
+}
+
+/// A wait-status transition for one of this shell's owned job members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildJobStatus {
+    Stopped(i32),
+    Continued,
+    Exited(i32),
+    Signaled(i32),
+}
+
+/// One process state transition observed while polling owned jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildJobUpdate {
+    pub pgid: i32,
+    pub pid: i32,
+    pub status: ChildJobStatus,
+}
+
+struct OwnedJob {
+    pgid: i32,
+    members: Vec<i32>,
+}
+
 struct RegisteredEmbedderBuiltin {
     handler: Arc<EmbedderBuiltinHandler>,
     shadows_regular_builtin: bool,
@@ -314,6 +352,10 @@ pub struct Shell {
     /// Unconsumed asynchronous jobs owned by this shell execution environment.
     pub(crate) background_pids: Vec<i32>,
     stopped_jobs: Vec<StoppedJob>,
+    owned_jobs: Vec<OwnedJob>,
+    pending_job_infos: Vec<ChildJobInfo>,
+    pending_job_updates: Vec<ChildJobUpdate>,
+    current_command_text: String,
     /// Actual interactive SIGINT/SIGQUIT, distinct from an ordinary exit code.
     interrupted: Option<ExitStatus>,
     /// Optional execution deadline. When exceeded, shell aborts with TimedOut.
@@ -660,6 +702,10 @@ impl ShellBuilder {
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
+            owned_jobs: Vec::new(),
+            pending_job_infos: Vec::new(),
+            pending_job_updates: Vec::new(),
+            current_command_text: String::new(),
             interrupted: None,
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
@@ -705,6 +751,10 @@ impl Shell {
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
+            owned_jobs: Vec::new(),
+            pending_job_infos: Vec::new(),
+            pending_job_updates: Vec::new(),
+            current_command_text: String::new(),
             interrupted: None,
             timeout: None,
             external_handler: None,
@@ -886,6 +936,7 @@ impl Shell {
             let mut status = 0i32;
             // SAFETY: pid is a valid child PID obtained from fork().
             sys::waitpid(pid, &mut status, 0);
+            self.record_owned_wait_status(pid, pid, status);
             self.child_pids.retain(|&p| p != pid);
             return Ok(ExitStatus::from_wait(status));
         }
@@ -944,8 +995,10 @@ impl Shell {
             if result == pid {
                 if libc::WIFSTOPPED(raw) {
                     self.record_stopped_job(pgid, &[pid]);
+                    self.record_owned_wait_status(pgid, pid, raw);
                     return Err(ShellError::Stopped { pid, pgid });
                 }
+                self.record_owned_wait_status(pgid, pid, raw);
                 self.child_pids.retain(|&p| p != pid);
                 return Ok(self.completed_child_status(raw));
             }
@@ -1031,6 +1084,9 @@ impl Shell {
         self.child_pids.clear();
         self.background_pids.clear();
         self.stopped_jobs.clear();
+        self.owned_jobs.clear();
+        self.pending_job_infos.clear();
+        self.pending_job_updates.clear();
         self.interrupted = None;
     }
 
@@ -1059,6 +1115,131 @@ impl Shell {
                 job.members.push(pid);
             }
         }
+        self.track_owned_job(pgid, pids, ChildJobState::Stopped);
+    }
+
+    fn track_owned_job(&mut self, pgid: i32, pids: &[i32], state: ChildJobState) {
+        if let Some(job) = self.owned_jobs.iter_mut().find(|job| job.pgid == pgid) {
+            for &pid in pids {
+                if self.child_pids.contains(&pid) && !job.members.contains(&pid) {
+                    job.members.push(pid);
+                }
+            }
+            if let Some(info) = self
+                .pending_job_infos
+                .iter_mut()
+                .find(|info| info.pgid == pgid)
+            {
+                info.pids.clone_from(&job.members);
+                if state == ChildJobState::Stopped {
+                    info.state = ChildJobState::Stopped;
+                }
+            }
+        } else {
+            let members: Vec<i32> = pids
+                .iter()
+                .copied()
+                .filter(|pid| self.child_pids.contains(pid))
+                .collect();
+            if members.is_empty() {
+                return;
+            }
+            self.owned_jobs.push(OwnedJob {
+                pgid,
+                members: members.clone(),
+            });
+            self.pending_job_infos.push(ChildJobInfo {
+                pgid,
+                pids: members,
+                command: self.current_command_text.clone(),
+                state,
+            });
+        }
+    }
+
+    fn record_owned_job_update(&mut self, pgid: i32, pid: i32, status: ChildJobStatus) -> bool {
+        let Some(job) = self.owned_jobs.iter_mut().find(|job| job.pgid == pgid) else {
+            return false;
+        };
+        if !job.members.contains(&pid) {
+            return false;
+        }
+        self.pending_job_updates
+            .push(ChildJobUpdate { pgid, pid, status });
+        if matches!(
+            status,
+            ChildJobStatus::Exited(_) | ChildJobStatus::Signaled(_)
+        ) {
+            job.members.retain(|member| *member != pid);
+        }
+        self.owned_jobs.retain(|job| !job.members.is_empty());
+        true
+    }
+
+    fn record_owned_wait_status(&mut self, pgid: i32, pid: i32, raw: i32) {
+        let status = if libc::WIFSTOPPED(raw) {
+            Some(ChildJobStatus::Stopped(libc::WSTOPSIG(raw)))
+        } else if libc::WIFCONTINUED(raw) {
+            Some(ChildJobStatus::Continued)
+        } else if libc::WIFEXITED(raw) {
+            Some(ChildJobStatus::Exited(libc::WEXITSTATUS(raw)))
+        } else if libc::WIFSIGNALED(raw) {
+            Some(ChildJobStatus::Signaled(libc::WTERMSIG(raw)))
+        } else {
+            None
+        };
+        if let Some(status) = status {
+            self.record_owned_job_update(pgid, pid, status);
+        }
+    }
+
+    /// Transfer newly launched/stopped child job details to the embedding frontend.
+    pub fn take_new_child_jobs(&mut self) -> Vec<ChildJobInfo> {
+        std::mem::take(&mut self.pending_job_infos)
+    }
+
+    /// Poll and reap only process IDs in jobs owned by this Shell instance.
+    /// No unrelated children are waited for.
+    pub fn poll_child_jobs(&mut self) -> Vec<ChildJobUpdate> {
+        let owned: Vec<(i32, Vec<i32>)> = self
+            .owned_jobs
+            .iter()
+            .map(|job| (job.pgid, job.members.clone()))
+            .collect();
+        for (pgid, members) in owned {
+            for pid in members {
+                if !self.child_pids.contains(&pid) {
+                    continue;
+                }
+                loop {
+                    let mut raw = 0;
+                    // SAFETY: pid is a specific member tracked by this Shell; never wait for arbitrary children.
+                    let result = unsafe {
+                        libc::waitpid(
+                            pid,
+                            &mut raw,
+                            libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
+                        )
+                    };
+                    if result == 0 {
+                        break;
+                    }
+                    if result == -1 {
+                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    self.record_owned_wait_status(pgid, pid, raw);
+                    if libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw) {
+                        self.child_pids.retain(|child| *child != pid);
+                        self.background_pids.retain(|child| *child != pid);
+                        break;
+                    }
+                }
+            }
+        }
+        std::mem::take(&mut self.pending_job_updates)
     }
 
     /// Terminate and reap stopped jobs created by this engine, never host jobs.
@@ -1068,6 +1249,8 @@ impl Shell {
     pub fn discard_stopped_jobs(&mut self) {
         for job in std::mem::take(&mut self.stopped_jobs) {
             self.terminate_job(job.pgid, &job.members);
+            self.owned_jobs.retain(|owned| owned.pgid != job.pgid);
+            self.pending_job_infos.retain(|info| info.pgid != job.pgid);
             for relay in job.relays {
                 let _ = relay.join();
             }
@@ -1321,7 +1504,9 @@ impl Shell {
         } else {
             None
         };
-        match Parser::new(source).parse() {
+        let previous_command_text =
+            std::mem::replace(&mut self.current_command_text, source.trim().to_owned());
+        let result = match Parser::new(source).parse() {
             Ok(program) => {
                 // Errors can unwind through a condition or loop before its normal
                 // cleanup; evaluation context must not leak into the next line.
@@ -1335,7 +1520,9 @@ impl Shell {
                 self.exit_status = ExitStatus::MISUSE;
                 ControlFlow::Continue(self.exit_status)
             }
-        }
+        };
+        self.current_command_text = previous_command_text;
+        result
     }
 
     /// Finish a REPL at EOF, running the EXIT trap while retaining the last status.
@@ -2440,6 +2627,7 @@ impl Shell {
                     let _ = crate::signal::reset_job_signals();
                 }
                 let _ = rustix::process::setpgid(None, None);
+                self.in_forked_child = true;
                 let _saved = match self.setup_redirections(redirs) {
                     Ok(s) => s,
                     Err(_) => sys::exit_child(ExitStatus::FAILURE),
@@ -2455,6 +2643,13 @@ impl Shell {
             self.child_pids.push(pid);
             self.background_pids.push(pid);
             self.last_bg_pid = Some(pid as u32);
+            // The leader establishes its own group in the child; repeat it in
+            // the parent to close the setpgid race before exposing the job.
+            let _ = rustix::process::setpgid(
+                rustix::process::Pid::from_raw(pid),
+                rustix::process::Pid::from_raw(pid),
+            );
+            self.track_owned_job(pid, &[pid], ChildJobState::Running);
             // Don't wait — background process
             Ok(ExitStatus::SUCCESS)
         }

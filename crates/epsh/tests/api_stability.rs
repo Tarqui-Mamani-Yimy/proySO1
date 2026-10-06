@@ -119,6 +119,27 @@ fn embedder_builtin_api_is_additive() {
 }
 
 #[test]
+fn owned_child_job_api_is_additive() {
+    let _: fn(&mut eval::Shell) -> Vec<eval::ChildJobInfo> = eval::Shell::take_new_child_jobs;
+    let _: fn(&mut eval::Shell) -> Vec<eval::ChildJobUpdate> = eval::Shell::poll_child_jobs;
+
+    let info = eval::ChildJobInfo {
+        pgid: 42,
+        pids: vec![42, 43],
+        command: "sleep 1 | cat".into(),
+        state: eval::ChildJobState::Running,
+    };
+    assert_eq!(info.pgid, 42);
+    assert_eq!(info.pids, [42, 43]);
+    assert_eq!(info.command, "sleep 1 | cat");
+    assert_eq!(info.state, eval::ChildJobState::Running);
+    let _: eval::ChildJobStatus = eval::ChildJobStatus::Stopped(148);
+    let _: eval::ChildJobStatus = eval::ChildJobStatus::Continued;
+    let _: eval::ChildJobStatus = eval::ChildJobStatus::Exited(0);
+    let _: eval::ChildJobStatus = eval::ChildJobStatus::Signaled(9);
+}
+
+#[test]
 fn shell_accessor_methods() {
     let mut shell = eval::Shell::new();
 

@@ -75,6 +75,11 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - R2-003: interactive wait path bypasses cancel/timeout-aware wait and skips joining relay threads.
   - R4-002: `discard_stopped_jobs` continues the job in the background after the terminal was taken back.
   - R2-001/R2-002/R2-004: misleading `stopped_child_pending` name, raw close of OwnedFd gate pipe, `Terminal::new` side effects not obvious.
+- [ ] **T4c — Job-control safety fixes from T4b review** (route: delegated → `codex-impl`; HIGH priority, before T6)
+  - R4-kill-children-own-group / R3-kill-children-resolved-group: interactive `kill_children` resolves each child's pgid and SIGKILLs the whole group without checking it differs from the shell's own group -> cancellation/timeout can kill the shell itself (`eval.rs:971-985`).
+  - R4-unbounded-ttin-spin / R3-ttin-spin-orphaned-group: `Terminal::acquire` busy-loops forever when started in an orphaned background group (SIGTTIN stop is discarded) (`terminal.rs:65-74`); bound it (sleep/backoff, orphan detection, fall back to no job control).
+  - R3-terminal-modes-before-foreground: modes saved with tcgetattr before the shell is in the foreground (`terminal.rs:48-51`); save them after acquiring the terminal.
+  - R2-dead-wuntraced-branch (`eval.rs:849-851`), polling interval constants (`eval.rs:939`): clean up.
 - [ ] **T5 — Startup rc file** (route: delegated → `codex-impl`)
   - Source `$SO1SH_RC` or `~/.so1shrc` at startup when interactive; errors reported, not fatal.
   - Accept: PTY test with an rc that sets PS1 and an alias-free function.
@@ -106,8 +111,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T4b (`9278d92` epsh: SIGINT/SIGQUIT abort the current list/loop with 130/131 incl. builtin loops; interactive waits honor cancel/timeout, signal pipeline pgids, reap members, join relays; stopped jobs discarded with SIGKILL; `8b0102e` shell: `Terminal::acquire` waits for foreground via SIGTTIN and restores the original owner; no controlling tty -> one diagnostic, REPL continues). Workspace 541 green; epsh verified alone. Orchestrator PTY probe (answering ESC[6n, script /tmp/claude-1000/so1sh-loop-probe.py): Ctrl-C aborts `sleep 100`, sleep loops and arithmetic loops -> PASS.
   Divergence from dash (orchestrator spec decision): Ctrl-\\ aborts the line with 131; dash continues the suffix after SIGQUIT.
   Codex observed one unexplained failure of `raw_bytes::path_lookup_handles_invalid_utf8_directories` during a concurrent run (rerun green, log kept) -> watch for flakiness.
+  Native review: high risk, user granted, 4 lenses approved, acknowledged; 6 WARNINGs -> T4c (two are safety-critical).
   Lesson: PTY probes must answer reedline's cursor-position query (ESC[6n) or the editor blocks.
 
 ## Progress / Next step
-- T5 running on `codex-impl`; then T6 (orchestrator + Claude verifier).
+- T5 running on `codex-impl`; then T4c (high priority), then T6 (orchestrator + Claude verifier).
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

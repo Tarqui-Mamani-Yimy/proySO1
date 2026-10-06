@@ -83,7 +83,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - [x] **T5 — Startup rc file** (route: delegated → `codex-impl`)
   - Source `$SO1SH_RC` or `~/.so1shrc` at startup when interactive; errors reported, not fatal.
   - Accept: PTY test with an rc that sets PS1 and an alias-free function.
-- [ ] **T6 — Phase verification** (route: orchestrator + fresh Claude verifier subagent; Antigravity session closed by the user on 2026-10-05)
+- [x] **T6 — Phase verification** (route: orchestrator + fresh Claude verifier subagent; Antigravity session closed by the user on 2026-10-05)
   - `make ci` + manual smoke script through a PTY; report.
 
 ## Verification evidence
@@ -120,6 +120,14 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T4c (`5f17781` epsh: never SIGKILL the shell's own process group; hand the tty to a job only with foreground permission; dead WUNTRACED branch removed; named poll interval. `758f3d4` shell: SIGTTIN wait sleeps 10 ms and times out after 1 s -> no-job-control fallback; terminal modes saved after acquiring the foreground). Orchestrator reviewed the diff (Codex report hidden by its UI); workspace 553 green; epsh verified alone.
   Native review: high risk, user granted, approved, acknowledged. WARNINGs: dead `wifstopped` check after WUNTRACED removal (`eval.rs:860`); the 1 s deadline also counts time spent stopped, so `so1sh &` resumed with `bg` after >1 s falls back instead of stopping again (`terminal.rs:74-79`) -> Phase 2 job control.
 
+- T6 (independent read-only Claude verifier, script /tmp/claude-1000/so1sh-t6/smoke.py answering ESC[6n): workspace 553/553 parallel and serial; `make ci` all steps pass except check.pl regression-37 (environmental). PTY smoke of the real binary PASS on all 15 checks: prompt/state, error recovery, `exit 3`, Ctrl-D, multiline, `echo >` immediate syntax error, history across sessions, Ctrl-C on sleep / sleep loop / builtin loop (130), children in cooked mode (`stty -a`: isig icanon), rc file + non-interactive ignores rc, background lists and `wait`. All acceptance criteria matched (T4c doc entry was added after the verifier read the file).
+  Not verified end to end: cancellation/timeout never killing the shell's own group (unit-tested + reviewed only), relative SO1SH_RC.
+  Minor: runtime error positions print as `0:0` (e.g. `epsh: 0:0: nope: missing`).
+
+## Phase 1 result
+- Shell MVP complete on `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`). Every code commit natively reviewed with user consent. Not pushed or merged: delivery is the user's decision.
+- Open follow-ups (carry into Phase 2 backlog): relative `SO1SH_RC` searched in PATH (`repl.rs:90`); `0:0` error positions; sticky `special_builtin_failed` (`eval.rs:289`); `wait` EINTR retry blocks traps; dead `wifstopped` check (`eval.rs:860`); SIGTTIN deadline counts stopped time; Ctrl-\\ aborts the line (divergence from dash, orchestrator decision).
+
 ## Progress / Next step
-- T6 running (independent Claude verifier, read-only). Small follow-up: relative SO1SH_RC PATH search.
+- PHASE 1 COMPLETE. Next: user decides merges to `main` and the PR/chain strategy (branch is well over the ~400-line budget); then Phase 2 (job control, OSC 133 blocks, completion, highlighting).
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

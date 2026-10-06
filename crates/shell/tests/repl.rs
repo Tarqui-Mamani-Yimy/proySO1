@@ -191,6 +191,14 @@ fn explicit_exit_defers_exit_trap_and_preserves_requested_status() {
     exited(&mut session, 3);
 }
 
+#[test]
+fn explicit_exit_after_caught_special_builtin_failure_terminates_repl() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "{ command break foo; exit 5; }");
+    exited(&mut session, 5);
+}
+
 fn recover_after_error(script: &str, diagnostic: &str) {
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
@@ -1037,11 +1045,25 @@ mod startup_rc {
     fn relative_rc_without_slash_is_loaded_from_current_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("rcfile"), "PS1='cwd> '; echo cwd-rc\n").unwrap();
-        let mut session = session(
-            &dir,
-            Some(OsStr::new("rcfile")),
-            Some(dir.path().as_os_str()),
-        );
+        let path_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            path_dir.path().join("rcfile"),
+            "PS1='path> '; echo path-rc\n",
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        command
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", path_dir.path().display()),
+            )
+            .env("TERM", "dumb")
+            .env("HOME", dir.path())
+            .env("SO1SH_RC", "rcfile")
+            .current_dir(&dir);
+        let mut session = spawn_command(command, Some(3000)).unwrap();
+        session.process_mut().set_kill_timeout(Some(1000));
         session.exp_string("cwd-rc\r\n").unwrap();
         session.exp_regex("cwd> ").unwrap();
         submit(&mut session, "exit");

@@ -65,6 +65,7 @@ impl Shell {
                 Some(ExitStatus::SUCCESS)
             }
             "exit" => {
+                self.special_builtin_failed = false;
                 let code = args
                     .get(1)
                     .and_then(|s| s.parse::<i32>().ok())
@@ -671,12 +672,14 @@ impl Shell {
 
         // `command` bypasses functions but NOT builtins. External commands use
         // the embedder's handler when one is installed, like ordinary lookup.
-        if let Some(status) = self.try_builtin_with_embedder(&new_args[0], &new_args, &[], span)? {
-            Ok(status)
-        } else if self.has_external_handler() {
-            self.call_external_handler(&new_args, &[])
-        } else {
-            self.eval_external(&new_args, &[], &[], span)
+        match self.try_builtin_with_embedder(&new_args[0], &new_args, &[], span) {
+            Ok(Some(status)) => Ok(status),
+            // `command` turns a special-builtin usage failure into an ordinary
+            // command status so the rest of a compound list can run.
+            Err(ShellError::Exit(_)) if self.special_builtin_failed => Ok(ExitStatus::MISUSE),
+            Ok(None) if self.has_external_handler() => self.call_external_handler(&new_args, &[]),
+            Ok(None) => self.eval_external(&new_args, &[], &[], span),
+            Err(error) => Err(error),
         }
     }
 

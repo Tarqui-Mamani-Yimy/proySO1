@@ -1355,6 +1355,7 @@ impl Shell {
             self.special_builtin_failed = false;
             match self.eval_command(cmd) {
                 Ok(status) => {
+                    self.special_builtin_failed = false;
                     self.exit_status = status;
                 }
                 Err(ShellError::Exit(n)) => {
@@ -2661,6 +2662,26 @@ mod tests {
             shell.eval_repl_line("exit 7"),
             ControlFlow::Break(status) if status.code() == 7
         ));
+    }
+
+    #[test]
+    fn repl_explicit_exit_after_caught_special_builtin_failure_exits_shell() {
+        let mut shell = Shell::new();
+        assert!(matches!(
+            shell.eval_repl_line("{ command break foo; exit 5; }"),
+            ControlFlow::Break(status) if status.code() == 5
+        ));
+    }
+
+    #[test]
+    fn repl_clears_caught_special_builtin_failure_after_compound_succeeds() {
+        let mut shell = Shell::new();
+        assert!(matches!(
+            shell.eval_repl_line("{ command break foo; after=yes; }"),
+            ControlFlow::Continue(_)
+        ));
+        assert_eq!(shell.get_var("after"), Some("yes"));
+        assert!(!shell.special_builtin_failed);
     }
 
     #[test]

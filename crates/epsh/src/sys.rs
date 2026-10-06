@@ -132,11 +132,6 @@ pub fn wtermsig(status: i32) -> i32 {
     status & 0x7f
 }
 
-/// True if `status` indicates the process was stopped (WIFSTOPPED / WUNTRACED).
-pub fn wifstopped(status: i32) -> bool {
-    (status & 0xff) == 0x7f
-}
-
 /// Return the real user ID of the calling process.
 pub fn getuid() -> u32 {
     rustix::process::getuid().as_raw()

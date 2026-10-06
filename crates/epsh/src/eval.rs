@@ -858,11 +858,6 @@ impl Shell {
             let mut status = 0i32;
             // SAFETY: pid is a valid child PID obtained from fork().
             sys::waitpid(pid, &mut status, 0);
-            if sys::wifstopped(status) {
-                // Don't remove from child_pids — process is still alive
-                self.record_stopped_job(pgid, &[pid]);
-                return Err(ShellError::Stopped { pid, pgid });
-            }
             self.child_pids.retain(|&p| p != pid);
             return Ok(ExitStatus::from_wait(status));
         }
@@ -879,10 +874,6 @@ impl Shell {
             // Check for result with a short timeout to allow cancel checks
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(status) => {
-                    if sys::wifstopped(status) {
-                        self.record_stopped_job(pgid, &[pid]);
-                        return Err(ShellError::Stopped { pid, pgid });
-                    }
                     self.child_pids.retain(|&p| p != pid);
                     return Ok(ExitStatus::from_wait(status));
                 }
@@ -1217,11 +1208,12 @@ impl Shell {
                     self.exit_status = status;
                 }
                 Err(ShellError::Exit(n)) => {
+                    let special_builtin_failed = std::mem::take(&mut self.special_builtin_failed);
                     if self.interrupted.take().is_some() {
                         self.exit_status = n;
                         return ControlFlow::Continue(n);
                     }
-                    if repl && self.special_builtin_failed {
+                    if repl && special_builtin_failed {
                         return self.repl_shell_error();
                     }
                     self.run_exit_trap();
@@ -1248,6 +1240,7 @@ impl Shell {
                     return ControlFlow::Break(ExitStatus::from(148));
                 }
                 Err(e) => {
+                    self.special_builtin_failed = false;
                     self.err_msg(&format!("epsh: {e}"));
                     if repl {
                         return self.repl_shell_error();
@@ -2488,6 +2481,20 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_script("X=hello");
         assert_eq!(shell.get_var("X"), Some("hello"));
+    }
+
+    #[test]
+    fn repl_clears_special_builtin_failure_after_recovery() {
+        let mut shell = Shell::new();
+        assert!(matches!(
+            shell.eval_repl_line("break foo"),
+            ControlFlow::Continue(_)
+        ));
+        assert!(!shell.special_builtin_failed);
+        assert!(matches!(
+            shell.eval_repl_line("exit 7"),
+            ControlFlow::Break(status) if status.code() == 7
+        ));
     }
 
     #[test]

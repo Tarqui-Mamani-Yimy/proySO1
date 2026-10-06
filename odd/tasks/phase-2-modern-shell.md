@@ -66,8 +66,12 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Job table never prunes Done/Killed jobs (`jobs.rs:43-74`): remove after they are reported (with T4 notifications).
   - Stopped jobs are never discarded on exit (`repl.rs:151`): handled by T4 (warn on exit, then HUP+CONT).
   - Dual stopped-job tracking in epsh (`eval.rs:1118`); timing-dependent PTY tests (`repl.rs:742-750`).
-- [ ] **T2c — Make `raw_bytes::path_lookup_handles_invalid_utf8_directories` hermetic** (codex-impl)
+- [x] **T2c — Make `raw_bytes::path_lookup_handles_invalid_utf8_directories` hermetic** (codex-impl)
   - Rare flake seen in Phase 0 T2, Phase 1 T4b and Phase 2 (full `cargo test --workspace` run after `492aa1a`); 0/15 failures in isolated reruns before and after `492aa1a` -> pre-existing, not caused by T0c/T1b. Find the shared state (tmp names, PATH, cwd) and isolate it.
+- [ ] **T1c — Review correction: dup redirections must stay in sinks** (codex-impl; native review of `492aa1a` returned correction_required, plan 80 lines)
+  - R3-dup-redirect-escapes-sinks (CRITICAL, `eval.rs:908-910`): with sinks set, `echo msg >&2` / `cmd 2>&1` write to the real process fd and escape the embedder's capture. File redirections bypass the sink; dups between stdout/stderr route to the matching sink.
+- [ ] **T2d — Flaky PTY test `pipeline_ctrl_z_is_retained_and_cleaned_up_by_test`** (codex-impl)
+  - Failed 4 of 11 full workspace runs in Codex's T2c verification (`crates/shell/tests/repl.rs:636`). Find the race and make it deterministic.
 - [ ] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
   - Fix: SIGTTIN acquisition deadline must not count time spent stopped (`terminal.rs:74-79`).
@@ -97,5 +101,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T0c+T1b (`492aa1a`, one unit: changes interleave in eval.rs): shell-wide `special_builtin_failed` removed, replaced by internal `EvalError::RecoverableSpecialBuiltin`; embedder builtin output follows redirected fd 1/2 instead of the sink; RAII fd guard on callback panic; `times` implemented; function-over-builtin precedence documented. Orchestrator found 2 tests flaky under the parallel runner (fd-1 redirection test, process-group test) that Codex had reported green -> Codex isolated them; orchestrator verified 10/10 parallel runs green.
   Process note: the orchestrator committed in the same command as a workspace run that showed the rare `path_lookup_handles_invalid_utf8_directories` flake; checked afterwards: 0/15 failures on both `492aa1a` and `0ce2047` -> pre-existing (T2c).
 
+- T2c: Codex could not reproduce the rare flake; removed the last shared dependency (copied Cargo `show_argv` fixture) by creating a private script in the test's temp PATH dir; integration 20/20 green. Committed by orchestrator; `.codegraph/` added to `.gitignore`.
+- T0c/T1b native review (`492aa1a`): `managed_assets_outdated` stop -> ran the provider's `gentle-ai sync --agent claude-code` (updated ~/.claude/CLAUDE.md; user-modified review agents preserved); then correction_required (R3-dup-redirect-escapes-sinks) -> plan 80 lines -> T1c.
+
 ## Progress / Next step
-- Next: T2c (flake) and T2b+T3 (fg/bg) on `codex-impl`; then T4.
+- T1c (review correction) running on `codex-impl`; then T2d (flaky PTY test), T2b+T3, T4.

@@ -40,10 +40,13 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   chain strategy still to be decided by the user together with Phases 0–1.
 
 ## Tasks
-- [ ] **T0 — Phase 1 follow-ups** (codex-impl)
+- [x] **T0 — Phase 1 follow-ups** (codex-impl)
   - Relative `SO1SH_RC` without `/` must not be searched in PATH (`repl.rs:90`).
   - Runtime error positions print `0:0` (e.g. `epsh: 0:0: nope: missing`): report real line:col or drop the prefix.
   - Remove dead `wifstopped` check (`eval.rs:860`); clear the sticky `special_builtin_failed` marker reliably (`eval.rs:289`).
+- [ ] **T0b — T0 review follow-ups** (codex-impl, small, after T1)
+  - R3-sticky-flag-ok-path: `special_builtin_failed` is only cleared on error arms; a non-fatal special-builtin failure (e.g. `command break foo`) inside one compound command leaves it set, so a following `exit N` in the same command (`{ command break foo; exit 5; }`) is misclassified. Clear it when the explicit `exit` builtin runs and on the Ok path; add that exact test.
+  - R3-relative-rc-test: make the PTY test prove no PATH search (same-named rc in a PATH dir must never be sourced).
 - [ ] **T1 — Embedder builtin hook in epsh** (codex-impl)
   - Register builtins by name with a callback receiving the shell and argv; runs in-process with redirections applied; listed by `command -v`/`type`; does not override POSIX special builtins.
   - Accept: embedding + api_stability tests; existing behavior unchanged.
@@ -64,7 +67,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - [ ] **T8 — Phase verification** (fresh Claude verifier subagent)
 
 ## Verification evidence
-_(filled per task)_
+- T0 (`09567a4` runtime errors omit unknown `0:0` positions; `fb0693b` clear REPL failure marker on handled errors, remove dead WIFSTOPPED checks; `9b082b2` PTY test: slash-less `SO1SH_RC` resolves in cwd — Codex refuted the T5 review claim of PATH search with evidence `builtins.rs:418`). Workspace 557 green (orchestrator spot-check).
+  Native review: high risk, user granted, approved, acknowledged. WARNINGs -> T0b. Process note: the new Codex session tried to run native review itself; told that review is orchestrator-owned.
 
 ## Progress / Next step
-- Next: re-brief `codex-impl` (new Codex session, model switched by the user to gpt-6-luna), then T0.
+- Codex re-briefed (new session, gpt-6-luna). T1 running on `codex-impl`; then T0b, T2.

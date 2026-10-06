@@ -2017,7 +2017,8 @@ mod raw_bytes {
         let dir = raw_path(tmp.path(), b"path-\x80");
         fs::create_dir(&dir).unwrap();
         let tool = dir.join("tool");
-        fs::copy(env!("CARGO_BIN_EXE_show_argv"), &tool).unwrap();
+        fs::write(&tool, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let out = run_script_os(
             tmp.path(),
             "type tool >/dev/null && command -v tool && tool marker",
@@ -2025,8 +2026,7 @@ mod raw_bytes {
         );
         assert_eq!(out.status.code().unwrap(), 0);
         let mut expected = tool.as_os_str().as_bytes().to_vec();
-        // show_argv prints the hex encoding of the argument "marker".
-        expected.extend_from_slice(b"\n6d61726b6572\n");
+        expected.extend_from_slice(b"\nmarker\n");
         assert_eq!(out.stdout, expected);
     }
 

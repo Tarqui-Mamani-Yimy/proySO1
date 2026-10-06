@@ -641,3 +641,162 @@ fn terminal_control_does_not_reopen_redirected_closed_stdin() {
     submit(&mut session, "exit");
     exited(&mut session, 0);
 }
+
+fn interrupt_loop(builtin_only: bool, signal: u8, status: i32) {
+    use std::os::fd::AsRawFd;
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    let line = if builtin_only {
+        "echo running; while true; do :; done; echo forbidden"
+    } else {
+        "i=0; while true; do i=$((i+1)); echo running; sleep 0.3; done; echo forbidden"
+    };
+    submit(&mut session, line);
+    session.exp_string("running\r\n").unwrap();
+    if !builtin_only {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == shell_group {
+            assert!(std::time::Instant::now() < deadline, "no foreground child");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    session
+        .send(std::str::from_utf8(&[signal]).unwrap())
+        .unwrap();
+    session.flush().unwrap();
+    let before_prompt = session.exp_string("$ ").unwrap();
+    assert!(!before_prompt.contains("forbidden"), "{before_prompt}");
+    assert!(
+        !before_prompt.contains("running"),
+        "loop continued: {before_prompt}"
+    );
+    submit(&mut session, "echo $?");
+    assert_no_output(&session.exp_string(&format!("{status}\r\n")).unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo alive");
+    assert_no_output(&session.exp_string("alive\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn interactive_ctrl_c_aborts_sleep_loop() {
+    interrupt_loop(false, 0x03, 130);
+}
+#[test]
+fn interactive_ctrl_quit_aborts_sleep_loop() {
+    interrupt_loop(false, 0x1c, 131);
+}
+#[test]
+fn interactive_ctrl_c_aborts_builtin_loop() {
+    interrupt_loop(true, 0x03, 130);
+}
+#[test]
+fn interactive_ctrl_quit_aborts_builtin_loop() {
+    interrupt_loop(true, 0x1c, 131);
+}
+
+#[test]
+fn background_start_waits_for_foreground_and_restores_parent_terminal() {
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-i")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("HOME", dir.path())
+        .env("PS1", "parent> ")
+        .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
+        .env("SO1SH_HISTFILE", dir.path().join("history"))
+        .current_dir(dir.path());
+    let mut session = spawn_command(command, Some(3000)).unwrap();
+    session.process_mut().set_kill_timeout(Some(1000));
+    session.exp_string("parent> ").unwrap();
+    let tty = session.process().get_file_handle().unwrap();
+    let parent_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    session
+        .send_line(
+            "PS1='$ ' \"$SO1SH_BIN\" & child=$!; echo $child > child; wait $child; echo waited:$?",
+        )
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !std::fs::read_to_string(dir.path().join("child"))
+        .is_ok_and(|raw| raw.trim().parse::<i32>().is_ok())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parent never started child"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let pid = std::fs::read_to_string(dir.path().join("child"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut child = TestJobs(vec![pid]);
+    // A background child must stop on SIGTTIN instead of printing its own prompt.
+    session.exp_string("waited:").unwrap();
+    session
+        .exp_string(&format!("{}\r\n", 128 + libc::SIGTTIN))
+        .unwrap();
+    session.exp_string("parent> ").unwrap();
+    assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, parent_group);
+    session.send_line("fg").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo inside");
+    session.exp_string("inside\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    session.exp_string("parent> ").unwrap();
+    assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, parent_group);
+    child.0.clear();
+    session.send_line("exit").unwrap();
+    exited(&mut session, 0);
+}
+
+#[test]
+fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("HOME", dir.path())
+        .current_dir(dir.path());
+    // SAFETY: child-only async-signal-safe detachment; keep stdin's tty fd open.
+    unsafe {
+        command.pre_exec(|| {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            let mut old = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignore.sa_mask);
+            if libc::sigaction(libc::SIGHUP, &ignore, &mut old) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let result = libc::ioctl(0, libc::TIOCNOTTY);
+            libc::sigaction(libc::SIGHUP, &old, std::ptr::null_mut());
+            if result == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut session = spawn_command(command, Some(3000)).unwrap();
+    session.process_mut().set_kill_timeout(Some(1000));
+    session.exp_string("so1sh: terminal:").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo after");
+    assert_no_output(&session.exp_string("after\r\n").unwrap());
+    let output = session.exp_string("$ ").unwrap();
+    assert!(!output.contains("terminal:"), "{output}");
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}

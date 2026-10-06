@@ -13,10 +13,13 @@ is Unicode-only; engine variables and non-interactive byte handling are unchange
 Piped input, `-c`, and script arguments use the shared epsh CLI dispatcher.
 Empty history variables are treated as unset; without a usable HOME, history
 stays in memory. History I/O errors are reported without ending the session.
-Foreground jobs use their own process group and terminal; Ctrl-C/Ctrl-\\/Ctrl-Z
-return to the prompt with status 130/131/148. Stopped jobs are reported and
-terminated with SIGTERM + SIGCONT, escalating to SIGKILL after 200 ms, then
-reaped. Terminal ownership and cooked modes are restored after each job.
+Foreground jobs use their own process group and terminal; Ctrl-C/Ctrl-\\ abort
+the remaining interactive line (including builtin loops), returning with 130/131.
+Ctrl-Z reports status 148; stopped jobs are killed without resuming user code,
+reaped, and their output relays joined. Terminal ownership and cooked modes are
+restored after each job. Startup waits for foreground permission instead of
+stealing the tty, and exit returns it to its original owner. Without a controlling
+tty, one diagnostic is printed and editing continues without terminal job control.
 Rc files are not implemented yet; job resume (`fg`/`bg`/`jobs`) is Phase 2.
 
 ## Architecture

@@ -94,7 +94,14 @@ pub fn run(shell: &mut Shell) -> i32 {
 }
 
 fn read_lines(shell: &mut Shell) -> io::Result<i32> {
-    let terminal = crate::terminal::Terminal::new()?;
+    let terminal = match crate::terminal::Terminal::acquire() {
+        Ok(terminal) => Some(terminal),
+        Err(error) => {
+            eprintln!("so1sh: terminal: {error}; continuing without terminal job control");
+            crate::terminal::ignore_prompt_signals()?;
+            None
+        }
+    };
     shell.opts_mut().interactive = true;
     let mut editor = Reedline::create().with_validator(Box::new(ShellValidator));
     if let Some(path) = history_path(shell) {
@@ -110,10 +117,14 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                 if let Err(error) = editor.sync_history() {
                     eprintln!("so1sh: history: {error}");
                 }
-                terminal.restore()?; // Never launch a child with editor raw modes.
+                if let Some(terminal) = &terminal {
+                    terminal.reclaim()?;
+                }
                 let result = shell.eval_repl_line(&source);
                 shell.discard_stopped_jobs();
-                terminal.restore()?;
+                if let Some(terminal) = &terminal {
+                    terminal.reclaim()?;
+                }
                 if let ControlFlow::Break(status) = result {
                     return Ok(status.code());
                 }

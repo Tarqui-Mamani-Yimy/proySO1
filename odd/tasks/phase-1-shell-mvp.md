@@ -75,7 +75,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - R2-003: interactive wait path bypasses cancel/timeout-aware wait and skips joining relay threads.
   - R4-002: `discard_stopped_jobs` continues the job in the background after the terminal was taken back.
   - R2-001/R2-002/R2-004: misleading `stopped_child_pending` name, raw close of OwnedFd gate pipe, `Terminal::new` side effects not obvious.
-- [ ] **T4c — Job-control safety fixes from T4b review** (route: delegated → `codex-impl`; HIGH priority, before T6)
+- [x] **T4c — Job-control safety fixes from T4b review** (route: delegated → `codex-impl`; HIGH priority, before T6)
   - R4-kill-children-own-group / R3-kill-children-resolved-group: interactive `kill_children` resolves each child's pgid and SIGKILLs the whole group without checking it differs from the shell's own group -> cancellation/timeout can kill the shell itself (`eval.rs:971-985`).
   - R4-unbounded-ttin-spin / R3-ttin-spin-orphaned-group: `Terminal::acquire` busy-loops forever when started in an orphaned background group (SIGTTIN stop is discarded) (`terminal.rs:65-74`); bound it (sleep/backoff, orphan detection, fall back to no job control).
   - R3-terminal-modes-before-foreground: modes saved with tcgetattr before the shell is in the foreground (`terminal.rs:48-51`); save them after acquiring the terminal.
@@ -117,6 +117,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T5 (`f3f5173`): interactive so1sh sources `$SO1SH_RC` or `~/.so1shrc` through `.` before the first prompt (errors recover per T2b; exit ends the shell; missing explicit rc reported, missing default silent; non-interactive never reads it). Workspace 550 green (orchestrator spot-check).
   Native review: high risk, user granted, approved, acknowledged. WARNING: a relative `SO1SH_RC` without a slash is searched in PATH by `.` (`repl.rs:90`) -> resolve relative to cwd or document. Suggestions: rc + `set -e` untested, duplicated post-eval tail.
 
+- T4c (`5f17781` epsh: never SIGKILL the shell's own process group; hand the tty to a job only with foreground permission; dead WUNTRACED branch removed; named poll interval. `758f3d4` shell: SIGTTIN wait sleeps 10 ms and times out after 1 s -> no-job-control fallback; terminal modes saved after acquiring the foreground). Orchestrator reviewed the diff (Codex report hidden by its UI); workspace 553 green; epsh verified alone.
+  Native review: high risk, user granted, approved, acknowledged. WARNINGs: dead `wifstopped` check after WUNTRACED removal (`eval.rs:860`); the 1 s deadline also counts time spent stopped, so `so1sh &` resumed with `bg` after >1 s falls back instead of stopping again (`terminal.rs:74-79`) -> Phase 2 job control.
+
 ## Progress / Next step
-- T4c running on `codex-impl` (high priority); then T6 (orchestrator + Claude verifier). Small follow-up: relative SO1SH_RC PATH search.
+- T6 running (independent Claude verifier, read-only). Small follow-up: relative SO1SH_RC PATH search.
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

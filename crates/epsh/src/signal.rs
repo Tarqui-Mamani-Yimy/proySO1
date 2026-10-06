@@ -196,3 +196,32 @@ unsafe fn darwin_sigaction(signal: i32, handler: usize, flags: core::ffi::c_int)
     };
     let _ = unsafe { sigaction(signal, &action, std::ptr::null_mut()) };
 }
+
+/// Reset shell job-control dispositions/masks before executing an interactive child.
+/// Uses only async-signal-safe operations, including in a Command pre_exec hook.
+pub(crate) fn reset_job_signals() -> std::io::Result<()> {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        let mut unblock: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut unblock);
+        for sig in [
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGPIPE,
+        ] {
+            if libc::sigaction(sig, &action, std::ptr::null_mut()) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::sigaddset(&mut unblock, sig);
+        }
+        if libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut()) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}

@@ -1098,3 +1098,95 @@ mod repl_errors {
         }
     }
 }
+
+mod interactive_signals {
+    use super::*;
+
+    #[test]
+    fn children_reset_ignored_signals_and_report_signal_status() {
+        if isolated_test(
+            "interactive_signals::children_reset_ignored_signals_and_report_signal_status",
+        ) {
+            return;
+        }
+        // Private test process: never change the runner's signal dispositions.
+        for signal in [
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ] {
+            unsafe {
+                libc::signal(signal, libc::SIG_IGN);
+            }
+        }
+        let mut shell = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .pipefail(true)
+            .build();
+        shell.set_var("PATH", "/usr/bin:/bin").unwrap();
+        for (signal, status) in [("INT", 130), ("QUIT", 131)] {
+            assert_eq!(
+                shell.run_script(&format!("/bin/sh -c 'kill -{signal} $$'")),
+                status
+            );
+            assert_eq!(
+                shell.run_script(&format!("/bin/sh -c 'kill -{signal} $$' | cat")),
+                status
+            );
+        }
+    }
+}
+
+mod stopped_job_cleanup {
+    use super::*;
+    #[test]
+    fn cleanup_reaps_only_owned_stopped_children() {
+        if isolated_test("stopped_job_cleanup::cleanup_reaps_only_owned_stopped_children") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let mut host = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut shell = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .cwd(dir.path().to_path_buf())
+            .build();
+        // SIGSTOP remains effective in an orphaned group even without a tty.
+        assert_eq!(
+            shell.run_script("/bin/sh -c 'echo $$ > job; kill -STOP $$'"),
+            148
+        );
+        let pid: i32 = fs::read_to_string(dir.path().join("job"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0); // embedding Stopped stays live
+        shell.discard_stopped_jobs();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(host.wait().unwrap().success());
+        // Repeated cleanup is harmless; an external-handler host job is not adopted.
+        shell.set_external_handler(Box::new(move |_, _| {
+            Err(epsh::error::ShellError::Stopped {
+                pid: std::process::id() as i32,
+                pgid: std::process::id() as i32,
+            })
+        }));
+        assert_eq!(
+            shell.eval_repl_line("host-command"),
+            std::ops::ControlFlow::Continue(ExitStatus::from(148))
+        );
+        shell.discard_stopped_jobs();
+    }
+}

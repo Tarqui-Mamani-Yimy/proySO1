@@ -59,6 +59,7 @@ fn shell_builder_methods() {
 
 #[test]
 fn shell_public_methods() {
+    let _: fn(&mut eval::Shell) = eval::Shell::discard_stopped_jobs;
     let mut shell = eval::Shell::new();
 
     // run_script returns i32

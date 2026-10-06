@@ -298,6 +298,7 @@ pub struct Shell {
     pub(crate) child_pids: Vec<i32>,
     /// Unconsumed asynchronous jobs owned by this shell execution environment.
     pub(crate) background_pids: Vec<i32>,
+    stopped_jobs: Vec<(i32, Vec<i32>)>,
     /// Optional execution deadline. When exceeded, shell aborts with TimedOut.
     timeout: Option<std::time::Instant>,
     /// Optional callback that replaces eval_external for spawning processes.
@@ -311,6 +312,87 @@ pub struct Shell {
     /// when a heredoc targets fd 0 in sink mode (avoids process-wide dup2 on fd 0
     /// which would race with other threads reading stdin, e.g. nerv's input loop).
     pub(crate) pending_stdin: Option<RawFd>,
+}
+
+// Restore the previous foreground group and modes on every result path. A
+// separate controlling-tty fd works even when a command redirects fd 0.
+struct ForegroundTerminal {
+    file: std::fs::File,
+    group: libc::pid_t,
+    modes: libc::termios,
+}
+
+fn hand_terminal(
+    fd: RawFd,
+    group: libc::pid_t,
+    modes: Option<&libc::termios>,
+) -> std::io::Result<()> {
+    // SAFETY: all calls are async-signal-safe (also used by pre_exec); SIGTTOU
+    // is blocked on this thread only, so a background owner can reclaim the tty.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut old = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        if libc::sigprocmask(libc::SIG_BLOCK, &block, &mut old) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = if libc::tcsetpgrp(fd, group) == -1
+            || modes.is_some_and(|m| libc::tcsetattr(fd, libc::TCSADRAIN, m) == -1)
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        result
+    }
+}
+
+impl ForegroundTerminal {
+    fn new(active: bool) -> Option<Self> {
+        if !active {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()?;
+        // SAFETY: live tty fd and target-specific termios storage.
+        unsafe {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+            let group = libc::tcgetpgrp(fd);
+            let mut modes = std::mem::zeroed();
+            if group == -1 || libc::tcgetattr(fd, &mut modes) == -1 {
+                return None;
+            }
+            Some(Self { file, group, modes })
+        }
+    }
+    fn fd(&self) -> RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.file)
+    }
+    fn give_to(&self, group: i32) -> std::io::Result<()> {
+        hand_terminal(self.fd(), group, None)
+    }
+}
+
+impl Drop for ForegroundTerminal {
+    fn drop(&mut self) {
+        let _ = hand_terminal(self.fd(), self.group, Some(&self.modes));
+    }
+}
+
+fn stopped_child_pending(pid: i32) -> bool {
+    loop {
+        // SAFETY: wait only for a recorded engine-owned direct child.
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return result == 0;
+    }
 }
 
 /// Shell option flags (`set -e`, `set -u`, etc.).
@@ -547,6 +629,7 @@ impl ShellBuilder {
             stderr_sink: self.stderr_sink,
             child_pids: Vec::new(),
             background_pids: Vec::new(),
+            stopped_jobs: Vec::new(),
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
             redirect_open_handler: self.redirect_open_handler,
@@ -589,6 +672,7 @@ impl Shell {
             stderr_sink: None,
             child_pids: Vec::new(),
             background_pids: Vec::new(),
+            stopped_jobs: Vec::new(),
             timeout: None,
             external_handler: None,
             redirect_open_handler: None,
@@ -724,6 +808,7 @@ impl Shell {
             sys::waitpid(pid, &mut status, wuntraced);
             if sys::wifstopped(status) {
                 // Don't remove from child_pids — process is still alive
+                self.record_stopped_job(pgid, &[pid]);
                 return Err(ShellError::Stopped { pid, pgid });
             }
             self.child_pids.retain(|&p| p != pid);
@@ -743,6 +828,7 @@ impl Shell {
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(status) => {
                     if sys::wifstopped(status) {
+                        self.record_stopped_job(pgid, &[pid]);
                         return Err(ShellError::Stopped { pid, pgid });
                     }
                     self.child_pids.retain(|&p| p != pid);
@@ -792,6 +878,60 @@ impl Shell {
     fn clear_child_tracking(&mut self) {
         self.child_pids.clear();
         self.background_pids.clear();
+        self.stopped_jobs.clear();
+    }
+
+    fn record_stopped_job(&mut self, pgid: i32, pids: &[i32]) {
+        if !self.stopped_jobs.iter().any(|(group, _)| *group == pgid) {
+            self.stopped_jobs.push((pgid, Vec::new()));
+        }
+        let (_, members) = self
+            .stopped_jobs
+            .iter_mut()
+            .find(|(group, _)| *group == pgid)
+            .unwrap();
+        for &pid in pids {
+            if self.child_pids.contains(&pid) && !members.contains(&pid) {
+                members.push(pid);
+            }
+        }
+    }
+
+    /// Terminate and reap stopped jobs created by this engine, never host jobs.
+    /// Opt-in for frontends without job resume: SIGTERM + SIGCONT, escalating to
+    /// SIGKILL after 200 ms. Other embedders can retain live `Stopped` jobs.
+    pub fn discard_stopped_jobs(&mut self) {
+        for (group, mut members) in std::mem::take(&mut self.stopped_jobs) {
+            let recorded = members.clone();
+            self.child_pids.retain(|pid| !recorded.contains(pid));
+            self.background_pids.retain(|pid| !recorded.contains(pid));
+            // Verify ownership first, in case the embedder already reaped a job.
+            members.retain(|&pid| stopped_child_pending(pid));
+            if members.is_empty() {
+                continue;
+            }
+            // SAFETY: a still-owned direct child pins this job's process group.
+            unsafe {
+                libc::kill(-group, libc::SIGTERM);
+                libc::kill(-group, libc::SIGCONT);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while !members.is_empty() && std::time::Instant::now() < deadline {
+                members.retain(|&pid| stopped_child_pending(pid));
+                if !members.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            if !members.is_empty() {
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+                for &pid in &members {
+                    let mut status = 0;
+                    sys::waitpid(pid, &mut status, 0);
+                }
+            }
+        }
     }
 
     /// Build the xtrace prefix string ($PS4, default "+ ").
@@ -1606,8 +1746,29 @@ impl Shell {
         let mut cmd = std::process::Command::new(args_bytes[0].to_os_string());
         cmd.args(args_bytes.iter().skip(1).map(ShellBytes::to_os_string));
         cmd.current_dir(&self.cwd);
-        // NOTE: no pre_exec here — allows Rust to use posix_spawn (1.4x faster).
-        // Process group isolation is done from parent after spawn via setpgid.
+        // Keep the fast posix_spawn path for batch mode. Interactive children
+        // must reset ignored signals and establish foreground ownership before exec.
+        let terminal = ForegroundTerminal::new(self.opts.interactive && !self.in_forked_child);
+        if self.opts.interactive {
+            use std::os::unix::process::CommandExt;
+            let foreground = !self.in_forked_child;
+            let tty = terminal.as_ref().map(ForegroundTerminal::fd);
+            // SAFETY: the hook uses only async-signal-safe libc operations; no
+            // allocation, locks, environment access, or Rust evaluation after fork.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if foreground {
+                        if libc::setpgid(0, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if let Some(fd) = tty {
+                            hand_terminal(fd, libc::getpid(), None)?;
+                        }
+                    }
+                    crate::signal::reset_job_signals()
+                });
+            }
+        }
 
         // Set environment: exported vars + temporary assignments
         cmd.env_clear();
@@ -1634,10 +1795,12 @@ impl Shell {
                 let child_id = child.id() as i32;
                 // Isolate in own process group from parent (allows posix_spawn path)
                 // SAFETY: child_id is a valid PID just returned by spawn().
-                let _ = rustix::process::setpgid(
-                    rustix::process::Pid::from_raw(child_id),
-                    rustix::process::Pid::from_raw(child_id),
-                );
+                if !self.opts.interactive || !self.in_forked_child {
+                    let _ = rustix::process::setpgid(
+                        rustix::process::Pid::from_raw(child_id),
+                        rustix::process::Pid::from_raw(child_id),
+                    );
+                }
                 self.child_pids.push(child_id);
 
                 // Spawn relay threads for sinks, keeping handles to join later
@@ -1647,6 +1810,22 @@ impl Shell {
                 }
                 if let Some(stderr) = child.stderr.take() {
                     handles.push(spawn_relay(stderr, self.stderr_sink.clone().unwrap()));
+                }
+
+                if self.opts.interactive {
+                    let group = if self.in_forked_child {
+                        rustix::process::getpgrp().as_raw_pid()
+                    } else {
+                        child_id
+                    };
+                    let status = self.wait_child_pgid(child_id, group);
+                    if !matches!(status, Err(ShellError::Stopped { .. })) {
+                        for handle in handles {
+                            let _ = handle.join();
+                        }
+                    }
+                    self.restore_redirections(saved);
+                    return status;
                 }
 
                 // Cancel-aware wait: spawn thread for blocking wait, check cancel in loop
@@ -1718,6 +1897,22 @@ impl Shell {
             pipes.push((fds[0], fds[1]));
         }
 
+        let foreground = self.opts.interactive && !self.in_forked_child;
+        let terminal = ForegroundTerminal::new(foreground);
+        let gate = if foreground {
+            match rustix::pipe::pipe() {
+                Ok(fds) => Some(fds),
+                Err(error) => {
+                    for &(r, w) in &pipes {
+                        sys::close(r);
+                        sys::close(w);
+                    }
+                    return Err(ShellError::Io(error.into()));
+                }
+            }
+        } else {
+            None
+        };
         let mut children = Vec::new();
         let mut pgid: i32 = 0; // first child's PID becomes the pipeline's PGID
 
@@ -1733,23 +1928,35 @@ impl Shell {
                         sys::close(r);
                         sys::close(w);
                     }
+                    drop(gate); // Unblock already-forked stages before reaping.
                     self.kill_children();
                     return Err(ShellError::Io(std::io::Error::last_os_error()));
                 }
 
                 if pid == 0 {
                     self.clear_child_tracking();
+                    if self.opts.interactive {
+                        let _ = crate::signal::reset_job_signals();
+                    }
                     // Child: join pipeline process group
                     // First child creates the group (pgid==0 → setpgid(0,0))
                     // Subsequent children join it
-                    let _ = rustix::process::setpgid(
-                        None,
-                        if pgid == 0 {
-                            None
-                        } else {
-                            rustix::process::Pid::from_raw(pgid)
-                        },
-                    );
+                    if !self.opts.interactive || foreground {
+                        let _ = rustix::process::setpgid(
+                            None,
+                            if pgid == 0 {
+                                None
+                            } else {
+                                rustix::process::Pid::from_raw(pgid)
+                            },
+                        );
+                    }
+                    if let Some((reader, writer)) = &gate {
+                        sys::close(std::os::fd::AsRawFd::as_raw_fd(writer));
+                        let mut byte = [0u8];
+                        let _ = rustix::io::read(reader, &mut byte);
+                        sys::close(std::os::fd::AsRawFd::as_raw_fd(reader));
+                    }
                     self.in_forked_child = true;
                     // Connect stdin from previous pipe
                     if i > 0 {
@@ -1780,10 +1987,12 @@ impl Shell {
                 if pgid == 0 {
                     pgid = pid; // first child's PID is the group leader
                 }
-                let _ = rustix::process::setpgid(
-                    rustix::process::Pid::from_raw(pid),
-                    rustix::process::Pid::from_raw(pgid),
-                );
+                if !self.opts.interactive || foreground {
+                    let _ = rustix::process::setpgid(
+                        rustix::process::Pid::from_raw(pid),
+                        rustix::process::Pid::from_raw(pgid),
+                    );
+                }
                 children.push(pid);
                 self.child_pids.push(pid);
             }
@@ -1796,14 +2005,22 @@ impl Shell {
             sys::close(write_fd);
         }
 
-        // Interactive mode: give the pipeline the terminal
-        if self.opts.interactive && pgid > 0 {
-            // SAFETY: pgid is a valid process group from setpgid; fd 0 is stdin.
-            let _ = rustix::termios::tcsetpgrp(
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                rustix::process::Pid::from_raw(pgid).unwrap(),
-            );
+        if let Some(tty) = &terminal
+            && let Err(error) = tty.give_to(pgid)
+        {
+            drop(gate);
+            // SAFETY: this process group and all listed PIDs are ours.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            for &pid in &children {
+                let mut status = 0;
+                sys::waitpid(pid, &mut status, 0);
+                self.child_pids.retain(|&p| p != pid);
+            }
+            return Err(ShellError::Io(error));
         }
+        drop(gate); // All stages may now run, including terminal readers.
 
         // Wait for all children, checking cancel between stages
         let mut last_status = ExitStatus::SUCCESS;
@@ -1818,47 +2035,16 @@ impl Shell {
                         last_status = stage_status;
                     }
                 }
-                Err(ShellError::Stopped { pid: _, pgid: _ }) if self.opts.interactive => {
-                    // Reclaim terminal before propagating
-                    // SAFETY: getpgrp() and tcsetpgrp are always safe with valid fd.
-                    let _ = rustix::termios::tcsetpgrp(
-                        unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                        rustix::process::getpgrp(),
-                    );
-                    return Err(ShellError::Stopped {
-                        pid: children[children.len() - 1],
-                        pgid,
-                    });
+                Err(ShellError::Stopped { pid, pgid }) if self.opts.interactive => {
+                    self.record_stopped_job(pgid, &children);
+                    return Err(ShellError::Stopped { pid, pgid });
                 }
                 Err(e @ (ShellError::Cancelled | ShellError::TimedOut)) => {
-                    if self.opts.interactive {
-                        let _ = rustix::termios::tcsetpgrp(
-                            unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                            rustix::process::getpgrp(),
-                        );
-                    }
                     self.kill_children();
                     return Err(e);
                 }
-                Err(e) => {
-                    if self.opts.interactive {
-                        let _ = rustix::termios::tcsetpgrp(
-                            unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                            rustix::process::getpgrp(),
-                        );
-                    }
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
-        }
-
-        // Interactive mode: reclaim the terminal
-        if self.opts.interactive && pgid > 0 {
-            // SAFETY: getpgrp() returns our process group; fd 0 is stdin.
-            let _ = rustix::termios::tcsetpgrp(
-                unsafe { std::os::fd::BorrowedFd::borrow_raw(0) },
-                rustix::process::getpgrp(),
-            );
         }
 
         if self.opts.pipefail && !pipefail_status.success() {
@@ -1876,6 +2062,7 @@ impl Shell {
     ) -> crate::error::Result<ExitStatus> {
         // SAFETY: Standard POSIX fork pattern. Child isolates into its own
         // process group, executes the body, then _exit()s. Parent waits.
+        let terminal = ForegroundTerminal::new(self.opts.interactive && !self.in_forked_child);
         unsafe {
             let pid = sys::fork();
             if pid < 0 {
@@ -1884,8 +2071,14 @@ impl Shell {
 
             if pid == 0 {
                 self.clear_child_tracking();
+                if self.opts.interactive {
+                    let _ = crate::signal::reset_job_signals();
+                }
                 // Child — isolate in own process group
                 let _ = rustix::process::setpgid(None, None);
+                if let Some(tty) = &terminal {
+                    let _ = tty.give_to(libc::getpid());
+                }
                 let parent_exit_trap = self
                     .traps
                     .remove("EXIT")
@@ -1929,6 +2122,9 @@ impl Shell {
 
             if pid == 0 {
                 self.clear_child_tracking();
+                if self.opts.interactive {
+                    let _ = crate::signal::reset_job_signals();
+                }
                 let _ = rustix::process::setpgid(None, None);
                 let _saved = match self.setup_redirections(redirs) {
                     Ok(s) => s,
@@ -2049,6 +2245,9 @@ impl Shell {
 
             if pid == 0 {
                 self.clear_child_tracking();
+                if self.opts.interactive {
+                    let _ = crate::signal::reset_job_signals();
+                }
                 // Child: redirect stdout to write end of pipe
                 let _ = rustix::process::setpgid(None, None);
                 self.in_forked_child = true;

@@ -263,6 +263,11 @@ fn errexit_still_ends_session_on_false() {
 }
 
 fn history_session(dir: &TempDir, explicit: bool) -> PtySession {
+    let path = explicit.then(|| dir.path().join("private-history"));
+    history_session_with_file(dir, path.as_deref())
+}
+
+fn history_session_with_file(dir: &TempDir, path: Option<&std::path::Path>) -> PtySession {
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
@@ -270,8 +275,8 @@ fn history_session(dir: &TempDir, explicit: bool) -> PtySession {
         .env("TERM", "dumb")
         .env("HOME", dir.path())
         .current_dir(dir.path());
-    if explicit {
-        command.env("SO1SH_HISTFILE", dir.path().join("private-history"));
+    if let Some(path) = path {
+        command.env("SO1SH_HISTFILE", path);
     }
     let mut session = spawn_command(command, Some(3000)).unwrap();
     session.process_mut().set_kill_timeout(Some(1000));
@@ -284,9 +289,14 @@ fn history_survives_sessions_and_ctrl_r_searches_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut first = history_session(&dir, explicit);
         first.exp_string("$ ").unwrap();
-        submit(&mut first, "echo persisted-history-marker");
+        let recalled = "echo persisted-history-marker; echo executed >> executions";
+        submit(&mut first, recalled);
         first.exp_string("persisted-history-marker\r\n").unwrap();
         first.exp_string("$ ").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("executions")).unwrap(),
+            "executed\n"
+        );
         submit(&mut first, "exit");
         exited(&mut first, 0);
         let path = dir.path().join(if explicit {
@@ -304,15 +314,130 @@ fn history_survives_sessions_and_ctrl_r_searches_it() {
         second.send_control('r').unwrap();
         second.send("persisted-history-marker").unwrap();
         second.send_line("").unwrap();
-        second
-            .exp_string("$ echo persisted-history-marker")
-            .unwrap();
+        second.exp_string(&format!("$ {recalled}")).unwrap();
+        // Search acceptance must not execute; the next Enter executes exactly once.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("executions")).unwrap(),
+            "executed\n"
+        );
         submit(&mut second, "");
         assert_no_output(&second.exp_string("persisted-history-marker\r\n").unwrap());
         second.exp_string("$ ").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("executions")).unwrap(),
+            "executed\nexecuted\n"
+        );
         submit(&mut second, "exit");
         exited(&mut second, 0);
     }
+}
+
+#[test]
+fn missing_redirection_target_is_reported_without_continuation() {
+    for input in ["echo >", "cat <<"] {
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        session.send_line(input).unwrap();
+        session.exp_string("syntax error").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo $?");
+        session.exp_string("2\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo after");
+        assert_no_output(&session.exp_string("after\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+}
+
+#[test]
+fn empty_heredoc_delimiter_finishes_with_one_enter() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    session.send_line("cat <<''").unwrap();
+    session.exp_string("> ").unwrap();
+    session.send_line("body").unwrap();
+    session.exp_string("> ").unwrap();
+    // One Enter terminates the empty delimiter line, without a second blank line.
+    session.send_line("").unwrap();
+    session.exp_string("\r\nbody\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn backslash_newline_uses_continuation_prompt() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    session.send_line("echo joined\\").unwrap();
+    session.exp_string("> ").unwrap();
+    session.send_line("-word").unwrap();
+    session.exp_string("\r\njoined-word\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+fn history_error_keeps_session_working(mut session: PtySession) {
+    session.exp_string("so1sh: history:").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo after");
+    assert_no_output(&session.exp_string("after\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn history_directory_reports_error_and_keeps_session_working() {
+    let dir = tempfile::tempdir().unwrap();
+    history_error_keeps_session_working(history_session_with_file(&dir, Some(dir.path())));
+}
+
+#[test]
+fn history_sync_error_keeps_session_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history");
+    let mut session = history_session_with_file(&dir, Some(&path));
+    session.exp_string("$ ").unwrap();
+    // Initialization succeeded; make only the subsequent sync fail.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    submit(&mut session, "echo after");
+    session.exp_string("so1sh: history:").unwrap();
+    session.exp_string("\r\n").unwrap();
+    assert_no_output(&session.exp_string("after\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    // Later submissions (including exit) must remain non-fatal as well.
+    submit(&mut session, "exit");
+    session.exp_string("so1sh: history:").unwrap();
+    exited(&mut session, 0);
+}
+
+#[test]
+fn history_unwritable_path_reports_error_and_keeps_session_working() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("read-only-history");
+    std::fs::write(&file, "").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // Root bypasses mode bits: an uncreatable descendant is the root-safe oracle.
+    let path = if unsafe { libc::geteuid() } == 0 {
+        file.join("history")
+    } else {
+        file
+    };
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .is_err()
+    );
+    history_error_keeps_session_working(history_session_with_file(&dir, Some(&path)));
 }
 
 #[test]

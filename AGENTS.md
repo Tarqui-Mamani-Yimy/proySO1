@@ -11,6 +11,8 @@ the session. History paths retain OS bytes. Reedline accepts Unicode strings:
 invalid UTF-8 in PS1/PS2 is replaced for display only, and interactive input
 is Unicode-only; engine variables and non-interactive byte handling are unchanged.
 Piped input, `-c`, and script arguments use the shared epsh CLI dispatcher.
+Empty history variables are treated as unset; without a usable HOME, history
+stays in memory. History I/O errors are reported without ending the session.
 Foreground jobs use their own process group and terminal; Ctrl-C/Ctrl-\\/Ctrl-Z
 return to the prompt with status 130/131/148. Stopped jobs are reported and
 terminated with SIGTERM + SIGCONT, escalating to SIGKILL after 200 ms, then

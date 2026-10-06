@@ -14,7 +14,10 @@ struct ShellValidator;
 
 impl Validator for ShellValidator {
     fn validate(&self, line: &str) -> ValidationResult {
-        if matches!(Parser::new(line).parse_interactive(), Ok(None)) {
+        // Enter terminates the final physical line, which may be an empty
+        // heredoc delimiter. Reedline validates before inserting that newline.
+        let submitted = format!("{line}\n");
+        if matches!(Parser::new(&submitted).parse_interactive(), Ok(None)) {
             ValidationResult::Incomplete
         } else {
             // Invalid input is submitted to epsh for its normal diagnostic/status.
@@ -69,10 +72,12 @@ impl Prompt for ShellPrompt {
 fn history_path(shell: &Shell) -> Option<PathBuf> {
     shell
         .get_var_bytes("SO1SH_HISTFILE")
+        .filter(|v| !v.is_empty())
         .map(|v| PathBuf::from(v.to_os_string()))
         .or_else(|| {
             shell
                 .get_var_bytes("HOME")
+                .filter(|v| !v.is_empty())
                 .map(|v| PathBuf::from(v.to_os_string()).join(".so1sh_history"))
         })
 }
@@ -160,6 +165,43 @@ mod tests {
             history_path(&shell),
             Some(ShellBytes::from_vec(b"history\xff".to_vec()).to_path_buf())
         );
+    }
+
+    #[test]
+    fn empty_history_variables_are_unset() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.set_var("HOME", "").unwrap();
+        assert_eq!(history_path(&shell), None);
+        shell.set_var("SO1SH_HISTFILE", "").unwrap();
+        assert_eq!(history_path(&shell), None);
+        shell.set_var("HOME", "/private/home").unwrap();
+        assert_eq!(
+            history_path(&shell),
+            Some(PathBuf::from("/private/home/.so1sh_history"))
+        );
+        shell.set_var("SO1SH_HISTFILE", "/private/history").unwrap();
+        shell.set_var("HOME", "").unwrap();
+        assert_eq!(
+            history_path(&shell),
+            Some(PathBuf::from("/private/history"))
+        );
+    }
+
+    #[test]
+    fn validator_enter_terminates_empty_heredoc_delimiter() {
+        let validator = ShellValidator;
+        for input in ["cat <<''", "cat <<''\nbody"] {
+            assert!(
+                matches!(validator.validate(input), ValidationResult::Incomplete),
+                "{input:?}"
+            );
+        }
+        for input in ["cat <<''\n", "cat <<''\nbody\n", "cat <<-''\n\t"] {
+            assert!(
+                matches!(validator.validate(input), ValidationResult::Complete),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

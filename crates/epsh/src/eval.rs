@@ -200,6 +200,11 @@ use crate::glob;
 use crate::parser::Parser;
 use crate::shell_bytes::ShellBytes;
 use crate::sys;
+
+pub(crate) const SINK_ROUTE_STDOUT: u8 = 0;
+pub(crate) const SINK_ROUTE_STDERR: u8 = 1;
+pub(crate) const SINK_ROUTE_BYPASS: u8 = 2;
+pub(crate) const SINK_ROUTE_CLOSED: u8 = 3;
 use crate::var::Variables;
 
 /// Callback for external command execution.
@@ -728,8 +733,8 @@ impl ShellBuilder {
             stderr_sink: self.stderr_sink,
             stdout_redirect_depth: Arc::new(AtomicUsize::new(0)),
             stderr_redirect_depth: Arc::new(AtomicUsize::new(0)),
-            stdout_sink_route: Arc::new(AtomicU8::new(0)),
-            stderr_sink_route: Arc::new(AtomicU8::new(1)),
+            stdout_sink_route: Arc::new(AtomicU8::new(SINK_ROUTE_STDOUT)),
+            stderr_sink_route: Arc::new(AtomicU8::new(SINK_ROUTE_STDERR)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
@@ -780,8 +785,8 @@ impl Shell {
             stderr_sink: None,
             stdout_redirect_depth: Arc::new(AtomicUsize::new(0)),
             stderr_redirect_depth: Arc::new(AtomicUsize::new(0)),
-            stdout_sink_route: Arc::new(AtomicU8::new(0)),
-            stderr_sink_route: Arc::new(AtomicU8::new(1)),
+            stdout_sink_route: Arc::new(AtomicU8::new(SINK_ROUTE_STDOUT)),
+            stderr_sink_route: Arc::new(AtomicU8::new(SINK_ROUTE_STDERR)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
@@ -913,8 +918,8 @@ impl Shell {
     pub fn write_stdout(&self, data: &[u8]) {
         let route = self.stdout_sink_route.load(Ordering::Relaxed);
         let sink = match route {
-            0 => self.stdout_sink.as_ref(),
-            1 => self.stderr_sink.as_ref(),
+            SINK_ROUTE_STDOUT => self.stdout_sink.as_ref(),
+            SINK_ROUTE_STDERR => self.stderr_sink.as_ref(),
             _ => None,
         };
         if let Some(sink) = sink {
@@ -931,8 +936,8 @@ impl Shell {
     pub fn write_stderr(&self, data: &[u8]) {
         let route = self.stderr_sink_route.load(Ordering::Relaxed);
         let sink = match route {
-            0 => self.stdout_sink.as_ref(),
-            1 => self.stderr_sink.as_ref(),
+            SINK_ROUTE_STDOUT => self.stdout_sink.as_ref(),
+            SINK_ROUTE_STDERR => self.stderr_sink.as_ref(),
             _ => None,
         };
         if let Some(sink) = sink {
@@ -1839,8 +1844,15 @@ impl Shell {
                     // execute directly without double-forking. Mirrors dash's
                     // EV_EXIT optimization. Prevents pipe fd leaks.
                     let saved = self.setup_redirections(redirs)?;
+                    let guard = crate::redirect::RedirectionGuard::new(
+                        saved,
+                        self.stdout_redirect_depth.clone(),
+                        self.stderr_redirect_depth.clone(),
+                        self.stdout_sink_route.clone(),
+                        self.stderr_sink_route.clone(),
+                    );
                     let result = self.eval_command_internal(body);
-                    self.restore_redirections(saved);
+                    drop(guard);
                     result
                 } else {
                     self.eval_in_subshell(body, redirs)
@@ -1853,8 +1865,15 @@ impl Shell {
                 span: _,
             } => {
                 let saved = self.setup_redirections(redirs)?;
+                let guard = crate::redirect::RedirectionGuard::new(
+                    saved,
+                    self.stdout_redirect_depth.clone(),
+                    self.stderr_redirect_depth.clone(),
+                    self.stdout_sink_route.clone(),
+                    self.stderr_sink_route.clone(),
+                );
                 let result = self.eval_command_internal(body);
-                self.restore_redirections(saved);
+                drop(guard);
                 result
             }
 
@@ -2207,6 +2226,13 @@ impl Shell {
 
         // Setup redirections
         let saved_fds = self.setup_redirections(redirs)?;
+        let guard = crate::redirect::RedirectionGuard::new(
+            saved_fds,
+            self.stdout_redirect_depth.clone(),
+            self.stderr_redirect_depth.clone(),
+            self.stdout_sink_route.clone(),
+            self.stderr_sink_route.clone(),
+        );
 
         // Execute function body
         let result = match self.eval_command_internal(body) {
@@ -2216,7 +2242,7 @@ impl Shell {
         };
 
         // Restore state
-        self.restore_redirections(saved_fds);
+        drop(guard);
         self.vars.pop_scope();
         self.vars.positional = saved_positional;
 
@@ -2738,7 +2764,11 @@ impl Shell {
                 let saved_sink = self.stdout_sink.take();
                 let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
                 self.stdout_sink = Some(buf.clone());
+                let saved_route = self
+                    .stdout_sink_route
+                    .swap(SINK_ROUTE_STDOUT, Ordering::Relaxed);
                 let status = self.try_builtin(&expanded[0], &expanded, &[], &[], *span);
+                self.stdout_sink_route.store(saved_route, Ordering::Relaxed);
                 self.stdout_sink = saved_sink;
                 if let Ok(Some(s)) = status {
                     self.exit_status = s;

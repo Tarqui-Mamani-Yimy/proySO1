@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::ast::*;
 use crate::error::ShellError;
-use crate::eval::{RedirectOpen, RedirectOpenMode, Shell};
+use crate::eval::{RedirectOpen, RedirectOpenMode, SINK_ROUTE_BYPASS, SINK_ROUTE_CLOSED, Shell};
 use crate::shell_bytes::ShellBytes;
 
 use crate::sys;
@@ -240,7 +240,7 @@ impl Shell {
                     if matches!(redir.kind, RedirKind::DupInput(_) | RedirKind::DupOutput(_)) {
                         None
                     } else {
-                        Some(2)
+                        Some(SINK_ROUTE_BYPASS)
                     };
                 if let Some(route) = route {
                     set_route(target_fd, route, self);
@@ -281,18 +281,19 @@ impl Shell {
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
                     if fd_str == "-" {
-                        set_route(target_fd, 3, self);
+                        set_route(target_fd, SINK_ROUTE_CLOSED, self);
                         // SAFETY: target_fd is a valid fd number from the redirect syntax.
                         sys::close(target_fd);
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
                         let route = match source_fd {
                             1 => self.stdout_sink_route.load(Ordering::Relaxed),
                             2 => self.stderr_sink_route.load(Ordering::Relaxed),
-                            _ => 2,
+                            _ => SINK_ROUTE_BYPASS,
                         };
                         set_route(target_fd, route, self);
                         // SAFETY: source_fd is user-specified (may fail at OS level); target_fd is from redirect syntax.
-                        sys::dup2(source_fd, target_fd);
+                        sys::dup2_checked(source_fd, target_fd)
+                            .map_err(|e| ShellError::Io(e.into()))?;
                     } else {
                         return Err(ShellError::Runtime {
                             msg: format!("{fd_str}: bad file descriptor"),

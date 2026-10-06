@@ -807,6 +807,112 @@ mod embedder_builtins {
     }
 
     #[test]
+    fn substitution_output_is_captured_inside_outer_redirections() {
+        if isolated_test(
+            "embedder_builtins::substitution_output_is_captured_inside_outer_redirections",
+        ) {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .cwd(temp.path().to_path_buf())
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr.clone())
+            .build();
+        shell
+            .register_embedder_builtin("emit", |shell, _| {
+                shell.write_stdout(b"hi\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+
+        assert_eq!(
+            shell.run_program(&parse("{ v=$(echo hi); echo \"[$v]\"; } > out")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(fs::read(temp.path().join("out")).unwrap(), b"[hi]\n");
+        assert!(stdout.lock().unwrap().is_empty());
+
+        assert_eq!(
+            shell.run_program(&parse("{ v=$(echo hi); echo \"[$v]\"; } >&2")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stderr.lock().unwrap(), b"[hi]\n");
+
+        assert_eq!(
+            shell.run_program(&parse("{ v=$(emit); echo \"[$v]\"; } > embedder-out")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(
+            fs::read(temp.path().join("embedder-out")).unwrap(),
+            b"[hi]\n"
+        );
+        assert!(stdout.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_descriptor_duplication_fails_redirection() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr.clone())
+            .build();
+        assert_ne!(
+            shell.run_program(&parse("echo unreachable 1>&9999")),
+            ExitStatus::SUCCESS
+        );
+        let error = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+        assert!(error.contains("Bad file descriptor"), "{error:?}");
+        assert!(!error.contains("Success (os error 0)"), "{error:?}");
+        assert_eq!(
+            shell.run_program(&parse("echo route-restored")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"route-restored\n");
+    }
+
+    #[test]
+    fn brace_group_panic_restores_fds_and_sink_routes() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        if isolated_test("embedder_builtins::brace_group_panic_restores_fds_and_sink_routes") {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .cwd(temp.path().to_path_buf())
+            .stdout_sink(stdout.clone())
+            .build();
+        shell
+            .register_embedder_builtin(
+                "panic_builtin",
+                |_shell, _argv| -> epsh::error::Result<ExitStatus> {
+                    panic!("intentional embedder panic")
+                },
+            )
+            .unwrap();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                shell.run_program(&parse("{ panic_builtin; } > panic.txt"))
+            }))
+            .is_err()
+        );
+        assert_ne!(
+            fs::read_link("/proc/self/fd/1").unwrap(),
+            temp.path().join("panic.txt")
+        );
+        assert_eq!(
+            shell.run_program(&parse("echo restored")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"restored\n");
+    }
+
+    #[test]
     fn command_v_and_type_recognize_embedder_builtins() {
         let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();

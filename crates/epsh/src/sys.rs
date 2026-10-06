@@ -80,6 +80,14 @@ pub fn write(fd: RawFd, buf: *const u8, len: usize) {
 /// Duplicate a file descriptor. Mirrors libc `dup2`: makes `newfd` a copy of
 /// `oldfd`, closing `newfd` first if open. Returns newfd on success, -1 on error.
 pub fn dup2(oldfd: RawFd, newfd: RawFd) -> i32 {
+    match dup2_checked(oldfd, newfd) {
+        Ok(()) => newfd,
+        Err(_) => -1,
+    }
+}
+
+/// Duplicate a file descriptor while preserving the underlying rustix error.
+pub fn dup2_checked(oldfd: RawFd, newfd: RawFd) -> rustix::io::Result<()> {
     // SAFETY: standard dup2. We take ownership of newfd via an OwnedFd, then
     // leak it with `forget` after the call, matching the pattern used by
     // `rustix::stdio::dup2_stdin` and similar rustix helpers.
@@ -88,10 +96,7 @@ pub fn dup2(oldfd: RawFd, newfd: RawFd) -> i32 {
         let result = rustix::io::dup2(BorrowedFd::borrow_raw(oldfd), &mut new);
         // Prevent Drop from closing newfd regardless of success/failure.
         std::mem::forget(new);
-        match result {
-            Ok(()) => newfd,
-            Err(_) => -1,
-        }
+        result
     }
 }
 

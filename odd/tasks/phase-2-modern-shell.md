@@ -68,8 +68,12 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Dual stopped-job tracking in epsh (`eval.rs:1118`); timing-dependent PTY tests (`repl.rs:742-750`).
 - [x] **T2c — Make `raw_bytes::path_lookup_handles_invalid_utf8_directories` hermetic** (codex-impl)
   - Rare flake seen in Phase 0 T2, Phase 1 T4b and Phase 2 (full `cargo test --workspace` run after `492aa1a`); 0/15 failures in isolated reruns before and after `492aa1a` -> pre-existing, not caused by T0c/T1b. Find the shared state (tmp names, PATH, cwd) and isolate it.
-- [ ] **T1c — Review correction: dup redirections must stay in sinks** (codex-impl; native review of `492aa1a` returned correction_required, plan 80 lines)
+- [x] **T1c — Review correction: dup redirections must stay in sinks** (codex-impl; native review of `492aa1a` returned correction_required, plan 80 lines)
   - R3-dup-redirect-escapes-sinks (CRITICAL, `eval.rs:908-910`): with sinks set, `echo msg >&2` / `cmd 2>&1` write to the real process fd and escape the embedder's capture. File redirections bypass the sink; dups between stdout/stderr route to the matching sink.
+- [ ] **T1d — Sink-route follow-ups from the `49243c1` review** (codex-impl, after T2d)
+  - R3-route-ignores-substitution-capture: the shared stdout route atomic stays at "real fd" inside compound bodies, so fork-free command substitution in `{ v=$(echo hi); } >file` (or `>&2`) may send `echo` to the file instead of the capture (`eval.rs:914-919`). Verify and fix: substitution capture must override the route.
+  - R4-compound-redirect-panic-leaks-route: brace groups, EV_EXIT subshells and function-definition redirections restore by hand, without the RAII guard; a panicking embedder builtin there leaks the route (`eval.rs:1855`).
+  - R2: route atomics readability (`eval.rs:374-377`, `redirect.rs:60-69`); failed dup routes to real fd (`redirect.rs:288-295`).
 - [ ] **T2d — Flaky PTY test `pipeline_ctrl_z_is_retained_and_cleaned_up_by_test`** (codex-impl)
   - Failed 4 of 11 full workspace runs in Codex's T2c verification (`crates/shell/tests/repl.rs:636`). Find the race and make it deterministic.
 - [ ] **T3 — `fg` and `bg`** (codex-impl)
@@ -104,5 +108,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T2c: Codex could not reproduce the rare flake; removed the last shared dependency (copied Cargo `show_argv` fixture) by creating a private script in the test's temp PATH dir; integration 20/20 green. Committed by orchestrator; `.codegraph/` added to `.gitignore`.
 - T0c/T1b native review (`492aa1a`): `managed_assets_outdated` stop -> ran the provider's `gentle-ai sync --agent claude-code` (updated ~/.claude/CLAUDE.md; user-modified review agents preserved); then correction_required (R3-dup-redirect-escapes-sinks) -> plan 80 lines -> T1c.
 
+- T1c (`49243c1`): per-fd sink provenance copied on dup and restored in reverse order; file redirections bypass the sink, `>&2`/`2>&1`/`1>&2` route to the matching sink. Diff 133+/14- exceeded the declared 80-line correction budget without notice (flagged to Codex). Orchestrator verified 5/5 embedding runs + workspace green.
+  Native review: the correction changed scope -> provider-issued `review recover` (scope_changed, new lineage review-802bc3456c12c1a9) -> 4 lenses approved, acknowledged. Covers `492aa1a`..`49243c1`. WARNINGs -> T1d.
+
 ## Progress / Next step
-- T1c (review correction) running on `codex-impl`; then T2d (flaky PTY test), T2b+T3, T4.
+- T2d running on `codex-impl`; then T1d, T2b+T3, T4. Pending user decision: untrack `.atl/` (tool cache that keeps triggering review consent).

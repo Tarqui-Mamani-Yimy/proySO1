@@ -198,6 +198,16 @@ fn parser_api() {
     let program: ast::Program = parser.parse().unwrap();
     assert!(!program.commands.is_empty());
 
+    let complete: Result<Option<ast::Program>, error::ShellError> =
+        parser::Parser::new("echo hello").parse_interactive();
+    assert!(complete.unwrap().is_some());
+    assert!(
+        parser::Parser::new("echo 'open")
+            .parse_interactive()
+            .unwrap()
+            .is_none()
+    );
+
     // Program has public commands field
     let _cmds: &Vec<ast::Command> = &program.commands;
 }

@@ -122,6 +122,8 @@ enum WordCtx {
 pub struct Lexer {
     src: Vec<char>,
     pos: usize,
+    /// Unfinished lexical construct or missing here-document delimiter at EOF.
+    pub(crate) incomplete_input: bool,
     line: u32,
     col: u32,
 
@@ -141,6 +143,7 @@ impl Lexer {
         Lexer {
             src: source.chars().collect(),
             pos: 0,
+            incomplete_input: false,
             line: 1,
             col: 1,
             pushback: None,
@@ -439,6 +442,7 @@ impl Lexer {
             match ch {
                 None => {
                     if ctx == WordCtx::Brace {
+                        self.incomplete_input = true;
                         return Err(ShellError::Syntax {
                             msg: "unterminated ${".into(),
                             span,
@@ -500,6 +504,7 @@ impl Lexer {
                             loop {
                                 match self.advance_raw() {
                                     None => {
+                                        self.incomplete_input = true;
                                         return Err(ShellError::Syntax {
                                             msg: "unterminated single quote".into(),
                                             span,
@@ -615,6 +620,7 @@ impl Lexer {
                 self.advance();
             }
             _ => {
+                self.incomplete_input = true;
                 return Err(ShellError::Syntax {
                     msg: "unterminated double quote".into(),
                     span,
@@ -759,6 +765,7 @@ impl Lexer {
                 }));
             }
             None => {
+                self.incomplete_input = true;
                 return Err(ShellError::Syntax {
                     msg: "unterminated ${".into(),
                     span,
@@ -897,6 +904,7 @@ impl Lexer {
             match self.advance() {
                 Some('}') => return Ok(()),
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated ${".into(),
                         span,
@@ -921,6 +929,7 @@ impl Lexer {
         loop {
             match self.peek() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated inner double quote in ${}".into(),
                         span,
@@ -982,6 +991,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated $(".into(),
                         span,
@@ -1003,6 +1013,7 @@ impl Lexer {
                     loop {
                         match self.advance() {
                             None => {
+                                self.incomplete_input = true;
                                 return Err(ShellError::Syntax {
                                     msg: "unterminated single quote in $()".into(),
                                     span,
@@ -1059,6 +1070,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated $((".into(),
                         span,
@@ -1092,6 +1104,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated backtick".into(),
                         span,
@@ -1127,6 +1140,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated double quote".into(),
                         span,
@@ -1212,6 +1226,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated ${".into(),
                         span,
@@ -1262,6 +1277,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated $(".into(),
                         span,
@@ -1283,6 +1299,7 @@ impl Lexer {
                     loop {
                         match self.advance() {
                             None => {
+                                self.incomplete_input = true;
                                 return Err(ShellError::Syntax {
                                     msg: "unterminated single quote in $()".into(),
                                     span,
@@ -1341,6 +1358,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated $((".into(),
                         span,
@@ -1376,6 +1394,7 @@ impl Lexer {
         loop {
             match self.advance() {
                 None => {
+                    self.incomplete_input = true;
                     return Err(ShellError::Syntax {
                         msg: "unterminated backtick".into(),
                         span,
@@ -1416,9 +1435,12 @@ impl Lexer {
                 match self.advance_raw() {
                     None => {
                         // EOF before newline — check if this line IS the delimiter
-                        if ShellBytes::from_str_lossless(&line) == heredoc.delimiter {
+                        if !line.is_empty()
+                            && ShellBytes::from_str_lossless(&line) == heredoc.delimiter
+                        {
                             return Ok(body);
                         }
+                        self.incomplete_input = true;
                         if !line.is_empty() {
                             body.push_str(&line);
                         }

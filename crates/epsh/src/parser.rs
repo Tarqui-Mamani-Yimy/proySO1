@@ -20,6 +20,7 @@ pub struct Parser {
     lexer: Lexer,
     /// Heredoc bodies read at newlines, waiting to be patched into the AST.
     heredoc_bodies: Vec<HereDocBody>,
+    consumed_eof: bool,
 }
 
 impl Parser {
@@ -27,6 +28,7 @@ impl Parser {
         Parser {
             lexer: Lexer::new(source),
             heredoc_bodies: Vec::new(),
+            consumed_eof: false,
         }
     }
 
@@ -34,6 +36,7 @@ impl Parser {
         Parser {
             lexer: Lexer::new_bytes(source),
             heredoc_bodies: Vec::new(),
+            consumed_eof: false,
         }
     }
 
@@ -41,6 +44,17 @@ impl Parser {
     pub fn parse(&mut self) -> Result<Program, ShellError> {
         let commands = self.parse_program()?;
         Ok(Program { commands })
+    }
+
+    /// Parse interactive input: `None` means more input is needed, while a syntax
+    /// error means the input is invalid. Batch `parse` semantics are unchanged.
+    pub fn parse_interactive(&mut self) -> Result<Option<Program>, ShellError> {
+        let result = self.parse();
+        if self.lexer.incomplete_input || (result.is_err() && self.consumed_eof) {
+            Ok(None)
+        } else {
+            result.map(Some)
+        }
     }
 
     /// Peek at the next token without consuming it.
@@ -52,7 +66,9 @@ impl Parser {
 
     /// Consume the next token.
     fn next(&mut self) -> Result<(Token, Span), ShellError> {
-        self.lexer.next_token()
+        let result = self.lexer.next_token()?;
+        self.consumed_eof = result.0 == Token::Eof;
+        Ok(result)
     }
 
     /// Consume the next token, expecting a specific token type.
@@ -2080,5 +2096,74 @@ mod tests {
             }
             other => panic!("expected Param, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod interactive_input_tests {
+    use super::Parser;
+
+    #[test]
+    fn incomplete_constructs_need_more_input() {
+        for input in [
+            "echo 'open",
+            "echo \"open",
+            "if true; then",
+            "if true; then\necho yes",
+            "echo hi |",
+            "true &&",
+            "false ||",
+            "cat <<EOF",
+            "cat <<EOF\nbody",
+            "cat <<-EOF\n\tbody",
+            "echo ${var",
+            "echo $(echo hi",
+            "while true; do",
+            "for i in a; do",
+            "case x in",
+            "(",
+            "{",
+        ] {
+            assert!(
+                matches!(Parser::new(input).parse_interactive(), Ok(None)),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_input_is_not_incomplete_even_with_an_unfinished_suffix() {
+        for input in [
+            "fi",
+            "echo hi | ;",
+            "if ;",
+            "fi; echo 'open",
+            "fi; cat <<EOF",
+        ] {
+            assert!(Parser::new(input).parse_interactive().is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn completed_constructs_produce_programs() {
+        for input in [
+            "",
+            "echo hi",
+            "echo 'first\nsecond'",
+            "if true; then\necho yes\nfi",
+            "echo hi |\ncat",
+            "true &&\necho yes",
+            "cat <<EOF\nbody\nEOF",
+            "cat <<-EOF\n\tbody\n\tEOF",
+            "cat <<''\n\n",
+        ] {
+            assert!(
+                matches!(Parser::new(input).parse_interactive(), Ok(Some(_))),
+                "{input:?}"
+            );
+            assert!(Parser::new(input).parse().is_ok(), "batch: {input:?}");
+        }
+        // Keep the legacy batch acceptance of an EOF-terminated here-document.
+        assert!(Parser::new("cat <<EOF\nbody").parse().is_ok());
     }
 }

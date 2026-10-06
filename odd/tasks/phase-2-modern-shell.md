@@ -70,12 +70,14 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Rare flake seen in Phase 0 T2, Phase 1 T4b and Phase 2 (full `cargo test --workspace` run after `492aa1a`); 0/15 failures in isolated reruns before and after `492aa1a` -> pre-existing, not caused by T0c/T1b. Find the shared state (tmp names, PATH, cwd) and isolate it.
 - [x] **T1c — Review correction: dup redirections must stay in sinks** (codex-impl; native review of `492aa1a` returned correction_required, plan 80 lines)
   - R3-dup-redirect-escapes-sinks (CRITICAL, `eval.rs:908-910`): with sinks set, `echo msg >&2` / `cmd 2>&1` write to the real process fd and escape the embedder's capture. File redirections bypass the sink; dups between stdout/stderr route to the matching sink.
-- [ ] **T1d — Sink-route follow-ups from the `49243c1` review** (codex-impl, after T2d)
+- [x] **T1d — Sink-route follow-ups from the `49243c1` review** (codex-impl, after T2d)
   - R3-route-ignores-substitution-capture: the shared stdout route atomic stays at "real fd" inside compound bodies, so fork-free command substitution in `{ v=$(echo hi); } >file` (or `>&2`) may send `echo` to the file instead of the capture (`eval.rs:914-919`). Verify and fix: substitution capture must override the route.
   - R4-compound-redirect-panic-leaks-route: brace groups, EV_EXIT subshells and function-definition redirections restore by hand, without the RAII guard; a panicking embedder builtin there leaks the route (`eval.rs:1855`).
   - R2: route atomics readability (`eval.rs:374-377`, `redirect.rs:60-69`); failed dup routes to real fd (`redirect.rs:288-295`).
-- [ ] **T2d — Flaky PTY test `pipeline_ctrl_z_is_retained_and_cleaned_up_by_test`** (codex-impl)
+- [x] **T2d — Flaky PTY test `pipeline_ctrl_z_is_retained_and_cleaned_up_by_test`** (codex-impl)
   - Failed 4 of 11 full workspace runs in Codex's T2c verification (`crates/shell/tests/repl.rs:636`). Find the race and make it deterministic.
+- [ ] **T2e — `make ci` hang with a terminal stdin** (investigate)
+  - Codex reported `make ci` (run without `< /dev/null`, from its interactive terminal) hanging ~5 min in the workspace test phase; orchestrator could not reproduce with stdin=/dev/null (3/3 workspace runs ~6 s, make ci 7 s). Hypothesis: a test inherits a terminal stdin and blocks. Reproduce under a PTY and make the suite independent of the caller's stdin.
 - [ ] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
   - Fix: SIGTTIN acquisition deadline must not count time spent stopped (`terminal.rs:74-79`).
@@ -111,5 +113,9 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T1c (`49243c1`): per-fd sink provenance copied on dup and restored in reverse order; file redirections bypass the sink, `>&2`/`2>&1`/`1>&2` route to the matching sink. Diff 133+/14- exceeded the declared 80-line correction budget without notice (flagged to Codex). Orchestrator verified 5/5 embedding runs + workspace green.
   Native review: the correction changed scope -> provider-issued `review recover` (scope_changed, new lineage review-802bc3456c12c1a9) -> 4 lenses approved, acknowledged. Covers `492aa1a`..`49243c1`. WARNINGs -> T1d.
 
+- `808fac5` chore: `.atl/` untracked (user approved) — tool cache kept re-triggering review consent.
+- T2d (`fd15f4b`): pipeline Ctrl-Z test assumed a returned prompt meant all killed members were reaped; now waits for pgid membership and observable Killed/Done states, no fixed sleeps. Orchestrator: 5/5 full workspace runs with 0 failures.
+- T1d (`eb83a98`): confirmed real bug — `{ v=$(echo hi); echo "[$v]"; } > out` wrote `hi\n[]` to the file; fork-free substitution now overrides the sink route; RedirectionGuard on compound/EV_EXIT/function paths; named route states; failed dup keeps errno. Orchestrator: 3/3 workspace runs green (~6 s), make ci only regression-37.
+
 ## Progress / Next step
-- T2d running on `codex-impl`; then T1d, T2b+T3, T4. Pending user decision: untrack `.atl/` (tool cache that keeps triggering review consent).
+- Next: native review of `49243c1..HEAD` when due; T2b+T3 (fg/bg) on `codex-impl`; T2e investigation; then T4.

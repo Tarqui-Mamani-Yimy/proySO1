@@ -1033,6 +1033,21 @@ mod startup_rc {
         exited(&mut session, 0);
     }
 
+    #[test]
+    fn relative_rc_without_slash_is_loaded_from_current_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rcfile"), "PS1='cwd> '; echo cwd-rc\n").unwrap();
+        let mut session = session(
+            &dir,
+            Some(OsStr::new("rcfile")),
+            Some(dir.path().as_os_str()),
+        );
+        session.exp_string("cwd-rc\r\n").unwrap();
+        session.exp_regex("cwd> ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
     fn error_then_prompt(mut session: PtySession, diagnostic: &str) {
         session.exp_string(diagnostic).unwrap();
         session.exp_string("$ ").unwrap();

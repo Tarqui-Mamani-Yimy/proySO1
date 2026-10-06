@@ -60,7 +60,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - reedline: history file, Ctrl-R search, multiline input when the parser reports incomplete input (open quote, `if` without `fi`).
   - Accept: PTY tests for history recall across sessions and a multiline `if`.
 - [x] **T3b — Line editor follow-ups from review** (route: delegated → `codex-impl`, after T4)
-  - R3-001: `parse_interactive` treats any syntax error after EOF as incomplete; `echo >` + Enter waits for continuation instead of reporting `syntax error near newline` (orchestrator PTY probe: no error printed). Fix and test.
+  - R3-001: `parse_interactive` treats any syntax error after EOF as incomplete; `echo >` + Enter waits for continuation instead of reporting `syntax error near newline` (orchestrator PTY probe was INVALID: it did not answer reedline's ESC[6n cursor query; the bug was independently proven by Codex's RED tests and the dash comparison). Fix and test.
   - R3-002: no tests for history I/O failure paths (unwritable or directory `SO1SH_HISTFILE`).
   - R3-003: treat empty `HOME` / `SO1SH_HISTFILE` as unset.
   - R3-004/R3-005 (suggestions): empty heredoc delimiter needs two Enters; Ctrl-R test does not prove submission semantics.
@@ -68,8 +68,8 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - Shell ignores SIGINT/SIGQUIT/SIGTSTP/SIGTTOU at the prompt; children run in their own process group with the terminal (epsh `interactive(true)`).
   - Ctrl-C kills the foreground command, not the shell; status 130.
   - Accept: PTY test `sleep 100` + Ctrl-C returns to the prompt with `$?` 130.
-- [ ] **T4b — Signal follow-ups from review** (route: delegated → `codex-impl`, after T3b; HIGH priority)
-  - R3-001 (confirmed by orchestrator PTY probe): Ctrl-C kills the child but does not abort the enclosing loop/list; `while true; do sleep 0.3; done` cannot be interrupted and the shell never returns to the prompt. A foreground child killed by SIGINT must abort the current line (like dash/bash).
+- [x] **T4b — Signal follow-ups from review** (route: delegated → `codex-impl`, after T3b; HIGH priority)
+  - R3-001 (orchestrator PTY probe was INVALID — unanswered ESC[6n; bug independently proven by Codex's RED 0/4): Ctrl-C kills the child but does not abort the enclosing loop/list; `while true; do sleep 0.3; done` cannot be interrupted and the shell never returns to the prompt. A foreground child killed by SIGINT must abort the current line (like dash/bash).
   - R4-001: `Terminal::new` calls tcsetpgrp without checking it is in the foreground (e.g. `so1sh &` steals the terminal); wait until foreground (SIGTTIN loop) and remember the original foreground group.
   - R3-002: if `Terminal::new` fails (no controlling tty), fall back gracefully instead of failing the REPL.
   - R2-003: interactive wait path bypasses cancel/timeout-aware wait and skips joining relay threads.
@@ -103,6 +103,11 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T3b (`a601d55` epsh: forbidden line endings reported immediately, e.g. `echo >` like dash; `30a3fc9` shell: empty HOME/HISTFILE unset, Enter-newline validation for empty heredoc delimiter and backslash-newline, history I/O failure and exact Ctrl-R PTY tests). Workspace 527 green; epsh verified alone. History/Ctrl-R tests passed before the fix (coverage, disclosed by Codex).
   Native review: high risk, user granted, approved, acknowledged; 1 WARNING (`parser.rs:84`) + 3 suggestions.
 
+- T4b (`9278d92` epsh: SIGINT/SIGQUIT abort the current list/loop with 130/131 incl. builtin loops; interactive waits honor cancel/timeout, signal pipeline pgids, reap members, join relays; stopped jobs discarded with SIGKILL; `8b0102e` shell: `Terminal::acquire` waits for foreground via SIGTTIN and restores the original owner; no controlling tty -> one diagnostic, REPL continues). Workspace 541 green; epsh verified alone. Orchestrator PTY probe (answering ESC[6n, script /tmp/claude-1000/so1sh-loop-probe.py): Ctrl-C aborts `sleep 100`, sleep loops and arithmetic loops -> PASS.
+  Divergence from dash (orchestrator spec decision): Ctrl-\\ aborts the line with 131; dash continues the suffix after SIGQUIT.
+  Codex observed one unexplained failure of `raw_bytes::path_lookup_handles_invalid_utf8_directories` during a concurrent run (rerun green, log kept) -> watch for flakiness.
+  Lesson: PTY probes must answer reedline's cursor-position query (ESC[6n) or the editor blocks.
+
 ## Progress / Next step
-- T4b running on `codex-impl` (high priority); then T5, T6.
+- T5 running on `codex-impl`; then T6 (orchestrator + Claude verifier).
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

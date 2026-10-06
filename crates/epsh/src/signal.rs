@@ -10,13 +10,77 @@
 //! static-musl linking); reset/ignore use rustix `kernel_sigaction` with the
 //! `SIG_DFL`/`SIG_IGN` kernel handlers (no trampoline involved).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use rustix::process::Signal;
 
 static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
 static SIGTERM_PENDING: AtomicBool = AtomicBool::new(false);
 static SIGHUP_PENDING: AtomicBool = AtomicBool::new(false);
+static INTERACTIVE_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn interactive_handler(signal: i32) {
+    INTERACTIVE_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+/// Evaluation-only signal policy; restores the caller's dispositions and mask.
+/// Interactive shells opt in, never non-interactive embedding applications.
+pub(crate) struct InteractiveSignalScope {
+    actions: Vec<(i32, libc::sigaction)>,
+    mask: Option<libc::sigset_t>,
+}
+
+impl InteractiveSignalScope {
+    pub(crate) fn install() -> std::io::Result<Self> {
+        let mut scope = Self {
+            actions: Vec::new(),
+            mask: None,
+        };
+        INTERACTIVE_SIGNAL.store(0, Ordering::Relaxed);
+        // SAFETY: initialized target-specific storage; invoked before evaluation,
+        // not from a handler. Drop rolls back even partially installed actions.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interactive_handler as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut unblock: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut unblock);
+            for signal in [libc::SIGINT, libc::SIGQUIT] {
+                let mut old = std::mem::zeroed();
+                if libc::sigaction(signal, &action, &mut old) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                scope.actions.push((signal, old));
+                libc::sigaddset(&mut unblock, signal);
+            }
+            let mut old_mask = std::mem::zeroed();
+            if libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, &mut old_mask) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            scope.mask = Some(old_mask);
+        }
+        Ok(scope)
+    }
+}
+
+impl Drop for InteractiveSignalScope {
+    fn drop(&mut self) {
+        // SAFETY: these actions and mask were saved from this process/thread.
+        unsafe {
+            for (signal, action) in &self.actions {
+                libc::sigaction(*signal, action, std::ptr::null_mut());
+            }
+            if let Some(mask) = &self.mask {
+                libc::sigprocmask(libc::SIG_SETMASK, mask, std::ptr::null_mut());
+            }
+        }
+        INTERACTIVE_SIGNAL.store(0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn take_interactive_signal() -> i32 {
+    INTERACTIVE_SIGNAL.swap(0, Ordering::Relaxed)
+}
 
 /// Map a signal name (e.g. "INT", "SIGINT") to its `Signal`.
 pub fn name_to_signal(name: &str) -> Option<Signal> {

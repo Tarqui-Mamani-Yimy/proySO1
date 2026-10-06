@@ -1190,3 +1190,295 @@ mod stopped_job_cleanup {
         shell.discard_stopped_jobs();
     }
 }
+
+mod interactive_line_interrupts {
+    use super::*;
+
+    #[test]
+    fn signal_to_evaluator_reaps_every_pipeline_stage() {
+        if isolated_test(
+            "interactive_line_interrupts::signal_to_evaluator_reaps_every_pipeline_stage",
+        ) {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let interrupt = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !["first", "second", "third"].iter().all(|name| {
+                fs::read_to_string(path.join(name))
+                    .is_ok_and(|raw| raw.trim().parse::<i32>().is_ok())
+            }) {
+                assert!(std::time::Instant::now() < deadline, "pipeline not ready");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Only this isolated engine process, not the test runner, receives INT.
+            unsafe {
+                libc::kill(std::process::id() as i32, libc::SIGINT);
+            }
+        });
+        let mut shell = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .cwd(dir.path().to_path_buf())
+            .build();
+        let result = shell.eval_repl_line("/bin/sh -c 'echo $$ > first; exec /bin/sleep 100' | /bin/sh -c 'echo $$ > second; exec /bin/sleep 100' | /bin/sh -c 'echo $$ > third; exec /bin/sleep 100'; echo forbidden");
+        interrupt.join().unwrap();
+        assert_eq!(
+            result,
+            std::ops::ControlFlow::Continue(ExitStatus::from(130))
+        );
+        for name in ["first", "second", "third"] {
+            let pid: i32 = fs::read_to_string(dir.path().join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "unreaped {name}: {pid}");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[test]
+    fn actual_signals_abort_the_line_but_numeric_statuses_do_not() {
+        if isolated_test(
+            "interactive_line_interrupts::actual_signals_abort_the_line_but_numeric_statuses_do_not",
+        ) {
+            return;
+        }
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .stdout_sink(out.clone())
+            .build();
+        shell.set_var("PATH", "/usr/bin:/bin").unwrap();
+        for (signal, code) in [("INT", 130), ("QUIT", 131)] {
+            for pipeline in [false, true] {
+                out.lock().unwrap().clear();
+                let suffix = if pipeline { " | /bin/cat" } else { "" };
+                assert_eq!(
+                    shell.run_script(&format!(
+                        "/bin/sh -c 'kill -{signal} $$'{suffix}; echo forbidden"
+                    )),
+                    code
+                );
+                assert!(out.lock().unwrap().is_empty());
+            }
+            out.lock().unwrap().clear();
+            assert_eq!(
+                shell.run_script(&format!("/bin/sh -c 'exit {code}'; echo allowed")),
+                0
+            );
+            assert_eq!(&*out.lock().unwrap(), b"allowed\n");
+        }
+        // Non-interactive lists retain their existing behavior.
+        shell.opts_mut().interactive = false;
+        out.lock().unwrap().clear();
+        assert_eq!(shell.run_script("/bin/sh -c 'kill -INT $$'; echo batch"), 0);
+        assert_eq!(&*out.lock().unwrap(), b"batch\n");
+    }
+}
+
+mod interactive_wait {
+    use super::*;
+
+    fn run_cancelled(pipeline: bool, timeout: bool) {
+        let dir = tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let file = dir.path().join("child");
+        let watchdog = {
+            let cancel = cancel.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok(raw) = fs::read_to_string(&file)
+                        && let Ok(pid) = raw.trim().parse::<i32>()
+                    {
+                        if !timeout {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            // Backstop only: a failing wait must not leave a 100s child.
+                            unsafe {
+                                libc::kill(pid, libc::SIGKILL);
+                            }
+                            break;
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline + Duration::from_secs(1),
+                        "child never started"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut builder = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .cwd(dir.path().to_path_buf())
+            .cancel_flag(cancel);
+        if timeout {
+            builder = builder.timeout(Duration::from_millis(100));
+        }
+        if !pipeline {
+            builder = builder
+                .stdout_sink(stdout.clone())
+                .stderr_sink(stderr.clone());
+        }
+        let mut shell = builder.build();
+        let script = if pipeline {
+            "/bin/true | /bin/sh -c 'echo $$ > child; exec /bin/sleep 100'"
+        } else {
+            "/bin/sh -c 'echo out; echo err >&2; echo $$ > child; exec /bin/sleep 100'"
+        };
+        let start = std::time::Instant::now();
+        let status = shell.run_script(script);
+        let elapsed = start.elapsed();
+        done.store(true, Ordering::Relaxed);
+        watchdog.join().unwrap();
+        assert_eq!(status, 130);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "interactive wait took {elapsed:?}"
+        );
+        if !pipeline {
+            assert_eq!(&*stdout.lock().unwrap(), b"out\n");
+            assert_eq!(&*stderr.lock().unwrap(), b"err\n");
+        }
+        let pid: i32 = fs::read_to_string(dir.path().join("child"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child still alive");
+    }
+
+    #[test]
+    fn standalone_cancel_and_timeout_join_relays() {
+        if isolated_test("interactive_wait::standalone_cancel_and_timeout_join_relays") {
+            return;
+        }
+        run_cancelled(false, false);
+        run_cancelled(false, true);
+    }
+    #[test]
+    fn pipeline_cancel_targets_the_job_group() {
+        if isolated_test("interactive_wait::pipeline_cancel_targets_the_job_group") {
+            return;
+        }
+        run_cancelled(true, false);
+    }
+    #[test]
+    fn pipeline_timeout_targets_the_job_group() {
+        if isolated_test("interactive_wait::pipeline_timeout_targets_the_job_group") {
+            return;
+        }
+        run_cancelled(true, true);
+    }
+
+    #[test]
+    fn stopped_cleanup_never_resumes_user_code() {
+        if isolated_test("interactive_wait::stopped_cleanup_never_resumes_user_code") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let mut shell = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .cwd(dir.path().to_path_buf())
+            .build();
+        assert_eq!(shell.run_script("/bin/sh -c 'trap \"echo resumed > resumed\" CONT; trap \"\" TERM; kill -STOP $$; while :; do /bin/sleep 0.1; done'"), 148);
+        shell.discard_stopped_jobs();
+        assert!(
+            !dir.path().join("resumed").exists(),
+            "cleanup resumed user code"
+        );
+    }
+
+    #[test]
+    fn stopped_cleanup_joins_retained_relay_threads() {
+        if isolated_test("interactive_wait::stopped_cleanup_joins_retained_relay_threads") {
+            return;
+        }
+        cleanup_joins_retained_relay_threads(false);
+    }
+
+    #[test]
+    fn cancel_cleanup_joins_stopped_relays() {
+        if isolated_test("interactive_wait::cancel_cleanup_joins_stopped_relays") {
+            return;
+        }
+        cleanup_joins_retained_relay_threads(true);
+    }
+
+    fn cleanup_joins_retained_relay_threads(cancelled: bool) {
+        struct DelayedSink {
+            started: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+            finished: Arc<AtomicBool>,
+        }
+        impl std::io::Write for DelayedSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.started.store(true, Ordering::Relaxed);
+                while !self.release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.finished.store(true, Ordering::Relaxed);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let sink = Arc::new(Mutex::new(DelayedSink {
+            started: started.clone(),
+            release: release.clone(),
+            finished: finished.clone(),
+        }));
+        let mut shell = Shell::builder()
+            .env_clear()
+            .interactive(true)
+            .stdout_sink(sink)
+            .build();
+        assert_eq!(
+            shell.run_script("/bin/sh -c 'echo delayed; kill -STOP $$'"),
+            148
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !started.load(Ordering::Relaxed) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let unblock = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.store(true, Ordering::Relaxed);
+        });
+        if cancelled {
+            shell.set_cancel_flag(Arc::new(AtomicBool::new(true)));
+            assert_eq!(
+                shell.eval_repl_line(":"),
+                std::ops::ControlFlow::Continue(ExitStatus::from(130))
+            );
+        } else {
+            shell.discard_stopped_jobs();
+        }
+        let joined = finished.load(Ordering::Relaxed);
+        unblock.join().unwrap();
+        assert!(joined, "cleanup returned before its relay thread finished");
+    }
+}

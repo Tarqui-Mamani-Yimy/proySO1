@@ -298,7 +298,9 @@ pub struct Shell {
     pub(crate) child_pids: Vec<i32>,
     /// Unconsumed asynchronous jobs owned by this shell execution environment.
     pub(crate) background_pids: Vec<i32>,
-    stopped_jobs: Vec<(i32, Vec<i32>)>,
+    stopped_jobs: Vec<StoppedJob>,
+    /// Actual interactive SIGINT/SIGQUIT, distinct from an ordinary exit code.
+    interrupted: Option<ExitStatus>,
     /// Optional execution deadline. When exceeded, shell aborts with TimedOut.
     timeout: Option<std::time::Instant>,
     /// Optional callback that replaces eval_external for spawning processes.
@@ -312,6 +314,12 @@ pub struct Shell {
     /// when a heredoc targets fd 0 in sink mode (avoids process-wide dup2 on fd 0
     /// which would race with other threads reading stdin, e.g. nerv's input loop).
     pub(crate) pending_stdin: Option<RawFd>,
+}
+
+struct StoppedJob {
+    pgid: i32,
+    members: Vec<i32>,
+    relays: Vec<std::thread::JoinHandle<()>>,
 }
 
 // Restore the previous foreground group and modes on every result path. A
@@ -384,14 +392,15 @@ impl Drop for ForegroundTerminal {
     }
 }
 
-fn stopped_child_pending(pid: i32) -> bool {
+/// Reap a finished child; true means no live owned child remains.
+fn reap_finished_child(pid: i32) -> bool {
     loop {
         // SAFETY: wait only for a recorded engine-owned direct child.
         let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
         if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
             continue;
         }
-        return result == 0;
+        return result != 0;
     }
 }
 
@@ -630,6 +639,7 @@ impl ShellBuilder {
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
+            interrupted: None,
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
             external_handler: self.external_handler,
             redirect_open_handler: self.redirect_open_handler,
@@ -673,6 +683,7 @@ impl Shell {
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
+            interrupted: None,
             timeout: None,
             external_handler: None,
             redirect_open_handler: None,
@@ -745,6 +756,42 @@ impl Shell {
         Ok(())
     }
 
+    fn capture_interactive_signal(&mut self) -> Option<ExitStatus> {
+        if self.opts.interactive && !self.in_forked_child {
+            let signal = crate::signal::take_interactive_signal();
+            if matches!(signal, libc::SIGINT | libc::SIGQUIT) {
+                let status = ExitStatus::from_signal(signal);
+                self.interrupted = Some(status);
+                return Some(status);
+            }
+        }
+        None
+    }
+
+    fn check_interactive_interrupt(&mut self) -> crate::error::Result<()> {
+        self.capture_interactive_signal();
+        if self.opts.interactive
+            && !self.in_forked_child
+            && let Some(status) = self.interrupted
+        {
+            self.exit_status = status;
+            return Err(ShellError::Exit(status));
+        }
+        Ok(())
+    }
+
+    fn completed_child_status(&mut self, raw: i32) -> ExitStatus {
+        let status = ExitStatus::from_wait(raw);
+        if self.opts.interactive
+            && !self.in_forked_child
+            && libc::WIFSIGNALED(raw)
+            && matches!(libc::WTERMSIG(raw), libc::SIGINT | libc::SIGQUIT)
+        {
+            self.interrupted = Some(status);
+        }
+        status
+    }
+
     /// Set a stdout sink. Builtin output will be written here instead of fd 1.
     pub fn set_stdout_sink(&mut self, sink: Arc<Mutex<dyn Write + Send>>) {
         self.stdout_sink = Some(sink);
@@ -799,6 +846,9 @@ impl Shell {
     }
 
     fn wait_child_pgid(&mut self, pid: i32, pgid: i32) -> crate::error::Result<ExitStatus> {
+        if self.opts.interactive {
+            return self.wait_interactive_child(pid, pgid);
+        }
         let wuntraced = if self.opts.interactive { 1 } else { 0 };
 
         // If no cancel flag or timeout, just block
@@ -855,8 +905,84 @@ impl Shell {
         }
     }
 
+    /// Poll only our child: no detached waiter, EINTR-as-success, or PID/PGID mixup.
+    fn wait_interactive_child(&mut self, pid: i32, pgid: i32) -> crate::error::Result<ExitStatus> {
+        loop {
+            // A previously interrupted stage must not skip waiting for siblings.
+            let error = self
+                .check_cancel()
+                .err()
+                .or_else(|| self.capture_interactive_signal().map(ShellError::Exit));
+            if let Some(error) = error {
+                self.terminate_job(pgid, &[pid]);
+                return Err(error);
+            }
+            let mut raw = 0;
+            // SAFETY: exact tracked child; this thread owns its wait lifecycle.
+            let result = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG | libc::WUNTRACED) };
+            if result == pid {
+                if libc::WIFSTOPPED(raw) {
+                    self.record_stopped_job(pgid, &[pid]);
+                    return Err(ShellError::Stopped { pid, pgid });
+                }
+                self.child_pids.retain(|&p| p != pid);
+                return Ok(self.completed_child_status(raw));
+            }
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                self.child_pids.retain(|&p| p != pid);
+                return Err(ShellError::Io(error));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Kill and reap only the specified engine-owned job members, never host PIDs.
+    fn terminate_job(&mut self, pgid: i32, pids: &[i32]) {
+        let members: Vec<i32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| self.child_pids.contains(pid) && !reap_finished_child(*pid))
+            .collect();
+        // SAFETY: verify a live owned member still pins the original group.
+        // Individual kills also cover a child that changed its own group.
+        unsafe {
+            if pgid > 0 && members.iter().any(|&pid| libc::getpgid(pid) == pgid) {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            for &pid in &members {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        for &pid in &members {
+            while !reap_finished_child(pid) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        self.child_pids.retain(|pid| !pids.contains(pid));
+        self.background_pids.retain(|pid| !pids.contains(pid));
+    }
+
     /// Kill all tracked child processes (process groups).
     fn kill_children(&mut self) {
+        if self.opts.interactive {
+            let jobs = std::mem::take(&mut self.stopped_jobs);
+            for pid in self.child_pids.clone() {
+                // SAFETY: ownership is verified again by terminate_job before kill.
+                let group = unsafe { libc::getpgid(pid) };
+                self.terminate_job(group, &[pid]);
+            }
+            for job in jobs {
+                for relay in job.relays {
+                    let _ = relay.join();
+                }
+            }
+            self.clear_child_tracking();
+            return;
+        }
         for &pid in &self.child_pids {
             // Kill the process group (negative PID)
             // SAFETY: pid is a valid child PID from fork(); negated for process group kill.
@@ -879,57 +1005,45 @@ impl Shell {
         self.child_pids.clear();
         self.background_pids.clear();
         self.stopped_jobs.clear();
+        self.interrupted = None;
+    }
+
+    fn reset_child_tracking_after_fork(&mut self) {
+        // Parent relay threads do not exist here. Forget their copied handles
+        // until exec/_exit rather than running thread destructors after fork.
+        std::mem::forget(std::mem::take(&mut self.stopped_jobs));
+        self.clear_child_tracking();
     }
 
     fn record_stopped_job(&mut self, pgid: i32, pids: &[i32]) {
-        if !self.stopped_jobs.iter().any(|(group, _)| *group == pgid) {
-            self.stopped_jobs.push((pgid, Vec::new()));
+        if !self.stopped_jobs.iter().any(|job| job.pgid == pgid) {
+            self.stopped_jobs.push(StoppedJob {
+                pgid,
+                members: Vec::new(),
+                relays: Vec::new(),
+            });
         }
-        let (_, members) = self
+        let job = self
             .stopped_jobs
             .iter_mut()
-            .find(|(group, _)| *group == pgid)
+            .find(|job| job.pgid == pgid)
             .unwrap();
         for &pid in pids {
-            if self.child_pids.contains(&pid) && !members.contains(&pid) {
-                members.push(pid);
+            if self.child_pids.contains(&pid) && !job.members.contains(&pid) {
+                job.members.push(pid);
             }
         }
     }
 
     /// Terminate and reap stopped jobs created by this engine, never host jobs.
-    /// Opt-in for frontends without job resume: SIGTERM + SIGCONT, escalating to
-    /// SIGKILL after 200 ms. Other embedders can retain live `Stopped` jobs.
+    /// Opt-in for frontends without job resume: SIGKILL without SIGCONT prevents
+    /// stopped user code from running or grabbing the tty during cleanup.
+    /// Joins retained output relays. Other embedders can retain live `Stopped` jobs.
     pub fn discard_stopped_jobs(&mut self) {
-        for (group, mut members) in std::mem::take(&mut self.stopped_jobs) {
-            let recorded = members.clone();
-            self.child_pids.retain(|pid| !recorded.contains(pid));
-            self.background_pids.retain(|pid| !recorded.contains(pid));
-            // Verify ownership first, in case the embedder already reaped a job.
-            members.retain(|&pid| stopped_child_pending(pid));
-            if members.is_empty() {
-                continue;
-            }
-            // SAFETY: a still-owned direct child pins this job's process group.
-            unsafe {
-                libc::kill(-group, libc::SIGTERM);
-                libc::kill(-group, libc::SIGCONT);
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-            while !members.is_empty() && std::time::Instant::now() < deadline {
-                members.retain(|&pid| stopped_child_pending(pid));
-                if !members.is_empty() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-            if !members.is_empty() {
-                unsafe {
-                    libc::kill(-group, libc::SIGKILL);
-                }
-                for &pid in &members {
-                    let mut status = 0;
-                    sys::waitpid(pid, &mut status, 0);
-                }
+        for job in std::mem::take(&mut self.stopped_jobs) {
+            self.terminate_job(job.pgid, &job.members);
+            for relay in job.relays {
+                let _ = relay.join();
             }
         }
     }
@@ -1038,10 +1152,27 @@ impl Shell {
     /// `Continue` carries the last command status and keeps the session alive.
     /// Syntax, runtime, and special-builtin errors print a diagnostic, abort the
     /// remaining line, and set `$?` to 2 (runtime/builtin errors exit with `-e`).
+    /// With `interactive(true)`, actual INT/QUIT abort the remaining line and
+    /// continue with 130/131 (even with `-e`); numeric exit codes alone do not.
+    /// Scoped process-wide handlers interrupt builtin loops during evaluation and
+    /// restore the caller's dispositions before returning to the prompt.
     /// Cancellation/timeouts continue with 130; stopped processes continue with
-    /// 148, without adopting job-control state. Embedders must reset cancellation
-    /// or deadlines before retrying. EXIT traps run on termination/EOF, not errors.
+    /// 148, retaining owned jobs until frontend cleanup. Embedders must reset
+    /// cancellation/deadlines before retrying. EXIT traps run on termination/EOF.
     pub fn eval_repl_line(&mut self, source: &str) -> ControlFlow<ExitStatus, ExitStatus> {
+        self.interrupted = None;
+        let _signals = if self.opts.interactive && !self.in_forked_child {
+            match crate::signal::InteractiveSignalScope::install() {
+                Ok(scope) => Some(scope),
+                Err(error) => {
+                    self.err_msg(&format!("epsh: signal setup: {error}"));
+                    self.exit_status = ExitStatus::MISUSE;
+                    return ControlFlow::Continue(self.exit_status);
+                }
+            }
+        } else {
+            None
+        };
         match Parser::new(source).parse() {
             Ok(program) => {
                 // Errors can unwind through a condition or loop before its normal
@@ -1079,6 +1210,10 @@ impl Shell {
                     self.exit_status = status;
                 }
                 Err(ShellError::Exit(n)) => {
+                    if self.interrupted.take().is_some() {
+                        self.exit_status = n;
+                        return ControlFlow::Continue(n);
+                    }
                     if repl && self.special_builtin_failed {
                         return self.repl_shell_error();
                     }
@@ -1208,10 +1343,13 @@ impl Shell {
     /// Evaluate a command node, returning its exit status.
     pub fn eval_command(&mut self, cmd: &Command) -> crate::error::Result<ExitStatus> {
         self.check_cancel()?;
+        self.check_interactive_interrupt()?;
         if self.opts.noexec {
             return Ok(ExitStatus::SUCCESS);
         }
-        let status = self.eval_command_inner(cmd)?;
+        let result = self.eval_command_inner(cmd);
+        self.check_interactive_interrupt()?;
+        let status = result?;
         self.exit_status = status;
 
         // Errexit check — mirrors dash's eval.c line 330.
@@ -1819,7 +1957,14 @@ impl Shell {
                         child_id
                     };
                     let status = self.wait_child_pgid(child_id, group);
-                    if !matches!(status, Err(ShellError::Stopped { .. })) {
+                    if let Err(ShellError::Stopped { pgid, .. }) = &status {
+                        let job = self
+                            .stopped_jobs
+                            .iter_mut()
+                            .find(|job| job.pgid == *pgid)
+                            .expect("wait recorded this stopped child");
+                        job.relays.extend(handles);
+                    } else {
                         for handle in handles {
                             let _ = handle.join();
                         }
@@ -1899,7 +2044,7 @@ impl Shell {
 
         let foreground = self.opts.interactive && !self.in_forked_child;
         let terminal = ForegroundTerminal::new(foreground);
-        let gate = if foreground {
+        let mut gate = if foreground {
             match rustix::pipe::pipe() {
                 Ok(fds) => Some(fds),
                 Err(error) => {
@@ -1934,7 +2079,7 @@ impl Shell {
                 }
 
                 if pid == 0 {
-                    self.clear_child_tracking();
+                    self.reset_child_tracking_after_fork();
                     if self.opts.interactive {
                         let _ = crate::signal::reset_job_signals();
                     }
@@ -1951,11 +2096,12 @@ impl Shell {
                             },
                         );
                     }
-                    if let Some((reader, writer)) = &gate {
-                        sys::close(std::os::fd::AsRawFd::as_raw_fd(writer));
+                    if let Some((reader, writer)) = gate.take() {
+                        drop(writer);
                         let mut byte = [0u8];
-                        let _ = rustix::io::read(reader, &mut byte);
-                        sys::close(std::os::fd::AsRawFd::as_raw_fd(reader));
+                        while rustix::io::read(&reader, &mut byte) == Err(rustix::io::Errno::INTR) {
+                        }
+                        drop(reader);
                     }
                     self.in_forked_child = true;
                     // Connect stdin from previous pipe
@@ -2043,6 +2189,10 @@ impl Shell {
                     self.kill_children();
                     return Err(e);
                 }
+                Err(e @ ShellError::Exit(_)) if self.interrupted.is_some() => {
+                    self.terminate_job(pgid, &children);
+                    return Err(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -2070,7 +2220,7 @@ impl Shell {
             }
 
             if pid == 0 {
-                self.clear_child_tracking();
+                self.reset_child_tracking_after_fork();
                 if self.opts.interactive {
                     let _ = crate::signal::reset_job_signals();
                 }
@@ -2121,7 +2271,7 @@ impl Shell {
             }
 
             if pid == 0 {
-                self.clear_child_tracking();
+                self.reset_child_tracking_after_fork();
                 if self.opts.interactive {
                     let _ = crate::signal::reset_job_signals();
                 }
@@ -2244,7 +2394,7 @@ impl Shell {
             }
 
             if pid == 0 {
-                self.clear_child_tracking();
+                self.reset_child_tracking_after_fork();
                 if self.opts.interactive {
                     let _ = crate::signal::reset_job_signals();
                 }

@@ -286,6 +286,8 @@ pub struct Shell {
     /// True when the current eval context will exit after the command completes.
     /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
     pub(crate) ev_exit: bool,
+    /// Distinguishes builtin errors encoded as Exit from explicit exit/errexit.
+    pub(crate) special_builtin_failed: bool,
     /// Optional cancellation flag. When set to true, the shell aborts execution.
     cancel: Option<Arc<AtomicBool>>,
     /// Optional stdout sink. When set, builtin output goes here instead of fd 1.
@@ -539,6 +541,7 @@ impl ShellBuilder {
             tested: false,
             in_forked_child: false,
             ev_exit: false,
+            special_builtin_failed: false,
             cancel: self.cancel,
             stdout_sink: self.stdout_sink,
             stderr_sink: self.stderr_sink,
@@ -580,6 +583,7 @@ impl Shell {
             tested: false,
             in_forked_child: false,
             ev_exit: false,
+            special_builtin_failed: false,
             cancel: None,
             stdout_sink: None,
             stderr_sink: None,
@@ -879,7 +883,7 @@ impl Shell {
     /// This is the library-facing entry point — parse once with `Parser`,
     /// then execute via `run_program`.
     pub fn run_program(&mut self, program: &crate::ast::Program) -> ExitStatus {
-        match self.run_program_inner(program) {
+        match self.run_program_inner(program, false) {
             ControlFlow::Continue(_) => {
                 self.run_exit_trap();
                 self.exit_status
@@ -890,12 +894,23 @@ impl Shell {
 
     /// Evaluate one REPL line without finishing the session after a normal command.
     ///
-    /// `Continue` carries the last command status; `Break` requests termination
-    /// (including `exit` and `errexit`). EXIT traps run on termination, not per line.
-    /// Syntax errors update `$?` to 2 and allow the next line to be evaluated.
+    /// `Break` requests termination only for explicit `exit` or `errexit`.
+    /// `Continue` carries the last command status and keeps the session alive.
+    /// Syntax, runtime, and special-builtin errors print a diagnostic, abort the
+    /// remaining line, and set `$?` to 2 (runtime/builtin errors exit with `-e`).
+    /// Cancellation/timeouts continue with 130; stopped processes continue with
+    /// 148, without adopting job-control state. Embedders must reset cancellation
+    /// or deadlines before retrying. EXIT traps run on termination/EOF, not errors.
     pub fn eval_repl_line(&mut self, source: &str) -> ControlFlow<ExitStatus, ExitStatus> {
         match Parser::new(source).parse() {
-            Ok(program) => self.run_program_inner(&program),
+            Ok(program) => {
+                // Errors can unwind through a condition or loop before its normal
+                // cleanup; evaluation context must not leak into the next line.
+                let context = (self.tested, self.loop_depth, self.ev_exit);
+                let result = self.run_program_inner(&program, true);
+                (self.tested, self.loop_depth, self.ev_exit) = context;
+                result
+            }
             Err(error) => {
                 self.err_msg(&format!("epsh: {error}"));
                 self.exit_status = ExitStatus::MISUSE;
@@ -915,21 +930,36 @@ impl Shell {
     fn run_program_inner(
         &mut self,
         program: &crate::ast::Program,
+        repl: bool,
     ) -> ControlFlow<ExitStatus, ExitStatus> {
         for cmd in &program.commands {
+            self.special_builtin_failed = false;
             match self.eval_command(cmd) {
                 Ok(status) => {
                     self.exit_status = status;
                 }
                 Err(ShellError::Exit(n)) => {
+                    if repl && self.special_builtin_failed {
+                        return self.repl_shell_error();
+                    }
                     self.run_exit_trap();
                     return ControlFlow::Break(n);
                 }
-                Err(ShellError::Cancelled) | Err(ShellError::TimedOut) => {
+                Err(e @ (ShellError::Cancelled | ShellError::TimedOut)) => {
                     self.kill_children();
+                    if repl {
+                        self.err_msg(&format!("epsh: {e}"));
+                        self.exit_status = ExitStatus::from_signal(2);
+                        return ControlFlow::Continue(self.exit_status);
+                    }
                     return ControlFlow::Break(ExitStatus::from_signal(2)); // 130 = SIGINT
                 }
-                Err(ShellError::Stopped { .. }) => {
+                Err(e @ ShellError::Stopped { .. }) => {
+                    if repl {
+                        self.err_msg(&format!("epsh: {e}"));
+                        self.exit_status = ExitStatus::from(148);
+                        return ControlFlow::Continue(self.exit_status);
+                    }
                     // A foreground process was stopped (SIGTSTP). Return 148
                     // (128 + SIGTSTP) so the embedder can detect and save the job.
                     // Do not print anything — the embedder handles the UI.
@@ -937,6 +967,9 @@ impl Shell {
                 }
                 Err(e) => {
                     self.err_msg(&format!("epsh: {e}"));
+                    if repl {
+                        return self.repl_shell_error();
+                    }
                     self.exit_status = ExitStatus::MISUSE;
                     self.run_exit_trap();
                     return ControlFlow::Break(self.exit_status);
@@ -946,6 +979,16 @@ impl Shell {
         }
 
         ControlFlow::Continue(self.exit_status)
+    }
+
+    fn repl_shell_error(&mut self) -> ControlFlow<ExitStatus, ExitStatus> {
+        self.exit_status = ExitStatus::MISUSE;
+        if self.opts.errexit {
+            self.run_exit_trap();
+            ControlFlow::Break(ExitStatus::MISUSE)
+        } else {
+            ControlFlow::Continue(self.exit_status)
+        }
     }
 
     /// Check for pending signals and run their trap handlers.

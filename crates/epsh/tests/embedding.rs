@@ -913,3 +913,188 @@ mod variables {
         assert_eq!(shell.exit_status(), ExitStatus::SUCCESS);
     }
 }
+
+mod repl_errors {
+    use super::*;
+    use epsh::error::ShellError;
+    use std::ops::ControlFlow;
+
+    type Sink = Arc<Mutex<Vec<u8>>>;
+
+    fn captured_shell() -> (Shell, Sink, Sink) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let shell = Shell::builder()
+            .env_clear()
+            .stdout_sink(output.clone())
+            .stderr_sink(errors.clone())
+            .build();
+        (shell, output, errors)
+    }
+
+    fn continued(shell: &mut Shell, source: &str, status: i32) {
+        assert_eq!(
+            shell.eval_repl_line(source),
+            ControlFlow::Continue(ExitStatus::from(status)),
+            "{source}"
+        );
+        assert_eq!(shell.exit_status().code(), status);
+    }
+
+    #[test]
+    fn shell_error_preserves_exit_trap_until_session_finishes() {
+        let (mut shell, output, errors) = captured_shell();
+        continued(&mut shell, "trap 'echo goodbye' EXIT", 0);
+        continued(&mut shell, "echo ${nope?missing}; echo unreachable", 2);
+        assert!(output.lock().unwrap().is_empty());
+        assert!(String::from_utf8_lossy(&errors.lock().unwrap()).contains("missing"));
+        continued(&mut shell, "echo $?; echo after", 0);
+        assert_eq!(*output.lock().unwrap(), b"2\nafter\n");
+        assert_eq!(shell.finish_repl().code(), 0);
+        assert_eq!(*output.lock().unwrap(), b"2\nafter\ngoodbye\n");
+    }
+
+    #[test]
+    fn builtin_errors_recover_but_explicit_exit_does_not() {
+        let dir = tempdir().unwrap();
+        for source in [
+            "break foo",
+            "break 0",
+            "continue foo",
+            "continue 0",
+            ".",
+            ". ./missing-script",
+        ] {
+            let (mut shell, output, errors) = captured_shell();
+            shell.set_cwd(dir.path().to_path_buf());
+            continued(&mut shell, &format!("{source}; echo unreachable"), 2);
+            assert!(output.lock().unwrap().is_empty());
+            assert!(!errors.lock().unwrap().is_empty());
+            assert_eq!(
+                shell.eval_repl_line("exit 2"),
+                ControlFlow::Break(ExitStatus::MISUSE)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_line_continues_with_status_130() {
+        let (mut shell, output, errors) = captured_shell();
+        let cancel = Arc::new(AtomicBool::new(true));
+        shell.set_cancel_flag(cancel.clone());
+        continued(&mut shell, "echo unreachable", 130);
+        assert!(output.lock().unwrap().is_empty());
+        assert!(String::from_utf8_lossy(&errors.lock().unwrap()).contains("cancelled"));
+        cancel.store(false, Ordering::Relaxed);
+        continued(&mut shell, "echo $?; echo after", 0);
+        assert_eq!(*output.lock().unwrap(), b"130\nafter\n");
+    }
+
+    #[test]
+    fn recovery_unwinds_condition_and_loop_context() {
+        for source in [
+            "echo ${nope?missing} && echo unreachable",
+            "if echo ${nope?missing}; then echo unreachable; fi",
+            "while echo ${nope?missing}; do echo unreachable; done",
+            "until echo ${nope?missing}; do echo unreachable; done",
+        ] {
+            let (mut shell, output, _) = captured_shell();
+            continued(&mut shell, source, 2);
+            assert!(output.lock().unwrap().is_empty());
+            continued(&mut shell, "break", 0);
+            continued(&mut shell, "set -e", 0);
+            assert_eq!(
+                shell.eval_repl_line("false"),
+                ControlFlow::Break(ExitStatus::FAILURE)
+            );
+        }
+    }
+
+    #[test]
+    fn errexit_still_terminates_on_shell_errors() {
+        for source in ["echo ${nope?missing}", "break foo"] {
+            let (mut shell, output, _) = captured_shell();
+            continued(&mut shell, "set -e", 0);
+            assert_eq!(
+                shell.eval_repl_line(source),
+                ControlFlow::Break(ExitStatus::MISUSE)
+            );
+            assert!(output.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn timed_out_line_continues_with_status_130() {
+        let (mut shell, output, errors) = captured_shell();
+        shell.set_timeout(Duration::ZERO);
+        continued(&mut shell, "echo unreachable", 130);
+        assert!(output.lock().unwrap().is_empty());
+        assert!(String::from_utf8_lossy(&errors.lock().unwrap()).contains("timed out"));
+        shell.set_timeout(Duration::from_secs(60));
+        continued(&mut shell, "echo $?; echo after", 0);
+        assert_eq!(*output.lock().unwrap(), b"130\nafter\n");
+    }
+
+    #[test]
+    fn stopped_line_continues_with_status_148() {
+        let (mut shell, output, errors) = captured_shell();
+        // Synthetic handler result: no child process or job-control state is created.
+        shell.set_external_handler(Box::new(|_, _| {
+            Err(ShellError::Stopped {
+                pid: 123,
+                pgid: 123,
+            })
+        }));
+        continued(&mut shell, "host-command; echo unreachable", 148);
+        assert!(output.lock().unwrap().is_empty());
+        assert!(String::from_utf8_lossy(&errors.lock().unwrap()).contains("stopped"));
+        continued(&mut shell, "echo $?; echo after", 0);
+        assert_eq!(*output.lock().unwrap(), b"148\nafter\n");
+    }
+
+    #[test]
+    fn script_builtin_errors_keep_original_status_and_exit_trap() {
+        let dir = tempdir().unwrap();
+        for (source, status) in [
+            ("break foo", 1),
+            ("break 0", 1),
+            ("continue foo", 1),
+            ("continue 0", 1),
+            (".", 2),
+            (". ./missing-script", 127),
+        ] {
+            let (mut shell, output, errors) = captured_shell();
+            shell.set_cwd(dir.path().to_path_buf());
+            assert_eq!(
+                shell.run_script(&format!(
+                    "trap 'echo goodbye' EXIT; {source}; echo unreachable"
+                )),
+                status
+            );
+            assert_eq!(*output.lock().unwrap(), b"goodbye\n");
+            assert!(!errors.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn script_control_errors_keep_original_status_and_output() {
+        for (error, status) in [
+            (ShellError::Cancelled, 130),
+            (ShellError::TimedOut, 130),
+            (
+                ShellError::Stopped {
+                    pid: 123,
+                    pgid: 123,
+                },
+                148,
+            ),
+        ] {
+            let (mut shell, output, errors) = captured_shell();
+            let mut error = Some(error);
+            shell.set_external_handler(Box::new(move |_, _| Err(error.take().unwrap())));
+            assert_eq!(shell.run_script("host-command; echo unreachable"), status);
+            assert!(output.lock().unwrap().is_empty());
+            assert!(errors.lock().unwrap().is_empty());
+        }
+    }
+}

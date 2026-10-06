@@ -178,3 +178,74 @@ fn explicit_exit_defers_exit_trap_and_preserves_requested_status() {
     session.exp_string("goodbye\r\n").unwrap();
     exited(&mut session, 3);
 }
+
+fn recover_after_error(script: &str, diagnostic: &str) {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    session.send_line(script).unwrap();
+    session.exp_string(diagnostic).unwrap();
+    let rest = session.exp_string("$ ").unwrap();
+    assert!(!rest.contains("unreachable\r\n"));
+    session.send_line("echo $?").unwrap();
+    assert_eq!(session.exp_string("2\r\n").unwrap(), "");
+    session.exp_string("$ ").unwrap();
+    session.send_line("echo after").unwrap();
+    assert_eq!(session.exp_string("after\r\n").unwrap(), "");
+    session.exp_string("$ ").unwrap();
+    session.send_line("exit").unwrap();
+    exited(&mut session, 0);
+}
+
+#[test]
+fn expansion_error_returns_to_prompt() {
+    recover_after_error("echo ${nope?missing}; echo unreachable", "missing");
+}
+
+#[test]
+fn special_builtin_redirection_error_returns_to_prompt() {
+    // The session has a private cwd; this parent directory cannot exist.
+    recover_after_error(": > absent/dir/x; echo unreachable", "epsh: ");
+}
+
+#[test]
+fn invalid_break_operand_outside_loop_returns_to_prompt() {
+    recover_after_error("break foo; echo unreachable", "break: ");
+}
+
+#[test]
+fn invalid_break_operand_inside_loop_returns_to_prompt() {
+    recover_after_error("while :; do break foo; echo unreachable; done", "break: ");
+}
+
+#[test]
+fn invalid_continue_operand_inside_loop_returns_to_prompt() {
+    recover_after_error(
+        "while :; do continue foo; echo unreachable; done",
+        "continue: ",
+    );
+}
+
+#[test]
+fn dot_missing_file_returns_to_prompt() {
+    recover_after_error(". ./missing-script; echo unreachable", ".: ");
+}
+
+#[test]
+fn dot_missing_argument_returns_to_prompt() {
+    recover_after_error(".; echo unreachable", ".: ");
+}
+
+#[test]
+fn errexit_still_ends_session_on_false() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    session.send_line("set -e").unwrap();
+    session.exp_string("$ ").unwrap();
+    session.send_line("false; echo unreachable").unwrap();
+    let output = session.exp_eof().unwrap();
+    assert!(!output.contains("unreachable\r\n"));
+    assert!(matches!(
+        session.process().wait().unwrap(),
+        WaitStatus::Exited(_, 1)
+    ));
+}

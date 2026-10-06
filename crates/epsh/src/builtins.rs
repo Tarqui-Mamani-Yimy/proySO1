@@ -40,6 +40,11 @@ fn kill_with_rustix(pid: i32, signum: i32) -> Result<(), rustix::io::Errno> {
 }
 
 impl Shell {
+    fn special_builtin_error(&mut self, status: ExitStatus) -> ShellError {
+        self.special_builtin_failed = true;
+        ShellError::Exit(status)
+    }
+
     /// Try to run a builtin command. Returns None if not a builtin.
     pub(crate) fn try_builtin(
         &mut self,
@@ -80,7 +85,7 @@ impl Shell {
                     match arg.parse::<usize>() {
                         Ok(0) => {
                             self.err_msg(&format!("break: Illegal number: {arg}"));
-                            return Err(ShellError::Exit(ExitStatus::FAILURE));
+                            return Err(self.special_builtin_error(ExitStatus::FAILURE));
                         }
                         Ok(n) => {
                             if self.loop_depth == 0 {
@@ -91,7 +96,7 @@ impl Shell {
                         }
                         Err(_) => {
                             self.err_msg(&format!("break: Illegal number: {arg}"));
-                            return Err(ShellError::Exit(ExitStatus::FAILURE));
+                            return Err(self.special_builtin_error(ExitStatus::FAILURE));
                         }
                     }
                 } else if self.loop_depth == 0 {
@@ -105,7 +110,7 @@ impl Shell {
                     match arg.parse::<usize>() {
                         Ok(0) => {
                             self.err_msg(&format!("continue: Illegal number: {arg}"));
-                            return Err(ShellError::Exit(ExitStatus::FAILURE));
+                            return Err(self.special_builtin_error(ExitStatus::FAILURE));
                         }
                         Ok(n) => {
                             if self.loop_depth == 0 {
@@ -116,7 +121,7 @@ impl Shell {
                         }
                         Err(_) => {
                             self.err_msg(&format!("continue: Illegal number: {arg}"));
-                            return Err(ShellError::Exit(ExitStatus::FAILURE));
+                            return Err(self.special_builtin_error(ExitStatus::FAILURE));
                         }
                     }
                 } else if self.loop_depth == 0 {
@@ -407,7 +412,7 @@ impl Shell {
     fn builtin_dot(&mut self, args: &[String], _span: Span) -> crate::error::Result<ExitStatus> {
         if args.len() <= 1 {
             self.err_msg(".: filename argument required");
-            return Err(ShellError::Exit(ExitStatus::MISUSE));
+            return Err(self.special_builtin_error(ExitStatus::MISUSE));
         }
         let filename = &args[1];
         let filepath = self.resolve_path_bytes(&ShellBytes::from_str_lossless(filename));
@@ -415,7 +420,7 @@ impl Shell {
             Ok(bytes) => crate::encoding::bytes_to_str(&bytes),
             Err(e) => {
                 self.err_msg(&format!(".: {filename}: {e}"));
-                return Err(ShellError::Exit(ExitStatus::NOT_FOUND));
+                return Err(self.special_builtin_error(ExitStatus::NOT_FOUND));
             }
         };
         // Catch return — it exits the dot script, not the shell

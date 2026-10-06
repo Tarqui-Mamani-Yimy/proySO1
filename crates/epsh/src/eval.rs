@@ -3,10 +3,36 @@ use std::io::{Read, Write};
 use std::ops::ControlFlow;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ast::*;
+use crate::error::ExitStatus;
+
+/// Internal execution error that keeps special-builtin recovery attached to
+/// the failure as it travels through nested shell evaluation.
+#[derive(Debug)]
+pub(crate) enum EvalError {
+    Shell(ShellError),
+    RecoverableSpecialBuiltin(ExitStatus),
+}
+
+pub(crate) type EvalResult<T> = std::result::Result<T, EvalError>;
+
+impl From<ShellError> for EvalError {
+    fn from(error: ShellError) -> Self {
+        Self::Shell(error)
+    }
+}
+
+impl EvalError {
+    fn into_shell_error(self) -> ShellError {
+        match self {
+            Self::Shell(error) => error,
+            Self::RecoverableSpecialBuiltin(status) => ShellError::Exit(status),
+        }
+    }
+}
 
 const INTERACTIVE_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
@@ -168,7 +194,7 @@ fn is_command_substitution_builtin(name: &str) -> bool {
         "echo" | "printf" | "true" | "false" | ":" | "pwd" | "type" | "test" | "[" | "command"
     )
 }
-use crate::error::{ExitStatus, ShellError, Span};
+use crate::error::{ShellError, Span};
 use crate::expand;
 use crate::glob;
 use crate::parser::Parser;
@@ -339,14 +365,14 @@ pub struct Shell {
     /// True when the current eval context will exit after the command completes.
     /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
     pub(crate) ev_exit: bool,
-    /// Distinguishes builtin errors encoded as Exit from explicit exit/errexit.
-    pub(crate) special_builtin_failed: bool,
     /// Optional cancellation flag. When set to true, the shell aborts execution.
     cancel: Option<Arc<AtomicBool>>,
     /// Optional stdout sink. When set, builtin output goes here instead of fd 1.
     pub(crate) stdout_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     /// Optional stderr sink. When set, error output goes here instead of fd 2.
     pub(crate) stderr_sink: Option<Arc<Mutex<dyn Write + Send>>>,
+    pub(crate) stdout_redirect_depth: Arc<AtomicUsize>,
+    pub(crate) stderr_redirect_depth: Arc<AtomicUsize>,
     /// PIDs of currently running child processes (for cancellation cleanup).
     pub(crate) child_pids: Vec<i32>,
     /// Unconsumed asynchronous jobs owned by this shell execution environment.
@@ -695,10 +721,11 @@ impl ShellBuilder {
             tested: false,
             in_forked_child: false,
             ev_exit: false,
-            special_builtin_failed: false,
             cancel: self.cancel,
             stdout_sink: self.stdout_sink,
             stderr_sink: self.stderr_sink,
+            stdout_redirect_depth: Arc::new(AtomicUsize::new(0)),
+            stderr_redirect_depth: Arc::new(AtomicUsize::new(0)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
@@ -744,10 +771,11 @@ impl Shell {
             tested: false,
             in_forked_child: false,
             ev_exit: false,
-            special_builtin_failed: false,
             cancel: None,
             stdout_sink: None,
             stderr_sink: None,
+            stdout_redirect_depth: Arc::new(AtomicUsize::new(0)),
+            stderr_redirect_depth: Arc::new(AtomicUsize::new(0)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
@@ -877,7 +905,9 @@ impl Shell {
 
     /// Write bytes to stdout, honoring an installed output sink.
     pub fn write_stdout(&self, data: &[u8]) {
-        if let Some(ref sink) = self.stdout_sink {
+        if let Some(ref sink) = self.stdout_sink
+            && self.stdout_redirect_depth.load(Ordering::Relaxed) == 0
+        {
             if let Ok(mut w) = sink.lock() {
                 let _ = w.write_all(data);
             }
@@ -889,7 +919,9 @@ impl Shell {
 
     /// Write bytes to stderr, honoring an installed error sink.
     pub fn write_stderr(&self, data: &[u8]) {
-        if let Some(ref sink) = self.stderr_sink {
+        if let Some(ref sink) = self.stderr_sink
+            && self.stderr_redirect_depth.load(Ordering::Relaxed) == 0
+        {
             if let Ok(mut w) = sink.lock() {
                 let _ = w.write_all(data);
             }
@@ -1363,7 +1395,7 @@ impl Shell {
         &mut self,
         name: &str,
         args: &[String],
-    ) -> crate::error::Result<Option<ExitStatus>> {
+    ) -> EvalResult<Option<ExitStatus>> {
         let Some(handler) = self
             .embedder_builtins
             .get(name)
@@ -1375,7 +1407,7 @@ impl Shell {
             .iter()
             .map(|argument| ShellBytes::from_str_lossless(argument))
             .collect::<Vec<_>>();
-        handler(self, &argv).map(Some)
+        handler(self, &argv).map(Some).map_err(EvalError::from)
     }
 
     pub(crate) fn try_builtin_with_embedder(
@@ -1384,7 +1416,7 @@ impl Shell {
         args: &[String],
         assigns: &[Assignment],
         span: Span,
-    ) -> crate::error::Result<Option<ExitStatus>> {
+    ) -> EvalResult<Option<ExitStatus>> {
         if crate::builtins::is_special_builtin(name) {
             return self.try_builtin(name, args, assigns, &[], span);
         }
@@ -1539,25 +1571,22 @@ impl Shell {
         repl: bool,
     ) -> ControlFlow<ExitStatus, ExitStatus> {
         for cmd in &program.commands {
-            self.special_builtin_failed = false;
-            match self.eval_command(cmd) {
+            match self.eval_command_internal(cmd) {
                 Ok(status) => {
-                    self.special_builtin_failed = false;
                     self.exit_status = status;
                 }
-                Err(ShellError::Exit(n)) => {
-                    let special_builtin_failed = std::mem::take(&mut self.special_builtin_failed);
+                Err(EvalError::RecoverableSpecialBuiltin(n)) => {
                     if self.interrupted.take().is_some() {
                         self.exit_status = n;
                         return ControlFlow::Continue(n);
                     }
-                    if repl && special_builtin_failed {
+                    if repl {
                         return self.repl_shell_error();
                     }
                     self.run_exit_trap();
                     return ControlFlow::Break(n);
                 }
-                Err(e @ (ShellError::Cancelled | ShellError::TimedOut)) => {
+                Err(EvalError::Shell(e @ (ShellError::Cancelled | ShellError::TimedOut))) => {
                     self.kill_children();
                     if repl {
                         self.err_msg(&format!("epsh: {e}"));
@@ -1566,7 +1595,7 @@ impl Shell {
                     }
                     return ControlFlow::Break(ExitStatus::from_signal(2)); // 130 = SIGINT
                 }
-                Err(e @ ShellError::Stopped { .. }) => {
+                Err(EvalError::Shell(e @ ShellError::Stopped { .. })) => {
                     if repl {
                         self.err_msg(&format!("epsh: {e}"));
                         self.exit_status = ExitStatus::from(148);
@@ -1577,8 +1606,15 @@ impl Shell {
                     // Do not print anything — the embedder handles the UI.
                     return ControlFlow::Break(ExitStatus::from(148));
                 }
-                Err(e) => {
-                    self.special_builtin_failed = false;
+                Err(EvalError::Shell(ShellError::Exit(n))) => {
+                    if self.interrupted.take().is_some() {
+                        self.exit_status = n;
+                        return ControlFlow::Continue(n);
+                    }
+                    self.run_exit_trap();
+                    return ControlFlow::Break(n);
+                }
+                Err(EvalError::Shell(e)) => {
                     self.err_msg(&format!("epsh: {e}"));
                     if repl {
                         return self.repl_shell_error();
@@ -1616,7 +1652,7 @@ impl Shell {
                 let mut parser = Parser::new(&action);
                 if let Ok(program) = parser.parse() {
                     for cmd in &program.commands {
-                        let _ = self.eval_command(cmd);
+                        let _ = self.eval_command_internal(cmd);
                     }
                 }
             }
@@ -1630,7 +1666,7 @@ impl Shell {
             let mut parser = Parser::new(&action);
             if let Ok(program) = parser.parse() {
                 for cmd in &program.commands {
-                    let _ = self.eval_command(cmd);
+                    let _ = self.eval_command_internal(cmd);
                 }
             }
         }
@@ -1680,6 +1716,11 @@ impl Shell {
 
     /// Evaluate a command node, returning its exit status.
     pub fn eval_command(&mut self, cmd: &Command) -> crate::error::Result<ExitStatus> {
+        self.eval_command_internal(cmd)
+            .map_err(EvalError::into_shell_error)
+    }
+
+    pub(crate) fn eval_command_internal(&mut self, cmd: &Command) -> EvalResult<ExitStatus> {
         self.check_cancel()?;
         self.check_interactive_interrupt()?;
         if self.opts.noexec {
@@ -1704,13 +1745,13 @@ impl Shell {
                 | Command::Background { .. }
         );
         if self.opts.errexit && is_leaf && !self.tested && !is_bang && !status.success() {
-            return Err(ShellError::Exit(status));
+            return Err(EvalError::Shell(ShellError::Exit(status)));
         }
 
         Ok(status)
     }
 
-    fn eval_command_inner(&mut self, cmd: &Command) -> crate::error::Result<ExitStatus> {
+    fn eval_command_inner(&mut self, cmd: &Command) -> EvalResult<ExitStatus> {
         // ev_exit only applies to the final simple command in an exit context.
         // Clear it for compound commands so nested commands don't exec-direct.
         if !matches!(cmd, Command::Simple { .. }) {
@@ -1744,12 +1785,12 @@ impl Shell {
                 // Left side of && is always tested (errexit suppressed)
                 let saved = self.tested;
                 self.tested = true;
-                let status = self.eval_command(left)?;
+                let status = self.eval_command_internal(left)?;
                 self.tested = saved;
                 self.exit_status = status;
                 if status.success() {
                     // Right side inherits parent's tested flag (like dash)
-                    self.eval_command(right)
+                    self.eval_command_internal(right)
                 } else {
                     Ok(status)
                 }
@@ -1758,20 +1799,20 @@ impl Shell {
             Command::Or(left, right) => {
                 let saved = self.tested;
                 self.tested = true;
-                let status = self.eval_command(left)?;
+                let status = self.eval_command_internal(left)?;
                 self.tested = saved;
                 self.exit_status = status;
                 if !status.success() {
-                    self.eval_command(right)
+                    self.eval_command_internal(right)
                 } else {
                     Ok(status)
                 }
             }
 
             Command::Sequence(left, right) => {
-                let status = self.eval_command(left)?;
+                let status = self.eval_command_internal(left)?;
                 self.exit_status = status;
-                self.eval_command(right)
+                self.eval_command_internal(right)
             }
 
             Command::Subshell {
@@ -1784,7 +1825,7 @@ impl Shell {
                     // execute directly without double-forking. Mirrors dash's
                     // EV_EXIT optimization. Prevents pipe fd leaks.
                     let saved = self.setup_redirections(redirs)?;
-                    let result = self.eval_command(body);
+                    let result = self.eval_command_internal(body);
                     self.restore_redirections(saved);
                     result
                 } else {
@@ -1798,7 +1839,7 @@ impl Shell {
                 span: _,
             } => {
                 let saved = self.setup_redirections(redirs)?;
-                let result = self.eval_command(body);
+                let result = self.eval_command_internal(body);
                 self.restore_redirections(saved);
                 result
             }
@@ -1811,13 +1852,13 @@ impl Shell {
             } => {
                 let saved = self.tested;
                 self.tested = true;
-                let cond_status = self.eval_command(cond)?;
+                let cond_status = self.eval_command_internal(cond)?;
                 self.tested = saved;
                 self.exit_status = cond_status;
                 if cond_status.success() {
-                    self.eval_command(then_part)
+                    self.eval_command_internal(then_part)
                 } else if let Some(else_part) = else_part {
-                    self.eval_command(else_part)
+                    self.eval_command_internal(else_part)
                 } else {
                     Ok(ExitStatus::SUCCESS)
                 }
@@ -1830,23 +1871,23 @@ impl Shell {
                     self.check_cancel()?;
                     let saved = self.tested;
                     self.tested = true;
-                    let cond_status = self.eval_command(cond)?;
+                    let cond_status = self.eval_command_internal(cond)?;
                     self.tested = saved;
                     self.exit_status = cond_status;
                     if !cond_status.success() {
                         break;
                     }
-                    match self.eval_command(body) {
+                    match self.eval_command_internal(body) {
                         Ok(s) => last_status = s,
-                        Err(ShellError::Break(1)) => break,
-                        Err(ShellError::Break(n)) if n > 1 => {
+                        Err(EvalError::Shell(ShellError::Break(1))) => break,
+                        Err(EvalError::Shell(ShellError::Break(n))) if n > 1 => {
                             self.loop_depth -= 1;
-                            return Err(ShellError::Break(n - 1));
+                            return Err(EvalError::Shell(ShellError::Break(n - 1)));
                         }
-                        Err(ShellError::Continue(1)) => continue,
-                        Err(ShellError::Continue(n)) if n > 1 => {
+                        Err(EvalError::Shell(ShellError::Continue(1))) => continue,
+                        Err(EvalError::Shell(ShellError::Continue(n))) if n > 1 => {
                             self.loop_depth -= 1;
-                            return Err(ShellError::Continue(n - 1));
+                            return Err(EvalError::Shell(ShellError::Continue(n - 1)));
                         }
                         Err(e) => {
                             self.loop_depth -= 1;
@@ -1865,23 +1906,23 @@ impl Shell {
                     self.check_cancel()?;
                     let saved = self.tested;
                     self.tested = true;
-                    let cond_status = self.eval_command(cond)?;
+                    let cond_status = self.eval_command_internal(cond)?;
                     self.tested = saved;
                     self.exit_status = cond_status;
                     if cond_status.success() {
                         break;
                     }
-                    match self.eval_command(body) {
+                    match self.eval_command_internal(body) {
                         Ok(s) => last_status = s,
-                        Err(ShellError::Break(1)) => break,
-                        Err(ShellError::Break(n)) if n > 1 => {
+                        Err(EvalError::Shell(ShellError::Break(1))) => break,
+                        Err(EvalError::Shell(ShellError::Break(n))) if n > 1 => {
                             self.loop_depth -= 1;
-                            return Err(ShellError::Break(n - 1));
+                            return Err(EvalError::Shell(ShellError::Break(n - 1)));
                         }
-                        Err(ShellError::Continue(1)) => continue,
-                        Err(ShellError::Continue(n)) if n > 1 => {
+                        Err(EvalError::Shell(ShellError::Continue(1))) => continue,
+                        Err(EvalError::Shell(ShellError::Continue(n))) if n > 1 => {
                             self.loop_depth -= 1;
-                            return Err(ShellError::Continue(n - 1));
+                            return Err(EvalError::Shell(ShellError::Continue(n - 1)));
                         }
                         Err(e) => {
                             self.loop_depth -= 1;
@@ -1915,17 +1956,17 @@ impl Shell {
                         self.err_msg(&e);
                         return Ok(ExitStatus::FAILURE);
                     }
-                    match self.eval_command(body) {
+                    match self.eval_command_internal(body) {
                         Ok(s) => last_status = s,
-                        Err(ShellError::Break(1)) => break,
-                        Err(ShellError::Break(n)) if n > 1 => {
+                        Err(EvalError::Shell(ShellError::Break(1))) => break,
+                        Err(EvalError::Shell(ShellError::Break(n))) if n > 1 => {
                             self.loop_depth -= 1;
-                            return Err(ShellError::Break(n - 1));
+                            return Err(EvalError::Shell(ShellError::Break(n - 1)));
                         }
-                        Err(ShellError::Continue(1)) => continue,
-                        Err(ShellError::Continue(n)) if n > 1 => {
+                        Err(EvalError::Shell(ShellError::Continue(1))) => continue,
+                        Err(EvalError::Shell(ShellError::Continue(n))) if n > 1 => {
                             self.loop_depth -= 1;
-                            return Err(ShellError::Continue(n - 1));
+                            return Err(EvalError::Shell(ShellError::Continue(n - 1)));
                         }
                         Err(e) => {
                             self.loop_depth -= 1;
@@ -1945,7 +1986,7 @@ impl Shell {
                         let pat = self.expand_pattern(pattern)?;
                         if glob::fnmatch(&pat, &expanded) {
                             if let Some(ref body) = arm.body {
-                                return self.eval_command(body);
+                                return self.eval_command_internal(body);
                             } else {
                                 return Ok(ExitStatus::SUCCESS);
                             }
@@ -1963,7 +2004,7 @@ impl Shell {
             Command::Not(cmd) => {
                 let saved = self.tested;
                 self.tested = true;
-                let status = self.eval_command(cmd)?;
+                let status = self.eval_command_internal(cmd)?;
                 self.tested = saved;
                 Ok(status.inverted())
             }
@@ -1982,7 +2023,7 @@ impl Shell {
         args: &[Word],
         redirs: &[Redir],
         span: Span,
-    ) -> crate::error::Result<ExitStatus> {
+    ) -> EvalResult<ExitStatus> {
         // Expand arguments
         let mut expanded_args: Vec<String> = Vec::new();
         for arg in args {
@@ -2047,22 +2088,17 @@ impl Shell {
 
         // Setup redirections before executing (applies to builtins, functions, externals)
         let saved_fds = self.setup_redirections(redirs)?;
+        let mut redirection_guard = crate::redirect::RedirectionGuard::new(
+            saved_fds,
+            self.stdout_redirect_depth.clone(),
+            self.stderr_redirect_depth.clone(),
+        );
 
         // Every outcome, including builtin errors, falls through to the
         // descriptor restoration below.
-        let result = (|| {
-            if crate::builtins::is_special_builtin(cmd_name) {
-                return match self.try_builtin_with_embedder(
-                    cmd_name,
-                    &expanded_args,
-                    assigns,
-                    span,
-                )? {
-                    Some(status) => Ok(status),
-                    None => Err(ShellError::CommandNotFound(cmd_name.clone())),
-                };
-            }
-            if let Some(func_body) = self.functions.get(cmd_name).cloned() {
+        let result = (|| -> EvalResult<ExitStatus> {
+            let is_special = crate::builtins::is_special_builtin(cmd_name);
+            if !is_special && let Some(func_body) = self.functions.get(cmd_name).cloned() {
                 self.ev_exit = false; // function body may have multiple commands
                 return self.eval_function(&func_body, &expanded_args, assigns, &[], span);
             }
@@ -2073,21 +2109,18 @@ impl Shell {
             }
             if self.external_handler.is_some() {
                 self.call_external_handler(&expanded_args, assigns)
+                    .map_err(EvalError::from)
             } else {
                 self.eval_external(&expanded_args, assigns, &[], span)
+                    .map_err(EvalError::from)
             }
         })();
 
         if is_exec {
-            // exec redirections are permanent — close saved copies instead of restoring
-            for s in saved_fds {
-                if let Some(copy) = s.saved_copy {
-                    // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec.
-                    sys::close(copy);
-                }
-            }
+            // exec redirections are permanent — close saved copies instead of restoring.
+            redirection_guard.persist();
         } else {
-            self.restore_redirections(saved_fds);
+            drop(redirection_guard);
         }
         result
     }
@@ -2139,7 +2172,7 @@ impl Shell {
         assigns: &[Assignment],
         redirs: &[Redir],
         _span: Span,
-    ) -> crate::error::Result<ExitStatus> {
+    ) -> EvalResult<ExitStatus> {
         // Save and set positional parameters (take avoids clone)
         let saved_positional = std::mem::replace(
             &mut self.vars.positional,
@@ -2160,9 +2193,9 @@ impl Shell {
         let saved_fds = self.setup_redirections(redirs)?;
 
         // Execute function body
-        let result = match self.eval_command(body) {
+        let result = match self.eval_command_internal(body) {
             Ok(s) => Ok(s),
-            Err(ShellError::Return(n)) => Ok(n),
+            Err(EvalError::Shell(ShellError::Return(n))) => Ok(n),
             Err(e) => Err(e),
         };
 
@@ -2377,9 +2410,9 @@ impl Shell {
     }
 
     /// Execute a pipeline.
-    fn eval_pipeline(&mut self, commands: &[Command]) -> crate::error::Result<ExitStatus> {
+    fn eval_pipeline(&mut self, commands: &[Command]) -> EvalResult<ExitStatus> {
         if commands.len() == 1 {
-            return self.eval_command(&commands[0]);
+            return self.eval_command_internal(&commands[0]);
         }
 
         // Create pipes between stages
@@ -2388,7 +2421,9 @@ impl Shell {
             let mut fds = [0i32; 2];
             // SAFETY: fds is a valid 2-element array for pipe() to write into.
             if sys::pipe(fds.as_mut_ptr()) != 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+                return Err(EvalError::Shell(ShellError::Io(
+                    std::io::Error::last_os_error(),
+                )));
             }
             pipes.push((fds[0], fds[1]));
         }
@@ -2403,7 +2438,7 @@ impl Shell {
                         sys::close(r);
                         sys::close(w);
                     }
-                    return Err(ShellError::Io(error.into()));
+                    return Err(EvalError::Shell(ShellError::Io(error.into())));
                 }
             }
         } else {
@@ -2426,7 +2461,9 @@ impl Shell {
                     }
                     drop(gate); // Unblock already-forked stages before reaping.
                     self.kill_children();
-                    return Err(ShellError::Io(std::io::Error::last_os_error()));
+                    return Err(EvalError::Shell(ShellError::Io(
+                        std::io::Error::last_os_error(),
+                    )));
                 }
 
                 if pid == 0 {
@@ -2472,9 +2509,10 @@ impl Shell {
                     // Mark this as exit context — eval_external can exec
                     // directly instead of fork+exec (dash's EV_EXIT).
                     self.ev_exit = true;
-                    let status = match self.eval_command(cmd) {
+                    let status = match self.eval_command_internal(cmd) {
                         Ok(s) => s,
-                        Err(ShellError::Exit(n)) => n,
+                        Err(EvalError::Shell(ShellError::Exit(n)))
+                        | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
                         Err(_) => ExitStatus::FAILURE,
                     };
                     sys::exit_child(status);
@@ -2515,7 +2553,7 @@ impl Shell {
                 sys::waitpid(pid, &mut status, 0);
                 self.child_pids.retain(|&p| p != pid);
             }
-            return Err(ShellError::Io(error));
+            return Err(EvalError::Shell(ShellError::Io(error)));
         }
         drop(gate); // All stages may now run, including terminal readers.
 
@@ -2534,17 +2572,17 @@ impl Shell {
                 }
                 Err(ShellError::Stopped { pid, pgid }) if self.opts.interactive => {
                     self.record_stopped_job(pgid, &children);
-                    return Err(ShellError::Stopped { pid, pgid });
+                    return Err(EvalError::Shell(ShellError::Stopped { pid, pgid }));
                 }
                 Err(e @ (ShellError::Cancelled | ShellError::TimedOut)) => {
                     self.kill_children();
-                    return Err(e);
+                    return Err(EvalError::Shell(e));
                 }
                 Err(e @ ShellError::Exit(_)) if self.interrupted.is_some() => {
                     self.terminate_job(pgid, &children);
-                    return Err(e);
+                    return Err(EvalError::Shell(e));
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(EvalError::Shell(e)),
             }
         }
 
@@ -2556,18 +2594,16 @@ impl Shell {
     }
 
     /// Execute a command in a subshell (fork).
-    fn eval_in_subshell(
-        &mut self,
-        body: &Command,
-        redirs: &[Redir],
-    ) -> crate::error::Result<ExitStatus> {
+    fn eval_in_subshell(&mut self, body: &Command, redirs: &[Redir]) -> EvalResult<ExitStatus> {
         // SAFETY: Standard POSIX fork pattern. Child isolates into its own
         // process group, executes the body, then _exit()s. Parent waits.
         let terminal = ForegroundTerminal::new(self.opts.interactive && !self.in_forked_child);
         unsafe {
             let pid = sys::fork();
             if pid < 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+                return Err(EvalError::Shell(ShellError::Io(
+                    std::io::Error::last_os_error(),
+                )));
             }
 
             if pid == 0 {
@@ -2591,9 +2627,10 @@ impl Shell {
                     Ok(s) => s,
                     Err(_) => sys::exit_child(ExitStatus::FAILURE),
                 };
-                let status = match self.eval_command(body) {
+                let status = match self.eval_command_internal(body) {
                     Ok(s) => s,
-                    Err(ShellError::Exit(n)) => n,
+                    Err(EvalError::Shell(ShellError::Exit(n)))
+                    | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
                     Err(_) => ExitStatus::FAILURE,
                 };
                 // Run subshell's own EXIT trap if it set one
@@ -2603,22 +2640,20 @@ impl Shell {
 
             // Parent
             self.child_pids.push(pid);
-            self.wait_child(pid)
+            Ok(self.wait_child(pid)?)
         }
     }
 
     /// Execute a command in the background.
-    fn eval_background(
-        &mut self,
-        cmd: &Command,
-        redirs: &[Redir],
-    ) -> crate::error::Result<ExitStatus> {
+    fn eval_background(&mut self, cmd: &Command, redirs: &[Redir]) -> EvalResult<ExitStatus> {
         // SAFETY: Standard POSIX fork pattern. Child isolates into its own
         // process group and runs the command. Parent does not wait (background).
         unsafe {
             let pid = sys::fork();
             if pid < 0 {
-                return Err(ShellError::Io(std::io::Error::last_os_error()));
+                return Err(EvalError::Shell(ShellError::Io(
+                    std::io::Error::last_os_error(),
+                )));
             }
 
             if pid == 0 {
@@ -2632,9 +2667,10 @@ impl Shell {
                     Ok(s) => s,
                     Err(_) => sys::exit_child(ExitStatus::FAILURE),
                 };
-                let status = match self.eval_command(cmd) {
+                let status = match self.eval_command_internal(cmd) {
                     Ok(s) => s,
-                    Err(ShellError::Exit(n)) => n,
+                    Err(EvalError::Shell(ShellError::Exit(n)))
+                    | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
                     Err(_) => ExitStatus::FAILURE,
                 };
                 sys::exit_child(status);
@@ -2767,9 +2803,10 @@ impl Shell {
                 // parent-provided sink copied across fork.
                 self.stdout_sink = None;
 
-                let status = match self.eval_command(cmd) {
+                let status = match self.eval_command_internal(cmd) {
                     Ok(s) => s,
-                    Err(ShellError::Exit(n)) => n,
+                    Err(EvalError::Shell(ShellError::Exit(n)))
+                    | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
                     Err(_) => ExitStatus::FAILURE,
                 };
                 self.run_exit_trap();
@@ -2852,7 +2889,6 @@ mod tests {
             shell.eval_repl_line("break foo"),
             ControlFlow::Continue(_)
         ));
-        assert!(!shell.special_builtin_failed);
         assert!(matches!(
             shell.eval_repl_line("exit 7"),
             ControlFlow::Break(status) if status.code() == 7
@@ -2869,6 +2905,70 @@ mod tests {
     }
 
     #[test]
+    fn repl_command_exit_after_caught_special_builtin_failure_exits_shell() {
+        let mut shell = Shell::new();
+        assert!(matches!(
+            shell.eval_repl_line("{ command break foo; command exit 3; }"),
+            ControlFlow::Break(status) if status.code() == 3
+        ));
+    }
+
+    #[test]
+    fn repl_command_eval_exit_after_caught_special_builtin_failure_exits_shell() {
+        let mut shell = Shell::new();
+        assert!(matches!(
+            shell.eval_repl_line("{ command break foo; command eval 'exit 3'; }"),
+            ControlFlow::Break(status) if status.code() == 3
+        ));
+    }
+
+    #[test]
+    fn caught_special_builtin_error_does_not_taint_later_command_dispatch() {
+        let mut shell = Shell::new();
+        let first = Parser::new("command break foo").parse().unwrap();
+        assert_eq!(
+            shell.eval_command(&first.commands[0]).unwrap(),
+            ExitStatus::MISUSE
+        );
+
+        let second = Parser::new("command eval 'exit 3'").parse().unwrap();
+        assert!(matches!(
+            shell.eval_command(&second.commands[0]),
+            Err(ShellError::Exit(status)) if status.code() == 3
+        ));
+    }
+
+    #[test]
+    fn command_dot_missing_file_recovers_and_continues() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr)
+            .build();
+        let missing = std::env::temp_dir().join(format!(
+            "epsh-t0c-missing-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let command = format!("command . {}; echo after", missing.display());
+
+        assert!(matches!(
+            shell.eval_repl_line(&command),
+            ControlFlow::Continue(status) if status.code() == 0
+        ));
+        assert_eq!(&*stdout.lock().unwrap(), b"after\n");
+
+        let script_stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut script_shell = Shell::builder()
+            .stdout_sink(script_stdout.clone())
+            .stderr_sink(Arc::new(Mutex::new(Vec::<u8>::new())))
+            .build();
+        assert_eq!(script_shell.run_script(&command), 0);
+        assert_eq!(&*script_stdout.lock().unwrap(), b"after\n");
+    }
+
+    #[test]
     fn repl_clears_caught_special_builtin_failure_after_compound_succeeds() {
         let mut shell = Shell::new();
         assert!(matches!(
@@ -2876,7 +2976,6 @@ mod tests {
             ControlFlow::Continue(_)
         ));
         assert_eq!(shell.get_var("after"), Some("yes"));
-        assert!(!shell.special_builtin_failed);
     }
 
     #[test]

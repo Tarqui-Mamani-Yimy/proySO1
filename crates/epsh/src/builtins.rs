@@ -40,9 +40,8 @@ fn kill_with_rustix(pid: i32, signum: i32) -> Result<(), rustix::io::Errno> {
 }
 
 impl Shell {
-    fn special_builtin_error(&mut self, status: ExitStatus) -> ShellError {
-        self.special_builtin_failed = true;
-        ShellError::Exit(status)
+    fn special_builtin_error(&mut self, status: ExitStatus) -> crate::eval::EvalError {
+        crate::eval::EvalError::RecoverableSpecialBuiltin(status)
     }
 
     /// Try to run a builtin command. Returns None if not a builtin.
@@ -53,7 +52,7 @@ impl Shell {
         _assigns: &[Assignment],
         redirs: &[Redir],
         span: Span,
-    ) -> crate::error::Result<Option<ExitStatus>> {
+    ) -> crate::eval::EvalResult<Option<ExitStatus>> {
         let status = match name {
             ":" | "true" => Some(ExitStatus::SUCCESS),
             "false" => Some(ExitStatus::FAILURE),
@@ -64,14 +63,14 @@ impl Shell {
                 self.write_out(&format!("{cwd}\n"));
                 Some(ExitStatus::SUCCESS)
             }
+            "times" => Some(self.builtin_times()),
             "exit" => {
-                self.special_builtin_failed = false;
                 let code = args
                     .get(1)
                     .and_then(|s| s.parse::<i32>().ok())
                     .map(ExitStatus::from)
                     .unwrap_or(self.exit_status);
-                return Err(ShellError::Exit(code));
+                return Err(crate::eval::EvalError::Shell(ShellError::Exit(code)));
             }
             "return" => {
                 let code = args
@@ -79,7 +78,7 @@ impl Shell {
                     .and_then(|s| s.parse::<i32>().ok())
                     .map(ExitStatus::from)
                     .unwrap_or(self.exit_status);
-                return Err(ShellError::Return(code));
+                return Err(crate::eval::EvalError::Shell(ShellError::Return(code)));
             }
             "break" => {
                 if let Some(arg) = args.get(1) {
@@ -92,7 +91,9 @@ impl Shell {
                             if self.loop_depth == 0 {
                                 Some(ExitStatus::SUCCESS)
                             } else {
-                                return Err(ShellError::Break(n.min(self.loop_depth)));
+                                return Err(crate::eval::EvalError::Shell(ShellError::Break(
+                                    n.min(self.loop_depth),
+                                )));
                             }
                         }
                         Err(_) => {
@@ -103,7 +104,7 @@ impl Shell {
                 } else if self.loop_depth == 0 {
                     Some(ExitStatus::SUCCESS)
                 } else {
-                    return Err(ShellError::Break(1));
+                    return Err(crate::eval::EvalError::Shell(ShellError::Break(1)));
                 }
             }
             "continue" => {
@@ -117,7 +118,9 @@ impl Shell {
                             if self.loop_depth == 0 {
                                 Some(ExitStatus::SUCCESS)
                             } else {
-                                return Err(ShellError::Continue(n.min(self.loop_depth)));
+                                return Err(crate::eval::EvalError::Shell(ShellError::Continue(
+                                    n.min(self.loop_depth),
+                                )));
                             }
                         }
                         Err(_) => {
@@ -128,7 +131,7 @@ impl Shell {
                 } else if self.loop_depth == 0 {
                     Some(ExitStatus::SUCCESS)
                 } else {
-                    return Err(ShellError::Continue(1));
+                    return Err(crate::eval::EvalError::Shell(ShellError::Continue(1)));
                 }
             }
             "export" => Some(self.builtin_export(args)),
@@ -221,6 +224,28 @@ impl Shell {
                 ExitStatus::FAILURE
             }
         }
+    }
+
+    fn builtin_times(&self) -> ExitStatus {
+        // POSIX exposes the shell's and its waited-for children's CPU usage.
+        // `times(2)` reports clock ticks; use the platform's configured rate.
+        let rate = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let ticks_per_second = if rate > 0 { rate as f64 } else { 100.0 };
+        let mut usage: libc::tms = unsafe { std::mem::zeroed() };
+        unsafe { libc::times(&mut usage) };
+        let format = |ticks: libc::clock_t| {
+            let seconds = ticks as f64 / ticks_per_second;
+            let minutes = (seconds / 60.0).floor();
+            format!("{minutes:.0}m{:.6}s", seconds - minutes * 60.0)
+        };
+        self.write_out(&format!(
+            "{} {}\n{} {}\n",
+            format(usage.tms_utime),
+            format(usage.tms_stime),
+            format(usage.tms_cutime),
+            format(usage.tms_cstime)
+        ));
+        ExitStatus::SUCCESS
     }
 
     fn builtin_export(&mut self, args: &[String]) -> ExitStatus {
@@ -383,7 +408,7 @@ impl Shell {
 
     /// Parse and execute a script inline (propagates control flow).
     /// Used by eval and dot builtins.
-    fn run_inline(&mut self, source: &str) -> crate::error::Result<ExitStatus> {
+    fn run_inline(&mut self, source: &str) -> crate::eval::EvalResult<ExitStatus> {
         let mut parser = Parser::new(source);
         let program = match parser.parse() {
             Ok(p) => p,
@@ -397,20 +422,20 @@ impl Shell {
         }
         let mut status = ExitStatus::SUCCESS;
         for cmd in &program.commands {
-            status = self.eval_command(cmd)?;
+            status = self.eval_command_internal(cmd)?;
             self.exit_status = status;
         }
         Ok(status)
     }
 
-    fn builtin_eval(&mut self, args: &[String]) -> crate::error::Result<ExitStatus> {
+    fn builtin_eval(&mut self, args: &[String]) -> crate::eval::EvalResult<ExitStatus> {
         if args.len() <= 1 {
             return Ok(ExitStatus::SUCCESS);
         }
         self.run_inline(&args[1..].join(" "))
     }
 
-    fn builtin_dot(&mut self, args: &[String], _span: Span) -> crate::error::Result<ExitStatus> {
+    fn builtin_dot(&mut self, args: &[String], _span: Span) -> crate::eval::EvalResult<ExitStatus> {
         if args.len() <= 1 {
             self.err_msg(".: filename argument required");
             return Err(self.special_builtin_error(ExitStatus::MISUSE));
@@ -426,7 +451,7 @@ impl Shell {
         };
         // Catch return — it exits the dot script, not the shell
         match self.run_inline(&content) {
-            Err(ShellError::Return(n)) => Ok(n),
+            Err(crate::eval::EvalError::Shell(ShellError::Return(n))) => Ok(n),
             other => other,
         }
     }
@@ -590,7 +615,7 @@ impl Shell {
         args: &[String],
         _redirs: &[Redir],
         _span: Span,
-    ) -> crate::error::Result<ExitStatus> {
+    ) -> crate::eval::EvalResult<ExitStatus> {
         // Redirections are applied permanently by eval_simple (is_exec flag).
         if args.len() <= 1 {
             return Ok(ExitStatus::SUCCESS);
@@ -605,7 +630,11 @@ impl Shell {
         Ok(ExitStatus::NOT_EXECUTABLE)
     }
 
-    fn builtin_command(&mut self, args: &[String], span: Span) -> crate::error::Result<ExitStatus> {
+    fn builtin_command(
+        &mut self,
+        args: &[String],
+        span: Span,
+    ) -> crate::eval::EvalResult<ExitStatus> {
         if args.len() <= 1 {
             return Ok(ExitStatus::SUCCESS);
         }
@@ -676,9 +705,13 @@ impl Shell {
             Ok(Some(status)) => Ok(status),
             // `command` turns a special-builtin usage failure into an ordinary
             // command status so the rest of a compound list can run.
-            Err(ShellError::Exit(_)) if self.special_builtin_failed => Ok(ExitStatus::MISUSE),
-            Ok(None) if self.has_external_handler() => self.call_external_handler(&new_args, &[]),
-            Ok(None) => self.eval_external(&new_args, &[], &[], span),
+            Err(crate::eval::EvalError::RecoverableSpecialBuiltin(_)) => Ok(ExitStatus::MISUSE),
+            Ok(None) if self.has_external_handler() => self
+                .call_external_handler(&new_args, &[])
+                .map_err(crate::eval::EvalError::from),
+            Ok(None) => self
+                .eval_external(&new_args, &[], &[], span)
+                .map_err(crate::eval::EvalError::from),
             Err(error) => Err(error),
         }
     }
@@ -1217,7 +1250,7 @@ impl Shell {
 pub const BUILTIN_NAMES: &[&str] = &[
     ":", "true", "false", "echo", "printf", "cd", "pwd", "exit", "return", "break", "continue",
     "export", "readonly", "unset", "set", "shift", "eval", ".", "source", "test", "[", "read",
-    "local", "exec", "command", "type", "wait", "trap", "kill", "umask", "getopts",
+    "local", "exec", "command", "type", "wait", "trap", "kill", "umask", "getopts", "times",
 ];
 
 const POSIX_SPECIAL_BUILTIN_NAMES: &[&str] = &[

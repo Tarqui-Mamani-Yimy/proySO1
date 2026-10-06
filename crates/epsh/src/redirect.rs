@@ -1,5 +1,7 @@
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -14,6 +16,99 @@ pub(crate) struct SavedFd {
     pub(crate) saved_copy: Option<RawFd>,
     /// The target was not open before the redirection, so restoration closes it.
     pub(crate) was_closed: bool,
+}
+
+/// Restores command redirections on every exit path, including unwinding from
+/// an embedder callback.
+pub(crate) struct RedirectionGuard {
+    saved: Option<Vec<SavedFd>>,
+    stdout_depth: Arc<AtomicUsize>,
+    stderr_depth: Arc<AtomicUsize>,
+}
+
+impl RedirectionGuard {
+    pub(crate) fn new(
+        saved: Vec<SavedFd>,
+        stdout_depth: Arc<AtomicUsize>,
+        stderr_depth: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            saved: Some(saved),
+            stdout_depth,
+            stderr_depth,
+        }
+    }
+
+    /// Keep the redirections installed, closing only the saved descriptor copies.
+    pub(crate) fn persist(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            for entry in saved {
+                if let Some(copy) = entry.saved_copy {
+                    sys::close(copy);
+                }
+            }
+        }
+    }
+
+    fn restore(&mut self) {
+        let Some(saved) = self.saved.take() else {
+            return;
+        };
+        for entry in &saved {
+            decrement_redirect_depth(entry.target_fd, &self.stdout_depth, &self.stderr_depth);
+        }
+        restore_saved_fds(saved);
+    }
+}
+
+impl Drop for RedirectionGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn increment_redirect_depth(fd: RawFd, stdout_depth: &AtomicUsize, stderr_depth: &AtomicUsize) {
+    match fd {
+        1 => {
+            stdout_depth.fetch_add(1, Ordering::Relaxed);
+        }
+        2 => {
+            stderr_depth.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+fn decrement_redirect_depth(fd: RawFd, stdout_depth: &AtomicUsize, stderr_depth: &AtomicUsize) {
+    match fd {
+        1 => {
+            stdout_depth.fetch_sub(1, Ordering::Relaxed);
+        }
+        2 => {
+            stderr_depth.fetch_sub(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+fn restore_saved_fds(saved: Vec<SavedFd>) {
+    for s in saved.into_iter().rev() {
+        if let Some(copy) = s.saved_copy {
+            // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec; target_fd is the original fd being restored.
+            sys::dup2(copy, s.target_fd);
+            sys::close(copy);
+        } else if s.was_closed
+            // SAFETY: only queried; a redirection that failed before its
+            // dup2 left the descriptor closed, and closing it again would
+            // report EBADF.
+            && rustix::io::fcntl_getfd(unsafe {
+                std::os::fd::BorrowedFd::borrow_raw(s.target_fd)
+            })
+            .is_ok()
+        {
+            sys::close(s.target_fd);
+        }
+    }
 }
 
 /// Install an opened descriptor without closing it when open reused the target.
@@ -102,6 +197,11 @@ impl Shell {
                     saved_copy,
                     was_closed,
                 });
+                increment_redirect_depth(
+                    target_fd,
+                    &self.stdout_redirect_depth,
+                    &self.stderr_redirect_depth,
+                );
             }
 
             match &redir.kind {
@@ -203,22 +303,13 @@ impl Shell {
 
     /// Restore file descriptors after redirections.
     pub(crate) fn restore_redirections(&self, saved: Vec<SavedFd>) {
-        for s in saved.into_iter().rev() {
-            if let Some(copy) = s.saved_copy {
-                // SAFETY: copy is a valid fd from fcntl_dupfd_cloexec; target_fd is the original fd being restored.
-                sys::dup2(copy, s.target_fd);
-                sys::close(copy);
-            } else if s.was_closed
-                // SAFETY: only queried; a redirection that failed before its
-                // dup2 left the descriptor closed, and closing it again would
-                // report EBADF.
-                && rustix::io::fcntl_getfd(unsafe {
-                    std::os::fd::BorrowedFd::borrow_raw(s.target_fd)
-                })
-                .is_ok()
-            {
-                sys::close(s.target_fd);
-            }
+        for entry in &saved {
+            decrement_redirect_depth(
+                entry.target_fd,
+                &self.stdout_redirect_depth,
+                &self.stderr_redirect_depth,
+            );
         }
+        restore_saved_fds(saved);
     }
 }

@@ -53,7 +53,7 @@ crates/epsh/src/
   lexer.rs        Single-pass lexer with unified word-part builder
   parser.rs       Recursive-descent parser, heredoc body reading
   eval.rs         Shell struct, ShellBuilder, command evaluation, pipelines, command substitution
-  builtins.rs     30 builtins: echo, cd, test, read, set, trap, printf, kill, ...
+  builtins.rs     31 builtins: echo, cd, test, read, set, trap, printf, kill, ...
   expand.rs       Word expansion: tilde, parameter, arithmetic, field splitting, pathname expansion, patterns
   arith.rs        $((…)) evaluator with short-circuit (noeval), int var cache
   var.rs          Variable storage with scope stack, integer cache
@@ -268,14 +268,17 @@ Applications can register shell-local builtins on a `Shell` instance with
 and byte-preserving `argv` (`argv[0]` is the command name), and returns the
 normal `Result<ExitStatus, ShellError>`. Use `Shell::write_stdout` and
 `Shell::write_stderr` for output so configured stdout/stderr sinks are honored;
-redirections are installed before the callback runs. Registered names are
+redirections are installed before the callback runs. An active redirection on
+fd 1 or 2 takes precedence over its configured sink; callback writes then use
+the redirected descriptor. Registered names are
 reported by `command -v`, `command -V`, and `type`. Query registrations with
 `Shell::is_embedder_builtin_registered`; `builtins::is_builtin` and
 `BUILTIN_NAMES` continue to describe epsh's builtins only.
 
 Lookup follows POSIX command precedence: special builtins first, then shell
-functions, then regular epsh builtins, embedder builtins, and PATH. A function
-can therefore take precedence over an embedder builtin. By default, registering
+functions, then regular epsh builtins, embedder builtins, and PATH. Functions
+take precedence over regular epsh builtins as well as embedder builtins; POSIX
+special builtins retain precedence over functions. By default, registering
 an epsh builtin name fails. Applications may explicitly opt into shadowing a
 regular epsh builtin with `register_embedder_builtin_shadowing_regular`; POSIX
 special builtins are never shadowable. The existing `ExternalHandler` remains a

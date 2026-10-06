@@ -663,6 +663,78 @@ mod embedder_builtins {
     }
 
     #[test]
+    fn redirected_embedder_stdout_bypasses_configured_sink() {
+        if isolated_test("embedder_builtins::redirected_embedder_stdout_bypasses_configured_sink") {
+            return;
+        }
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let temp = tempdir().unwrap();
+        let mut shell = Shell::builder()
+            .cwd(temp.path().to_path_buf())
+            .stdout_sink(stdout.clone())
+            .build();
+        shell
+            .register_embedder_builtin("hello", |shell, _argv| {
+                shell.write_stdout(b"redirected\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+
+        assert_eq!(
+            shell.run_program(&parse("hello > output.txt")),
+            ExitStatus::SUCCESS
+        );
+        assert!(stdout.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(temp.path().join("output.txt")).unwrap(),
+            b"redirected\n"
+        );
+    }
+
+    #[test]
+    fn embedder_panic_restores_redirected_stdout() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        if isolated_test("embedder_builtins::embedder_panic_restores_redirected_stdout") {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("panic.txt");
+        let mut shell = Shell::new();
+        shell
+            .register_embedder_builtin(
+                "panic_builtin",
+                |_shell, _argv| -> epsh::error::Result<ExitStatus> {
+                    panic!("intentional embedder panic")
+                },
+            )
+            .unwrap();
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                shell.run_program(&parse(&format!("panic_builtin > {}", output.display())))
+            }))
+            .is_err()
+        );
+        let fd_target = fs::read_link("/proc/self/fd/1").unwrap();
+        assert_ne!(fd_target, output);
+    }
+
+    #[test]
+    fn times_is_an_implemented_special_builtin() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        assert_eq!(shell.run_program(&parse("times")), ExitStatus::SUCCESS);
+        let output = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 2);
+        assert!(
+            output
+                .lines()
+                .all(|line| line.contains("m") && line.contains("s"))
+        );
+    }
+
+    #[test]
     fn command_substitution_runs_embedder_builtin() {
         let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
@@ -726,6 +798,23 @@ mod embedder_builtins {
             ExitStatus::SUCCESS
         );
         assert_eq!(*stdout.lock().unwrap(), b"function\n");
+    }
+
+    #[test]
+    fn cd_wrapper_function_precedes_regular_builtin() {
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let temp = tempdir().unwrap();
+        let target = temp.path().to_path_buf();
+        let mut shell = Shell::builder().stdout_sink(stdout.clone()).build();
+        assert_eq!(
+            shell.run_program(&parse(&format!(
+                "cd() {{ echo wrapper; command cd '{}'; }}; cd",
+                target.display()
+            ))),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stdout.lock().unwrap(), b"wrapper\n");
+        assert_eq!(shell.cwd(), target);
     }
 
     #[test]
@@ -1528,6 +1617,9 @@ mod interactive_wait {
         assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
         let group = unsafe { libc::getpgrp() };
         for timeout in [false, true] {
+            let temp = tempdir().unwrap();
+            let release_handler = temp.path().join("release-handler");
+            let handler_release_path = release_handler.clone();
             let mut host = std::process::Command::new("/bin/sh")
                 .env_clear()
                 .args(["-c", "/bin/sleep 0.1; exit 7"])
@@ -1537,6 +1629,11 @@ mod interactive_wait {
                 .env_clear()
                 .interactive(true)
                 .external_handler(Box::new(move |_, _| {
+                    // Wait until the parent has completed its own setpgid call
+                    // for the background job before joining the shell's group.
+                    while !handler_release_path.exists() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                     // Runs in the engine-owned background fork, not the host.
                     assert_eq!(unsafe { libc::setpgid(0, group) }, 0);
                     assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) }, 0);
@@ -1546,6 +1643,7 @@ mod interactive_wait {
                 }))
                 .build();
             assert_eq!(shell.run_script("group-child & owned=$!"), 0);
+            fs::write(&release_handler, b"go").unwrap();
             let owned: i32 = shell.get_var("owned").unwrap().parse().unwrap();
             let mut status = 0;
             assert_eq!(

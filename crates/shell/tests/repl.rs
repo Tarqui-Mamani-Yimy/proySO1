@@ -42,6 +42,40 @@ impl Drop for ProcessGroupCleanup {
     }
 }
 
+fn wait_for_process_group(pids: &[i32], pgid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let joined = pids
+            .iter()
+            .all(|&pid| unsafe { libc::getpgid(pid) } == pgid);
+        if joined {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pipeline members {pids:?} did not join process group {pgid}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_for_job_state(session: &mut PtySession, expected: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        submit(session, "jobs");
+        let output = session.exp_string("$ ").unwrap();
+        let listing = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+        if listing.contains(expected) {
+            return listing;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job never reached {expected:?}; last listing: {listing:?}"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn session() -> (PtySession, TempDir) {
     session_with(&[], None)
 }
@@ -597,6 +631,7 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
             })
             .collect(),
     );
+    wait_for_process_group(&jobs.0, jobs.0[0]);
     let mut cleanup = (status == 148).then(|| ProcessGroupCleanup::new(jobs.0[0]));
     let tty = session.process().get_file_handle().unwrap();
     use std::os::fd::AsRawFd;
@@ -627,8 +662,7 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
             );
         }
         cleanup.terminate();
-        submit(&mut session, "jobs");
-        let _ = session.exp_string("$ ").unwrap();
+        wait_for_job_state(&mut session, "Killed(9)");
     }
     // Interrupted jobs are terminated/reaped, and stopped-job fixtures are
     // explicitly killed and reaped below so tests cannot leak a child.
@@ -686,7 +720,7 @@ fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
             break pgid;
         }
         assert!(std::time::Instant::now() < deadline, "no foreground job");
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     };
     let mut cleanup = ProcessGroupCleanup::new(pgid);
     session.send("\x1a").unwrap();
@@ -701,8 +735,7 @@ fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
     assert!(listing.contains("[1]+ Stopped  sleep 100"), "{listing:?}");
 
     cleanup.terminate();
-    submit(&mut session, "jobs");
-    session.exp_string("$ ").unwrap();
+    wait_for_job_state(&mut session, "Killed(9)");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -728,8 +761,7 @@ fn background_job_is_registered_and_listed_as_running() {
     );
 
     cleanup.terminate();
-    submit(&mut session, "jobs");
-    session.exp_string("$ ").unwrap();
+    wait_for_job_state(&mut session, "Killed(9)");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -742,11 +774,7 @@ fn finished_background_job_is_reported_done() {
     submit(&mut session, "sleep 0.1 &");
     let launch = session.exp_string("$ ").unwrap();
     let mut cleanup = ProcessGroupCleanup::new(background_pgid(launch.as_bytes()));
-    std::thread::sleep(std::time::Duration::from_millis(250));
-
-    submit(&mut session, "jobs");
-    let listing = session.exp_string("$ ").unwrap();
-    let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+    let listing = wait_for_job_state(&mut session, "Done(0)");
     assert!(listing.contains("[1]  Done(0)"), "{listing:?}");
     cleanup.disarm();
     submit(&mut session, "exit");
@@ -767,8 +795,7 @@ fn jobs_resolves_prefix_job_spec() {
     assert!(listing.contains("[1]+ Running  sleep 100"), "{listing:?}");
 
     cleanup.terminate();
-    submit(&mut session, "jobs");
-    session.exp_string("$ ").unwrap();
+    wait_for_job_state(&mut session, "Killed(9)");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -835,7 +862,7 @@ fn interrupt_loop(builtin_only: bool, signal: u8, status: i32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == shell_group {
             assert!(std::time::Instant::now() < deadline, "no foreground child");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
         }
     }
     session

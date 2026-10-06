@@ -52,7 +52,7 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
   - New workspace member, binary `so1sh`. Loop: print prompt, read a line, run it with epsh, keep `$?`, exit on `exit` and on EOF (Ctrl-D).
   - Non-TTY stdin keeps epsh script semantics.
   - Accept: PTY test types `echo hi`, sees `hi` and a new prompt; `exit 3` returns status 3.
-- [ ] **T2b — Interactive shells survive shell errors** (route: delegated → `codex-impl`; review WARNINGs on T2)
+- [x] **T2b — Interactive shells survive shell errors** (route: delegated → `codex-impl`; review WARNINGs on T2)
   - `eval_repl_line` returns `Break` for generic runtime errors and Cancelled/Stopped (`crates/epsh/src/eval.rs:930-942`), so e.g. `${x?msg}` or a special-builtin error ends the session. POSIX 2.8.1: an interactive shell must not exit on these errors.
   - Only `exit` (and errexit when set) should end the REPL; errors set `$?` and return to the prompt. Document the `Break` contract.
   - Accept: PTY tests for `${nope?missing}` then `echo after`, and a redirection error on a special builtin.
@@ -79,7 +79,9 @@ child of the host process, which is unsafe once epsh is embedded in our shell.
 - T1b (`24b23f7`): parser wrapped the whole accumulated sequential list in `Background` on `&` (`x=1; cmd &` ran `x=1` in a subshell); now `&` binds to the current AND-OR list only. Compared with dash (6 scripts). Workspace 480 green (orchestrator spot-check). `sys.rs` negative-PID mapping unreachable (crate-private, positive callers only) -> left unchanged.
   Native review: high risk, user granted, approved, acknowledged; 4 suggestions only.
 
+- T2b (`91118c0`): REPL survives expansion errors, special-builtin errors (redirection, invalid break/continue operands, missing `.` file) per POSIX 2.8.1; only `exit`/errexit end the session; Cancelled -> 130, Stopped -> 148, both continue. Private `special_builtin_failed` marker; public `ShellError` unchanged. Workspace 497 green (orchestrator spot-check); orchestrator PTY probe: `local` scope is unwound after an error inside a function.
+  Native review: high risk, user granted, approved, acknowledged. WARNINGs to revisit: sticky `special_builtin_failed` side channel (`eval.rs:289`), partial context restore in `eval_repl_line` (`eval.rs:906-913`), stopped child not adopted (`eval.rs:957-962`) -> Phase 2 job control.
+
 ## Progress / Next step
-- PAUSED by the user on 2026-10-05 after T1b. Both agents told to stand by.
-- Resume with: T2b (interactive shell survives errors) on `codex-impl`, then T3, T4, T5, T6.
+- Resumed 2026-10-05. Next: T3 (reedline) on `codex-impl`, then T4, T5, T6.
 - Branch `feat/phase-1-shell-mvp` (stacked on `chore/phase-0-workspace`); merge to `main` still pending the user's decision.

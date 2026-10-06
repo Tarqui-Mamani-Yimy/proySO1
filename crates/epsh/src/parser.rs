@@ -21,6 +21,8 @@ pub struct Parser {
     /// Heredoc bodies read at newlines, waiting to be patched into the AST.
     heredoc_bodies: Vec<HereDocBody>,
     consumed_eof: bool,
+    /// EOF where an unescaped physical newline is forbidden by the grammar.
+    invalid_line_end: bool,
 }
 
 impl Parser {
@@ -29,6 +31,7 @@ impl Parser {
             lexer: Lexer::new(source),
             heredoc_bodies: Vec::new(),
             consumed_eof: false,
+            invalid_line_end: false,
         }
     }
 
@@ -37,6 +40,7 @@ impl Parser {
             lexer: Lexer::new_bytes(source),
             heredoc_bodies: Vec::new(),
             consumed_eof: false,
+            invalid_line_end: false,
         }
     }
 
@@ -47,10 +51,13 @@ impl Parser {
     }
 
     /// Parse interactive input: `None` means more input is needed, while a syntax
-    /// error means the input is invalid. Batch `parse` semantics are unchanged.
+    /// error means the input is invalid, including a missing same-line word
+    /// after a redirection operator. Batch `parse` semantics are unchanged.
     pub fn parse_interactive(&mut self) -> Result<Option<Program>, ShellError> {
         let result = self.parse();
-        if self.lexer.incomplete_input || (result.is_err() && self.consumed_eof) {
+        if self.lexer.incomplete_input
+            || (result.is_err() && self.consumed_eof && !self.invalid_line_end)
+        {
             Ok(None)
         } else {
             result.map(Some)
@@ -71,6 +78,13 @@ impl Parser {
         Ok(result)
     }
 
+    /// Required words cannot start on the next physical line unless escaped.
+    fn next_same_line(&mut self) -> Result<(Token, Span), ShellError> {
+        let result = self.next()?;
+        self.invalid_line_end = matches!(result.0, Token::Eof | Token::Newline);
+        Ok(result)
+    }
+
     /// Consume the next token, expecting a specific token type.
     fn expect(&mut self, expected: &Token) -> Result<Span, ShellError> {
         let (tok, span) = self.next()?;
@@ -82,6 +96,15 @@ impl Parser {
                 span,
             })
         }
+    }
+
+    /// Function headers and case patterns cannot split before their closing `)`.
+    fn expect_same_line(&mut self, expected: &Token) -> Result<Span, ShellError> {
+        let result = self.expect(expected);
+        if result.is_err() && self.consumed_eof {
+            self.invalid_line_end = true;
+        }
+        result
     }
 
     /// Consume any newlines (linebreak in the grammar).
@@ -324,6 +347,9 @@ impl Parser {
         let bang = tok == Token::Bang;
         if bang {
             self.next()?;
+            if self.peek()?.0 == Token::Eof {
+                self.invalid_line_end = true;
+            }
         }
 
         let first = self.parse_command()?;
@@ -431,7 +457,7 @@ impl Parser {
                             let (next, _next_span) = self.peek()?;
                             if next == Token::LParen {
                                 self.next()?;
-                                self.expect(&Token::RParen)?;
+                                self.expect_same_line(&Token::RParen)?;
                                 self.skip_newlines()?;
                                 let body = self.parse_command()?;
                                 return Ok(Command::FuncDef {
@@ -455,7 +481,7 @@ impl Parser {
                         let (next, _next_span) = self.peek()?;
                         if next == Token::LParen {
                             self.next()?;
-                            self.expect(&Token::RParen)?;
+                            self.expect_same_line(&Token::RParen)?;
                             self.skip_newlines()?;
                             let body = self.parse_command()?;
                             return Ok(Command::FuncDef {
@@ -548,7 +574,7 @@ impl Parser {
                 // Here-document: read delimiter word
                 let strip_tabs = *op == Token::DLessDash;
                 self.lexer.recognize_reserved = false;
-                let (delim_tok, delim_span) = self.next()?;
+                let (delim_tok, delim_span) = self.next_same_line()?;
                 self.lexer.recognize_reserved = true;
                 let (delim_parts, had_quoting) = match delim_tok {
                     Token::Word(parts, q) => (parts, q),
@@ -585,7 +611,7 @@ impl Parser {
             _ => {
                 // All other redirections take a word argument
                 self.lexer.recognize_reserved = false;
-                let (word_tok, word_span) = self.next()?;
+                let (word_tok, word_span) = self.next_same_line()?;
                 self.lexer.recognize_reserved = true;
                 let word = match word_tok {
                     Token::Word(parts, _) => Word {
@@ -811,7 +837,7 @@ impl Parser {
 
         // Variable name
         self.lexer.recognize_reserved = false;
-        let (name_tok, name_span) = self.next()?;
+        let (name_tok, name_span) = self.next_same_line()?;
         self.lexer.recognize_reserved = true;
         let var = match name_tok {
             Token::Word(parts, _) => parts_to_text(&parts),
@@ -888,7 +914,7 @@ impl Parser {
 
         // Case word
         self.lexer.recognize_reserved = false;
-        let (word_tok, word_span) = self.next()?;
+        let (word_tok, word_span) = self.next_same_line()?;
         self.lexer.recognize_reserved = true;
         let word = match word_tok {
             Token::Word(parts, _) => Word {
@@ -936,7 +962,8 @@ impl Parser {
 
         // Optional leading (
         let (tok, _) = self.peek()?;
-        if tok == Token::LParen {
+        let parenthesized = tok == Token::LParen;
+        if parenthesized {
             self.next()?;
         }
 
@@ -944,7 +971,12 @@ impl Parser {
         let mut patterns = Vec::new();
         loop {
             self.lexer.recognize_reserved = false;
-            let (tok, tok_span) = self.next()?;
+            let (tok, tok_span) = if parenthesized || !patterns.is_empty() {
+                self.next_same_line()?
+            } else {
+                // No pattern has started: EOF here can still be followed by esac.
+                self.next()?
+            };
             self.lexer.recognize_reserved = true;
             let pat = match tok {
                 Token::Word(parts, _) => Word {
@@ -975,7 +1007,7 @@ impl Parser {
             }
         }
 
-        self.expect(&Token::RParen)?;
+        self.expect_same_line(&Token::RParen)?;
         self.skip_newlines()?;
 
         // Body (optional — could be empty before ;;)
@@ -2104,6 +2136,53 @@ mod interactive_input_tests {
     use super::Parser;
 
     #[test]
+    fn missing_same_line_words_are_invalid_not_incomplete() {
+        for prefix in [
+            "echo >",
+            "echo <",
+            "echo >>",
+            "echo 2>&",
+            "cat <<",
+            "cat <<-",
+            "for",
+            "case",
+            "f(",
+            "case x in foo",
+            "case x in (",
+            "case x in foo|",
+            "!",
+        ] {
+            for suffix in ["", "\n"] {
+                let input = format!("{prefix}{suffix}");
+                assert!(
+                    Parser::new(&input).parse_interactive().is_err(),
+                    "{input:?}"
+                );
+                assert!(Parser::new(&input).parse().is_err(), "{input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn backslash_newline_at_end_needs_another_line() {
+        for input in [
+            "echo continued\\\n",
+            "echo > \\\n",
+            "echo continued\\\n\\\n",
+        ] {
+            assert!(
+                matches!(Parser::new(input).parse_interactive(), Ok(None)),
+                "{input:?}"
+            );
+        }
+        assert!(matches!(
+            Parser::new("echo continued\\\nnext\n").parse_interactive(),
+            Ok(Some(_))
+        ));
+        assert!(Parser::new("echo continued\\\n").parse().is_ok());
+    }
+
+    #[test]
     fn incomplete_constructs_need_more_input() {
         for input in [
             "echo 'open",
@@ -2118,9 +2197,15 @@ mod interactive_input_tests {
             "cat <<-EOF\n\tbody",
             "echo ${var",
             "echo $(echo hi",
+            "echo > 'open",
             "while true; do",
             "for i in a; do",
             "case x in",
+            "case x in foo)",
+            "case x in foo) true;;",
+            "f()",
+            "f() {",
+            "! if true; then",
             "(",
             "{",
         ] {

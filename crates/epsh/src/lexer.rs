@@ -187,6 +187,9 @@ impl Lexer {
                 self.pos += 2;
                 self.line += 1;
                 self.col = 1;
+                if self.pos == self.src.len() {
+                    self.incomplete_input = true;
+                }
                 continue;
             }
             return Some(ch);
@@ -214,6 +217,9 @@ impl Lexer {
                 self.pos += 2;
                 self.line += 1;
                 self.col = 1;
+                if self.pos == self.src.len() {
+                    self.incomplete_input = true;
+                }
                 continue;
             }
             self.pos += 1;

@@ -33,8 +33,12 @@ fn check_child_test(name: &str, out: &std::process::Output) -> Result<(), String
 
 // Tests that change FDs or reap arbitrary children need a private process.
 fn isolated_test(name: &str) -> bool {
+    isolated_test_capture(name).is_some()
+}
+
+fn isolated_test_capture(name: &str) -> Option<std::process::Output> {
     if std::env::var("EPSH_EMBEDDING_CHILD").as_deref() == Ok(name) {
-        return false;
+        return None;
     }
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
@@ -43,7 +47,7 @@ fn isolated_test(name: &str) -> bool {
         .output()
         .unwrap();
     check_child_test(name, &out).unwrap();
-    true
+    Some(out)
 }
 
 mod hermeticity {
@@ -689,6 +693,54 @@ mod embedder_builtins {
             fs::read(temp.path().join("output.txt")).unwrap(),
             b"redirected\n"
         );
+    }
+
+    #[test]
+    fn descriptor_duplications_route_output_to_the_destination_sink() {
+        let name =
+            "embedder_builtins::descriptor_duplications_route_output_to_the_destination_sink";
+        if let Some(out) = isolated_test_capture(name) {
+            for leaked in [b"a\n".as_slice(), b"b\n", b"c\n", b"d\n", b"ef\n"] {
+                assert!(
+                    !out.stdout
+                        .windows(leaked.len())
+                        .any(|window| window == leaked),
+                    "stdout leaked {leaked:?}: {out:?}"
+                );
+                assert!(
+                    !out.stderr
+                        .windows(leaked.len())
+                        .any(|window| window == leaked),
+                    "stderr leaked {leaked:?}: {out:?}"
+                );
+            }
+            return;
+        }
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr.clone())
+            .build();
+        shell
+            .register_embedder_builtin("emit", |shell, _| {
+                shell.write_stdout(b"f\n");
+                Ok(ExitStatus::SUCCESS)
+            })
+            .unwrap();
+        for command in ["echo a >&2", "printf e 1>&2", "emit >&2"] {
+            assert_eq!(shell.run_program(&parse(command)), ExitStatus::SUCCESS);
+        }
+        assert_eq!(
+            shell.run_program(&parse("echo b 2>&1")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(
+            shell.run_program(&parse("{ echo c; echo d >&2; } 2>&1")),
+            ExitStatus::SUCCESS
+        );
+        assert_eq!(*stderr.lock().unwrap(), b"a\nef\n");
+        assert_eq!(*stdout.lock().unwrap(), b"b\nc\nd\n");
     }
 
     #[test]

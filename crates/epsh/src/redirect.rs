@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::ast::*;
 use crate::error::ShellError;
@@ -16,6 +16,7 @@ pub(crate) struct SavedFd {
     pub(crate) saved_copy: Option<RawFd>,
     /// The target was not open before the redirection, so restoration closes it.
     pub(crate) was_closed: bool,
+    pub(crate) prior_route: Option<u8>,
 }
 
 /// Restores command redirections on every exit path, including unwinding from
@@ -24,6 +25,8 @@ pub(crate) struct RedirectionGuard {
     saved: Option<Vec<SavedFd>>,
     stdout_depth: Arc<AtomicUsize>,
     stderr_depth: Arc<AtomicUsize>,
+    stdout_route: Arc<AtomicU8>,
+    stderr_route: Arc<AtomicU8>,
 }
 
 impl RedirectionGuard {
@@ -31,11 +34,15 @@ impl RedirectionGuard {
         saved: Vec<SavedFd>,
         stdout_depth: Arc<AtomicUsize>,
         stderr_depth: Arc<AtomicUsize>,
+        stdout_route: Arc<AtomicU8>,
+        stderr_route: Arc<AtomicU8>,
     ) -> Self {
         Self {
             saved: Some(saved),
             stdout_depth,
             stderr_depth,
+            stdout_route,
+            stderr_route,
         }
     }
 
@@ -54,10 +61,29 @@ impl RedirectionGuard {
         let Some(saved) = self.saved.take() else {
             return;
         };
-        for entry in &saved {
+        for entry in saved.iter().rev() {
             decrement_redirect_depth(entry.target_fd, &self.stdout_depth, &self.stderr_depth);
+            restore_route(entry, &self.stdout_route, &self.stderr_route);
         }
         restore_saved_fds(saved);
+    }
+}
+
+fn restore_route(entry: &SavedFd, stdout: &AtomicU8, stderr: &AtomicU8) {
+    if let Some(route) = entry.prior_route {
+        match entry.target_fd {
+            1 => stdout.store(route, Ordering::Relaxed),
+            2 => stderr.store(route, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+}
+
+fn set_route(fd: RawFd, route: u8, shell: &Shell) {
+    match fd {
+        1 => shell.stdout_sink_route.store(route, Ordering::Relaxed),
+        2 => shell.stderr_sink_route.store(route, Ordering::Relaxed),
+        _ => {}
     }
 }
 
@@ -196,12 +222,29 @@ impl Shell {
                     target_fd,
                     saved_copy,
                     was_closed,
+                    prior_route: match target_fd {
+                        1 => Some(self.stdout_sink_route.load(Ordering::Relaxed)),
+                        2 => Some(self.stderr_sink_route.load(Ordering::Relaxed)),
+                        _ => None,
+                    },
                 });
                 increment_redirect_depth(
                     target_fd,
                     &self.stdout_redirect_depth,
                     &self.stderr_redirect_depth,
                 );
+            }
+
+            if target_fd == 1 || target_fd == 2 {
+                let route =
+                    if matches!(redir.kind, RedirKind::DupInput(_) | RedirKind::DupOutput(_)) {
+                        None
+                    } else {
+                        Some(2)
+                    };
+                if let Some(route) = route {
+                    set_route(target_fd, route, self);
+                }
             }
 
             match &redir.kind {
@@ -238,9 +281,16 @@ impl Shell {
                 RedirKind::DupInput(word) | RedirKind::DupOutput(word) => {
                     let fd_str = self.expand_string(word)?;
                     if fd_str == "-" {
+                        set_route(target_fd, 3, self);
                         // SAFETY: target_fd is a valid fd number from the redirect syntax.
                         sys::close(target_fd);
                     } else if let Ok(source_fd) = fd_str.parse::<i32>() {
+                        let route = match source_fd {
+                            1 => self.stdout_sink_route.load(Ordering::Relaxed),
+                            2 => self.stderr_sink_route.load(Ordering::Relaxed),
+                            _ => 2,
+                        };
+                        set_route(target_fd, route, self);
                         // SAFETY: source_fd is user-specified (may fail at OS level); target_fd is from redirect syntax.
                         sys::dup2(source_fd, target_fd);
                     } else {
@@ -303,12 +353,13 @@ impl Shell {
 
     /// Restore file descriptors after redirections.
     pub(crate) fn restore_redirections(&self, saved: Vec<SavedFd>) {
-        for entry in &saved {
+        for entry in saved.iter().rev() {
             decrement_redirect_depth(
                 entry.target_fd,
                 &self.stdout_redirect_depth,
                 &self.stderr_redirect_depth,
             );
+            restore_route(entry, &self.stdout_sink_route, &self.stderr_sink_route);
         }
         restore_saved_fds(saved);
     }

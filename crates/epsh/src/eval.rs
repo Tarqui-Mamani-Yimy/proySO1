@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::ops::ControlFlow;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ast::*;
@@ -373,6 +373,8 @@ pub struct Shell {
     pub(crate) stderr_sink: Option<Arc<Mutex<dyn Write + Send>>>,
     pub(crate) stdout_redirect_depth: Arc<AtomicUsize>,
     pub(crate) stderr_redirect_depth: Arc<AtomicUsize>,
+    pub(crate) stdout_sink_route: Arc<AtomicU8>,
+    pub(crate) stderr_sink_route: Arc<AtomicU8>,
     /// PIDs of currently running child processes (for cancellation cleanup).
     pub(crate) child_pids: Vec<i32>,
     /// Unconsumed asynchronous jobs owned by this shell execution environment.
@@ -726,6 +728,8 @@ impl ShellBuilder {
             stderr_sink: self.stderr_sink,
             stdout_redirect_depth: Arc::new(AtomicUsize::new(0)),
             stderr_redirect_depth: Arc::new(AtomicUsize::new(0)),
+            stdout_sink_route: Arc::new(AtomicU8::new(0)),
+            stderr_sink_route: Arc::new(AtomicU8::new(1)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
@@ -776,6 +780,8 @@ impl Shell {
             stderr_sink: None,
             stdout_redirect_depth: Arc::new(AtomicUsize::new(0)),
             stderr_redirect_depth: Arc::new(AtomicUsize::new(0)),
+            stdout_sink_route: Arc::new(AtomicU8::new(0)),
+            stderr_sink_route: Arc::new(AtomicU8::new(1)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             stopped_jobs: Vec::new(),
@@ -905,9 +911,13 @@ impl Shell {
 
     /// Write bytes to stdout, honoring an installed output sink.
     pub fn write_stdout(&self, data: &[u8]) {
-        if let Some(ref sink) = self.stdout_sink
-            && self.stdout_redirect_depth.load(Ordering::Relaxed) == 0
-        {
+        let route = self.stdout_sink_route.load(Ordering::Relaxed);
+        let sink = match route {
+            0 => self.stdout_sink.as_ref(),
+            1 => self.stderr_sink.as_ref(),
+            _ => None,
+        };
+        if let Some(sink) = sink {
             if let Ok(mut w) = sink.lock() {
                 let _ = w.write_all(data);
             }
@@ -919,9 +929,13 @@ impl Shell {
 
     /// Write bytes to stderr, honoring an installed error sink.
     pub fn write_stderr(&self, data: &[u8]) {
-        if let Some(ref sink) = self.stderr_sink
-            && self.stderr_redirect_depth.load(Ordering::Relaxed) == 0
-        {
+        let route = self.stderr_sink_route.load(Ordering::Relaxed);
+        let sink = match route {
+            0 => self.stdout_sink.as_ref(),
+            1 => self.stderr_sink.as_ref(),
+            _ => None,
+        };
+        if let Some(sink) = sink {
             if let Ok(mut w) = sink.lock() {
                 let _ = w.write_all(data);
             }
@@ -2092,6 +2106,8 @@ impl Shell {
             saved_fds,
             self.stdout_redirect_depth.clone(),
             self.stderr_redirect_depth.clone(),
+            self.stdout_sink_route.clone(),
+            self.stderr_sink_route.clone(),
         );
 
         // Every outcome, including builtin errors, falls through to the

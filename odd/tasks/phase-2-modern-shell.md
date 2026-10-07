@@ -102,7 +102,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - [x] **T5 — Shell integration marks** (codex-impl)
   - Emit OSC 133 A/B/C/D (prompt start, command start, output start, command end with exit code) and OSC 7 (cwd as file:// URL) when interactive; opt-out variable.
   - Accept: PTY tests assert exact sequences and ordering.
-- [ ] **T6 — Tab completion** (codex-impl)
+- [x] **T6 — Tab completion** (codex-impl) — `77c88ce` OSC 7 hostname, `8115caf` completion.
+- [ ] **T6b — Review correction (PENDING, plan 40 lines)**: native review lineage review-065e210f56cc033f returned correction_required for `tab_lists_multiple_file_matches` (`crates/shell/tests/repl.rs:2318`) expecting `MULTI-FIRST.TXT`; real terminal output is lowercase (orchestrator probe) yet the test passes -> it does not prove what it claims. Fix the expectation, explain why uppercase matched, commit, then re-query STATUS for that lineage (expect corrected_candidate -> targeted validation -> acknowledge).
   - Commands (builtins, functions, embedder builtins, PATH executables), file paths (quoting spaces), `$VAR` names.
 - [ ] **T7 — Hints and syntax highlighting** (codex-impl)
   - History-based ghost-text hints; highlighting via the epsh lexer (commands found/not found, strings, operators).
@@ -149,6 +150,11 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 
 - T5 (`9b8b256`): OSC 7 before each prompt + OSC 133 A/B/C/D (ST terminator), terminal-only, one block for multiline, none for Ctrl-C-discarded input, `SO1SH_SHELL_INTEGRATION=0` opt-out; reedline secondary-prompt callbacks no longer consume B early; 12 new PTY tests incl. wrapped long input; legacy PTY fixtures opt out of marks. Orchestrator PTY probe: `false` -> `133;D;1`, `cd /tmp` -> `7;file://localhost/tmp`.
   Follow-up: OSC 7 uses host `localhost`; terminals use the real hostname to detect remote sessions -> use gethostname.
+
+
+## Pause point (2026-10-06, usage limit reached)
+- HEAD `8115caf` + docs. T7 (hints + highlighting) was RUNNING on `codex-impl` (uncommitted when paused) — on resume read its report, verify, commit.
+- Pending: T6b correction (above), T7, T2e, T8. Then Phase 2 closes.
 
 ## Progress / Next step
 - Next: T6 (tab completion) on `codex-impl` (+ OSC 7 hostname); then T7, T2e, T8.

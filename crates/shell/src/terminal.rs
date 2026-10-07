@@ -142,7 +142,7 @@ impl Terminal {
 
     /// Report the cwd as an OSC 7 file URL without routing through shell output.
     pub fn report_cwd(&self, cwd: &Path) -> io::Result<()> {
-        let hostname = hostname_bytes().unwrap_or_else(|| b"localhost".to_vec());
+        let hostname = hostname_bytes()?;
         let mut sequence = b"\x1b]7;file://".to_vec();
         append_url_bytes(&mut sequence, &hostname, false);
         append_url_bytes(&mut sequence, cwd.as_os_str().as_bytes(), true);
@@ -151,17 +151,45 @@ impl Terminal {
     }
 }
 
-fn hostname_bytes() -> Option<Vec<u8>> {
+fn hostname_bytes() -> io::Result<Vec<u8>> {
     let mut buffer = [0u8; 256];
     // SAFETY: buffer is writable and its length is passed to gethostname.
-    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == -1 {
+    let hostname = if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0 {
+        let len = buffer
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(buffer.len());
+        Some(buffer[..len].to_vec())
+    } else {
+        None
+    };
+    let nodename = uname_nodename_bytes();
+    select_hostname(hostname, nodename)
+        .ok_or_else(|| io::Error::other("could not determine the local hostname"))
+}
+
+fn uname_nodename_bytes() -> Option<Vec<u8>> {
+    // SAFETY: utsname is zero-initialized and libc::uname fills it on success.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut name) } == -1 {
         return None;
     }
-    let len = buffer
+    // SAFETY: nodename is a fixed-size C string field inside the initialized
+    // utsname; bound the scan to that field even if it lacks a trailing NUL.
+    let nodename = unsafe {
+        std::slice::from_raw_parts(name.nodename.as_ptr().cast::<u8>(), name.nodename.len())
+    };
+    let len = nodename
         .iter()
         .position(|&byte| byte == 0)
-        .unwrap_or(buffer.len());
-    Some(buffer[..len].to_vec())
+        .unwrap_or(nodename.len());
+    Some(nodename[..len].to_vec())
+}
+
+fn select_hostname(hostname: Option<Vec<u8>>, nodename: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    hostname
+        .filter(|name| !name.is_empty())
+        .or_else(|| nodename.filter(|name| !name.is_empty()))
 }
 
 fn append_url_bytes(out: &mut Vec<u8>, bytes: &[u8], keep_slash: bool) {
@@ -189,7 +217,7 @@ impl Drop for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::append_url_bytes;
+    use super::{append_url_bytes, select_hostname};
 
     #[test]
     fn osc7_url_bytes_are_percent_encoded_without_losing_path_slashes() {
@@ -197,5 +225,18 @@ mod tests {
         append_url_bytes(&mut url, b"host name", false);
         append_url_bytes(&mut url, b"/tmp/a b%", true);
         assert_eq!(url, b"host%20name/tmp/a%20b%25");
+    }
+
+    #[test]
+    fn hostname_selection_prefers_gethostname_then_uname_nodename() {
+        assert_eq!(
+            select_hostname(Some(b"host-name".to_vec()), Some(b"uname-name".to_vec())).unwrap(),
+            b"host-name"
+        );
+        assert_eq!(
+            select_hostname(None, Some(b"uname-name".to_vec())).unwrap(),
+            b"uname-name"
+        );
+        assert!(select_hostname(None, None).is_none());
     }
 }

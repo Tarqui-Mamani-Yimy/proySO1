@@ -248,7 +248,8 @@ pub struct ChildJobInfo {
 }
 
 /// A frontend callback for a newly launched background job. The returned bytes
-/// are written immediately through the shell's configured stdout route.
+/// are written immediately through the shell's configured stderr route so a
+/// command's stdout redirection cannot capture interactive job-control notices.
 pub type BackgroundJobLaunchHandler = Box<dyn FnMut(&ChildJobInfo) -> Vec<u8> + Send>;
 
 /// A frontend callback for interactive exit requests. Return true to keep the
@@ -1283,7 +1284,7 @@ impl Shell {
                 && let Some(mut handler) = self.background_job_launch_handler.take()
             {
                 let output = handler(&info);
-                self.write_stdout(&output);
+                self.write_stderr(&output);
                 self.background_job_launch_handler = Some(handler);
                 return;
             }

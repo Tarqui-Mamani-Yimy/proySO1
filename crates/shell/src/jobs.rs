@@ -529,7 +529,7 @@ fn report_notifications(shell: &mut Shell, table: &mut JobTable) {
             JobState::Running => None,
         };
         if let Some(line) = line {
-            shell.write_stdout(line.as_bytes());
+            shell.write_stderr(line.as_bytes());
         }
         if matches!(job.state, JobState::Done(_) | JobState::Killed(_)) {
             completed.push(job.number);
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn completed_job_notification_prunes_job_table_entry() {
         let output = Arc::new(Mutex::new(Vec::new()));
-        let mut shell = Shell::builder().stdout_sink(output.clone()).build();
+        let mut shell = Shell::builder().stderr_sink(output.clone()).build();
         let mut table = JobTable::default();
         table.add(info(101, "sleep 1"));
         table.apply(ChildJobUpdate {

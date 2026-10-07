@@ -1756,3 +1756,132 @@ fn ctrl_d_with_stopped_jobs_requires_confirmation() {
     }
     cleanup.disarm();
 }
+
+#[test]
+fn background_launch_notice_bypasses_compound_stdout_redirection() {
+    let (mut session, dir) = session();
+    session.exp_string("$ ").unwrap();
+    let output_file = dir.path().join("launch-output");
+    submit(
+        &mut session,
+        &format!("{{ sleep 100 & }} > {}", output_file.display()),
+    );
+    let output = session.exp_string("$ ").unwrap();
+    let file_output = std::fs::read(&output_file).unwrap();
+    let pgid = background_pgid(&[output.as_bytes(), &file_output].concat());
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    assert!(
+        file_output.is_empty(),
+        "job-control notice leaked into redirected stdout: {file_output:?}"
+    );
+    assert!(
+        String::from_utf8(strip_ansi_escapes::strip(output.clone()))
+            .unwrap()
+            .contains(&format!("[1] {pgid}")),
+        "launch notice was not written to the terminal: {output:?}"
+    );
+    cleanup.terminate();
+    wait_for_job_state(&mut session, "Killed");
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn foregrounded_job_stopped_again_is_reported_stopped() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if group != shell_group {
+            break group;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleep did not become foreground"
+        );
+        std::thread::yield_now();
+    };
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    let first_stop = session.exp_string("$ ").unwrap();
+    assert!(
+        first_stop.contains("[1]+  Stopped  sleep 100"),
+        "{first_stop:?}"
+    );
+
+    submit(&mut session, "fg");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } != pgid {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fg did not foreground {pgid}"
+        );
+        std::thread::yield_now();
+    }
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    let second_stop = session.exp_string("$ ").unwrap();
+    assert!(
+        second_stop.contains("[1]+  Stopped  sleep 100"),
+        "second stop was not reported: {second_stop:?}"
+    );
+    cleanup.terminate();
+    wait_for_job_state(&mut session, "Killed");
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn stopped_job_exit_warning_resets_after_a_non_exit_command() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if group != shell_group {
+            break group;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleep did not become foreground"
+        );
+        std::thread::yield_now();
+    };
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    session.exp_string("$ ").unwrap();
+
+    submit(&mut session, "exit 7");
+    session.exp_string("There are stopped jobs.\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo still-here");
+    session.exp_string("still-here\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit 7");
+    session.exp_string("There are stopped jobs.\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit 7");
+    exited(&mut session, 7);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pgid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stopped job survived confirmed exit"
+        );
+        std::thread::yield_now();
+    }
+    cleanup.disarm();
+}

@@ -24,6 +24,8 @@ struct Job {
     command: String,
     activity: u64,
     terminal_modes: Option<libc::termios>,
+    notification_pending: bool,
+    notification_marker: char,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,12 +62,23 @@ impl JobTable {
             command: info.command,
             activity: self.activity_clock,
             terminal_modes: None,
+            notification_pending: info.state == ChildJobState::Stopped,
+            notification_marker: ' ',
         });
         self.update_current_previous();
+        if self
+            .jobs
+            .last()
+            .is_some_and(|job| job.number == number && job.notification_pending)
+        {
+            self.jobs.last_mut().unwrap().notification_marker = '+';
+        }
         number
     }
 
     fn apply(&mut self, update: ChildJobUpdate) {
+        let current = self.current;
+        let previous = self.previous;
         let changes_activity = matches!(
             update.status,
             ChildJobStatus::Stopped(_) | ChildJobStatus::Continued
@@ -76,6 +89,7 @@ impl JobTable {
         let Some(job) = self.jobs.iter_mut().find(|job| job.pgid == update.pgid) else {
             return;
         };
+        let previous_state = job.state;
         match update.status {
             ChildJobStatus::Stopped(_) => job.state = JobState::Stopped,
             ChildJobStatus::Continued => job.state = JobState::Running,
@@ -97,6 +111,16 @@ impl JobTable {
         }
         if changes_activity {
             job.activity = self.activity_clock;
+        }
+        if job.state != previous_state {
+            job.notification_pending = true;
+            job.notification_marker = if current == Some(job.number) {
+                '+'
+            } else if previous == Some(job.number) {
+                '-'
+            } else {
+                ' '
+            };
         }
         self.update_current_previous();
     }
@@ -189,6 +213,37 @@ fn result_state(job: &Job) -> JobState {
 
 pub(crate) fn register(shell: &mut Shell) -> Result<Arc<Mutex<JobTable>>, String> {
     let jobs = Arc::new(Mutex::new(JobTable::default()));
+    let launch_jobs = jobs.clone();
+    shell.set_background_job_launch_handler(Box::new(move |info| {
+        let mut table = launch_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let number = table.add(info.clone());
+        format!("[{number}] {}\n", info.pgid).into_bytes()
+    }));
+    let exit_jobs = jobs.clone();
+    shell.set_repl_exit_handler(Box::new(move |shell, _status, confirmed| {
+        let stopped = exit_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .jobs
+            .iter()
+            .filter(|job| job.state == JobState::Stopped)
+            .map(|job| job.pgid)
+            .collect::<Vec<_>>();
+        if stopped.is_empty() {
+            return false;
+        }
+        if !confirmed {
+            shell.write_stderr(b"There are stopped jobs.\n");
+            return true;
+        }
+        for pgid in stopped {
+            let _ = shell.signal_owned_job(pgid, libc::SIGHUP);
+            let _ = shell.signal_owned_job(pgid, libc::SIGCONT);
+        }
+        false
+    }));
     let builtin_jobs = jobs.clone();
     shell.register_embedder_builtin("jobs", move |shell, argv| {
         let args = argv
@@ -263,7 +318,7 @@ fn background(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
 
 fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) -> ExitStatus {
     let selected = table.lock().unwrap_or_else(|p| p.into_inner());
-    let (number, pgid, command, state) = match select_job(&selected, args) {
+    let (number, pgid, _command, state) = match select_job(&selected, args) {
         Ok(job) => job,
         Err(error) => {
             shell.write_stderr(format!("fg: {error}\n").as_bytes());
@@ -361,7 +416,6 @@ fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
         {
             job.terminal_modes = job_modes;
         }
-        shell.write_stdout(format!("[{number}]+  Stopped  {command}\n").as_bytes());
         return ExitStatus::from(128 + libc::SIGTSTP);
     }
     match current {
@@ -378,19 +432,57 @@ pub(crate) fn sync(shell: &mut Shell, table: &Arc<Mutex<JobTable>>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for info in new_jobs {
-        let state = info.state;
-        let pgid = info.pgid;
-        let command = info.command.clone();
-        let number = table.add(info);
-        let notice = match state {
-            ChildJobState::Running => format!("[{number}] {pgid}\n"),
-            ChildJobState::Stopped => format!("[{number}]+  Stopped  {command}\n"),
-        };
-        shell.write_stdout(notice.as_bytes());
+        table.add(info);
     }
     for update in updates {
         table.apply(update);
     }
+    report_notifications(shell, &mut table);
+}
+
+fn report_notifications(shell: &mut Shell, table: &mut JobTable) {
+    let current = table.current;
+    let previous = table.previous;
+    let mut completed = Vec::new();
+    for job in &mut table.jobs {
+        if !job.notification_pending {
+            continue;
+        }
+        job.notification_pending = false;
+        let marker = if job.notification_marker != ' ' {
+            job.notification_marker
+        } else if current == Some(job.number) {
+            '+'
+        } else if previous == Some(job.number) {
+            '-'
+        } else {
+            ' '
+        };
+        let line = match job.state {
+            JobState::Stopped => Some(format!(
+                "[{}]{marker}  Stopped  {}\n",
+                job.number, job.command
+            )),
+            JobState::Done(0) => Some(format!("[{}]{marker}  Done  {}\n", job.number, job.command)),
+            JobState::Done(status) => Some(format!(
+                "[{}]{marker}  Done  (Exit {status}) {}\n",
+                job.number, job.command
+            )),
+            JobState::Killed(_) => Some(format!(
+                "[{}]{marker}  Killed  {}\n",
+                job.number, job.command
+            )),
+            JobState::Running => None,
+        };
+        if let Some(line) = line {
+            shell.write_stdout(line.as_bytes());
+        }
+        if matches!(job.state, JobState::Done(_) | JobState::Killed(_)) {
+            completed.push(job.number);
+        }
+    }
+    table.jobs.retain(|job| !completed.contains(&job.number));
+    table.update_current_previous();
 }
 
 fn list(shell: &mut Shell, table: &mut JobTable, args: &[String]) -> ExitStatus {

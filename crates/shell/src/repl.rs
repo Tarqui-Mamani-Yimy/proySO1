@@ -109,6 +109,7 @@ pub fn run(shell: &mut Shell) -> i32 {
 fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     let jobs = crate::jobs::register(shell)
         .map_err(|error| io::Error::other(format!("so1sh: jobs builtin: {error}")))?;
+    shell.suppress_repl_stopped_diagnostic(true);
     let terminal = match crate::terminal::Terminal::acquire() {
         Ok(terminal) => Some(terminal),
         Err(error) => {
@@ -156,7 +157,11 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                     return Ok(status.code());
                 }
             }
-            Signal::CtrlD => return Ok(shell.finish_repl().code()),
+            Signal::CtrlD => {
+                if let Some(status) = shell.try_finish_repl() {
+                    return Ok(status.code());
+                }
+            }
             Signal::CtrlC => {} // reedline discards the buffer; keep the shell alive.
             _ => {}
         }

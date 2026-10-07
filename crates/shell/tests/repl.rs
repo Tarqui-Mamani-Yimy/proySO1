@@ -662,7 +662,7 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
             );
         }
         cleanup.terminate();
-        wait_for_job_state(&mut session, "Killed(9)");
+        wait_for_job_state(&mut session, "Killed");
     }
     // Interrupted jobs are terminated/reaped, and stopped-job fixtures are
     // explicitly killed and reaped below so tests cannot leak a child.
@@ -735,7 +735,7 @@ fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
     assert!(listing.contains("[1]+ Stopped  sleep 100"), "{listing:?}");
 
     cleanup.terminate();
-    wait_for_job_state(&mut session, "Killed(9)");
+    wait_for_job_state(&mut session, "Killed");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -761,7 +761,7 @@ fn background_job_is_registered_and_listed_as_running() {
     );
 
     cleanup.terminate();
-    wait_for_job_state(&mut session, "Killed(9)");
+    wait_for_job_state(&mut session, "Killed");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -774,8 +774,11 @@ fn finished_background_job_is_reported_done() {
     submit(&mut session, "sleep 0.1 &");
     let launch = session.exp_string("$ ").unwrap();
     let mut cleanup = ProcessGroupCleanup::new(background_pgid(launch.as_bytes()));
-    let listing = wait_for_job_state(&mut session, "Done(0)");
-    assert!(listing.contains("[1]  Done(0)"), "{listing:?}");
+    let notification = wait_for_job_state(&mut session, "Done");
+    assert!(
+        notification.contains("[1]+  Done  sleep 0.1 &"),
+        "{notification:?}"
+    );
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -795,7 +798,7 @@ fn jobs_resolves_prefix_job_spec() {
     assert!(listing.contains("[1]+ Running  sleep 100"), "{listing:?}");
 
     cleanup.terminate();
-    wait_for_job_state(&mut session, "Killed(9)");
+    wait_for_job_state(&mut session, "Killed");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -1441,10 +1444,14 @@ fn interactive_wait_preserves_background_exit_statuses() {
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 0.2 & wait $!; echo $?");
-    assert_no_output(&session.exp_string("0\r\n").unwrap());
+    let output = session.exp_string("0\r\n").unwrap();
+    let output = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+    assert!(output.contains("[1] "), "launch notice missing: {output:?}");
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sh -c 'exit 7' & wait $!; echo $?");
-    assert_no_output(&session.exp_string("7\r\n").unwrap());
+    let output = session.exp_string("7\r\n").unwrap();
+    let output = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+    assert!(output.contains("[2] "), "launch notice missing: {output:?}");
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");
     exited(&mut session, 0);
@@ -1485,8 +1492,225 @@ fn backgrounded_so1sh_can_acquire_tty_after_sigttin_timeout_window() {
     let listing = wait_for_job_state(&mut session, "Running");
     assert!(listing.contains("Running"), "{listing:?}");
     cleanup.terminate();
-    wait_for_job_state(&mut session, "Killed(9)");
+    wait_for_job_state(&mut session, "Killed");
     cleanup.disarm();
     submit(&mut session, "exit");
     exited(&mut session, 0);
+}
+
+#[test]
+fn background_launch_notice_precedes_later_commands_on_same_line() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sleep 100 & echo tail");
+    let output = session.exp_string("$ ").unwrap();
+    let output = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+    let pgid = background_pgid(output.as_bytes());
+    let cleanup = ProcessGroupCleanup::new(pgid);
+    let launch = output.find(&format!("[1] {pgid}")).unwrap();
+    let tail = output.find("tail").unwrap();
+    assert!(
+        launch < tail,
+        "launch notice came after later command: {output:?}"
+    );
+    cleanup.terminate();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn background_done_notification_includes_nonzero_exit_and_is_removed() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sh -c 'exit 3' &");
+    let launch = session.exp_string("$ ").unwrap();
+    let pgid = background_pgid(launch.as_bytes());
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut observed = String::new();
+    while !observed.contains("Done") {
+        submit(&mut session, "jobs");
+        let output = session.exp_string("$ ").unwrap();
+        observed.push_str(&String::from_utf8(strip_ansi_escapes::strip(output)).unwrap());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "completion notification not reported: {observed:?}"
+        );
+    }
+    assert!(
+        observed.contains("[1]+  Done  (Exit 3) sh -c 'exit 3'"),
+        "{observed:?}"
+    );
+    submit(&mut session, "jobs");
+    let after_report = session.exp_string("$ ").unwrap();
+    let after_report = String::from_utf8(strip_ansi_escapes::strip(after_report)).unwrap();
+    assert!(
+        !after_report.contains("exit 3"),
+        "reported job remained listed: {after_report:?}"
+    );
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn killed_background_job_notifies_before_removal() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sleep 100 &");
+    let launch = session.exp_string("$ ").unwrap();
+    let pgid = background_pgid(launch.as_bytes());
+    let cleanup = ProcessGroupCleanup::new(pgid);
+    cleanup.terminate();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut notification = String::new();
+    while !notification.contains("Killed") {
+        submit(&mut session, "jobs");
+        notification =
+            String::from_utf8(strip_ansi_escapes::strip(session.exp_string("$ ").unwrap()))
+                .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "kill notification was not reported"
+        );
+    }
+    assert!(
+        notification.contains("[1]+  Killed  sleep 100"),
+        "{notification:?}"
+    );
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn ctrl_z_reports_only_the_shell_job_notification() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if group != shell_group {
+            break group;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleep did not become foreground"
+        );
+        std::thread::yield_now();
+    };
+    let cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    let output = session.exp_string("$ ").unwrap();
+    let output = String::from_utf8(strip_ansi_escapes::strip(output)).unwrap();
+    assert!(
+        !output.contains("epsh: stopped"),
+        "internal diagnostic leaked: {output:?}"
+    );
+    assert!(output.contains("[1]+  Stopped  sleep 100"), "{output:?}");
+    cleanup.terminate();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        submit(&mut session, "jobs");
+        let output = session.exp_string("$ ").unwrap();
+        if String::from_utf8(strip_ansi_escapes::strip(output))
+            .unwrap()
+            .contains("Killed")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup kill was not reaped"
+        );
+    }
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn first_exit_with_stopped_jobs_warns_and_second_exits() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if group != shell_group {
+            break group;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleep did not become foreground"
+        );
+        std::thread::yield_now();
+    };
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    session.exp_string("$ ").unwrap();
+
+    submit(&mut session, "exit");
+    session.exp_string("There are stopped jobs.\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 148);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pgid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stopped job survived confirmed exit"
+        );
+        std::thread::yield_now();
+    }
+    cleanup.disarm();
+}
+
+#[test]
+fn ctrl_d_with_stopped_jobs_requires_confirmation() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if group != shell_group {
+            break group;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleep did not become foreground"
+        );
+        std::thread::yield_now();
+    };
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    session.exp_string("$ ").unwrap();
+
+    session.send_control('d').unwrap();
+    session.exp_string("There are stopped jobs.\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    session.send_control('d').unwrap();
+    exited(&mut session, 148);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::kill(pgid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stopped job survived confirmed EOF"
+        );
+        std::thread::yield_now();
+    }
+    cleanup.disarm();
 }

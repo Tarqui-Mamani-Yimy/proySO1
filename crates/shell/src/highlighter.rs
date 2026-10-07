@@ -300,6 +300,17 @@ mod tests {
             .collect()
     }
 
+    fn byte_range_at(text: &StyledText, needle: &str) -> std::ops::Range<usize> {
+        let mut byte_offset = 0;
+        for (_, segment) in &text.buffer {
+            if let Some(offset) = segment.find(needle) {
+                return byte_offset + offset..byte_offset + offset + needle.len();
+            }
+            byte_offset += segment.len();
+        }
+        panic!("no byte range found for {needle:?}");
+    }
+
     #[test]
     fn syntax_highlighter_styles_commands_strings_operators_variables_and_comments() {
         let context = context();
@@ -322,6 +333,26 @@ mod tests {
         assert_eq!(style_at(&styled, source, "$HOME").0, Some(Color::Magenta));
         assert_eq!(style_at(&styled, source, "|").0, Some(Color::Blue));
         assert!(style_at(&styled, source, "# comment").1);
+    }
+
+    #[test]
+    fn syntax_highlighter_maps_byte_offsets_after_multibyte_utf8() {
+        let context = context();
+        let source = "echo 'café'; missing-command";
+        let styled = highlight_line(source, &context);
+
+        assert_eq!(plain_text(&styled), source);
+        assert_eq!(style_at(&styled, source, "'café'").0, Some(Color::Yellow));
+        assert_eq!(style_at(&styled, source, ";").0, Some(Color::Blue));
+        assert_eq!(
+            style_at(&styled, source, "missing-command").0,
+            Some(Color::Red)
+        );
+        let byte_offset = source.find("missing-command").unwrap();
+        assert_eq!(
+            byte_range_at(&styled, "missing-command"),
+            byte_offset..byte_offset + "missing-command".len()
+        );
     }
 
     #[test]
@@ -353,6 +384,25 @@ mod tests {
                 "command={command}"
             );
         }
+    }
+
+    #[test]
+    fn syntax_highlighter_recognizes_executable_command_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("path-tool");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut shell = Shell::builder()
+            .cwd(temp.path().to_path_buf())
+            .env_clear()
+            .build();
+        shell.set_var("PATH", "").unwrap();
+        let context = CompletionContext::from_shell(&shell);
+        let source = "./path-tool";
+        let styled = highlight_line(source, &context);
+
+        assert_eq!(plain_text(&styled), source);
+        assert_eq!(style_at(&styled, source, source).0, Some(Color::Green));
     }
 
     #[test]

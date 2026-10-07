@@ -2316,6 +2316,27 @@ fn tab_completes_a_unique_builtin_command() {
 }
 
 #[test]
+fn tab_completes_executable_relative_path_command() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, dir) = session();
+    let executable = dir.path().join("t6c-path-command");
+    std::fs::write(&executable, "#!/bin/sh\nprintf 'path-completion-ok\\n'\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.path().join("t6c-path-command-data"), "").unwrap();
+
+    session.exp_string("$ ").unwrap();
+    session.send("./t6c-path-com").unwrap();
+    session.send("\t").unwrap();
+    submit(&mut session, "");
+    assert_no_output(&session.exp_string("path-completion-ok\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
 fn tab_lists_multiple_file_matches() {
     let _pty_test_guard = serialize_pty_test();
     let (mut session, dir) = session_with_term(&[], None, "xterm-256color");

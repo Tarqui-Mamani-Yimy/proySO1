@@ -49,7 +49,19 @@ impl CompletionContext {
     }
 
     pub(crate) fn resolves_command(&self, name: &str) -> bool {
-        self.command_names.contains(name)
+        if self.command_names.contains(name) {
+            return true;
+        }
+        if !name.contains('/') {
+            return false;
+        }
+        let path = Path::new(name);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        };
+        is_executable_file(&path)
     }
 }
 
@@ -129,10 +141,12 @@ fn complete(line: &str, pos: usize, context: &CompletionContext) -> Vec<Suggesti
     }
 
     let decoded_prefix = unescape_shell_word(raw_prefix);
-    if command_position(&line[..start]) {
+    if command_position(&line[..start]) && decoded_prefix.contains('/') {
+        file_completions(&decoded_prefix, start, pos, context, true)
+    } else if command_position(&line[..start]) {
         command_completions(&decoded_prefix, start, pos, context)
     } else {
-        file_completions(&decoded_prefix, start, pos, context)
+        file_completions(&decoded_prefix, start, pos, context, false)
     }
 }
 
@@ -162,10 +176,7 @@ fn executable_names(path: &[PathBuf]) -> BTreeSet<String> {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            if !is_executable_file(&entry.path()) {
                 continue;
             }
             if let Some(name) = entry.file_name().to_str() {
@@ -176,11 +187,17 @@ fn executable_names(path: &[PathBuf]) -> BTreeSet<String> {
     names
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn file_completions(
     prefix: &str,
     start: usize,
     pos: usize,
     context: &CompletionContext,
+    executable_commands_only: bool,
 ) -> Vec<Suggestion> {
     let (directory_prefix, basename_prefix) = prefix
         .rfind('/')
@@ -196,7 +213,7 @@ fn file_completions(
             context.cwd.join(path)
         }
     };
-    let Ok(entries) = fs::read_dir(directory) else {
+    let Ok(entries) = fs::read_dir(&directory) else {
         return Vec::new();
     };
     let show_hidden = basename_prefix.starts_with('.');
@@ -209,7 +226,15 @@ fn file_completions(
         if (!show_hidden && name.starts_with('.')) || !name.starts_with(basename_prefix) {
             continue;
         }
-        let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        let path = directory.join(name);
+        let Ok(metadata) = fs::metadata(path) else {
+            continue;
+        };
+        let is_directory = metadata.is_dir();
+        let is_executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+        if executable_commands_only && !is_directory && !is_executable {
+            continue;
+        }
         let value = format!(
             "{directory_prefix}{name}{}",
             if is_directory { "/" } else { "" }
@@ -449,6 +474,42 @@ mod tests {
             let result = complete(line, line.len(), &context);
             assert_eq!(values(result), vec!["unique-tool"], "line={line:?}");
         }
+    }
+
+    #[test]
+    fn command_path_completion_offers_only_directories_and_executables() {
+        let temp = tempfile::tempdir().unwrap();
+        executable(&temp.path().join("tool-executable"));
+        fs::write(temp.path().join("tool-data"), "").unwrap();
+        fs::create_dir(temp.path().join("tool-directory")).unwrap();
+        let context = context(temp.path(), vec![]);
+
+        assert_eq!(
+            values(complete("./tool-", "./tool-".len(), &context)),
+            vec!["./tool-directory/", "./tool-executable"]
+        );
+    }
+
+    #[test]
+    fn path_commands_follow_executable_symlinks_and_skip_broken_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        executable(&bin.join("real-tool"));
+        symlink("real-tool", bin.join("linked-tool")).unwrap();
+        symlink("missing-target", bin.join("broken-tool")).unwrap();
+        let mut shell = Shell::builder()
+            .cwd(temp.path().to_path_buf())
+            .env_clear()
+            .build();
+        shell.set_var("PATH", bin.to_str().unwrap()).unwrap();
+        let context = CompletionContext::from_shell(&shell);
+
+        assert!(context.resolves_command("linked-tool"));
+        assert!(!context.resolves_command("broken-tool"));
+        assert_eq!(values(complete("linked", 6, &context)), vec!["linked-tool"]);
     }
 
     #[test]

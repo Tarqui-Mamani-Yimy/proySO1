@@ -1527,7 +1527,10 @@ mod repl_errors {
         }));
         continued(&mut shell, "host-command; echo unreachable", 148);
         assert!(output.lock().unwrap().is_empty());
-        assert!(String::from_utf8_lossy(&errors.lock().unwrap()).contains("stopped"));
+        assert!(
+            String::from_utf8_lossy(&errors.lock().unwrap())
+                .contains("epsh: stopped (pid=123, pgid=123)")
+        );
         continued(&mut shell, "echo $?; echo after", 0);
         assert_eq!(*output.lock().unwrap(), b"148\nafter\n");
     }

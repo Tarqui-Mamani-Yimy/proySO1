@@ -246,6 +246,14 @@ pub struct ChildJobInfo {
     pub state: ChildJobState,
 }
 
+/// A frontend callback for a newly launched background job. The returned bytes
+/// are written immediately through the shell's configured stdout route.
+pub type BackgroundJobLaunchHandler = Box<dyn FnMut(&ChildJobInfo) -> Vec<u8> + Send>;
+
+/// A frontend callback for interactive exit requests. Return true to keep the
+/// REPL alive; `confirmed` is true after a previous consecutive request was held.
+pub type ReplExitHandler = Box<dyn FnMut(&mut Shell, ExitStatus, bool) -> bool + Send>;
+
 /// A wait-status transition for one of this shell's owned job members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildJobStatus {
@@ -391,6 +399,10 @@ pub struct Shell {
     pub(crate) owned_job_history: Vec<(i32, Vec<i32>)>,
     pending_job_infos: Vec<ChildJobInfo>,
     pending_job_updates: Vec<ChildJobUpdate>,
+    background_job_launch_handler: Option<BackgroundJobLaunchHandler>,
+    repl_exit_handler: Option<ReplExitHandler>,
+    repl_exit_warned: bool,
+    suppress_repl_stopped_diagnostic: bool,
     current_command_text: String,
     /// Actual interactive SIGINT/SIGQUIT, distinct from an ordinary exit code.
     interrupted: Option<ExitStatus>,
@@ -746,6 +758,10 @@ impl ShellBuilder {
             owned_job_history: Vec::new(),
             pending_job_infos: Vec::new(),
             pending_job_updates: Vec::new(),
+            background_job_launch_handler: None,
+            repl_exit_handler: None,
+            repl_exit_warned: false,
+            suppress_repl_stopped_diagnostic: false,
             current_command_text: String::new(),
             interrupted: None,
             timeout: self.timeout.map(|d| std::time::Instant::now() + d),
@@ -800,6 +816,10 @@ impl Shell {
             owned_job_history: Vec::new(),
             pending_job_infos: Vec::new(),
             pending_job_updates: Vec::new(),
+            background_job_launch_handler: None,
+            repl_exit_handler: None,
+            repl_exit_warned: false,
+            suppress_repl_stopped_diagnostic: false,
             current_command_text: String::new(),
             interrupted: None,
             timeout: None,
@@ -1224,12 +1244,21 @@ impl Shell {
                 pgid,
                 members: members.clone(),
             });
-            self.pending_job_infos.push(ChildJobInfo {
+            let info = ChildJobInfo {
                 pgid,
                 pids: members,
                 command: self.current_command_text.clone(),
                 state,
-            });
+            };
+            if state == ChildJobState::Running
+                && let Some(mut handler) = self.background_job_launch_handler.take()
+            {
+                let output = handler(&info);
+                self.write_stdout(&output);
+                self.background_job_launch_handler = Some(handler);
+                return;
+            }
+            self.pending_job_infos.push(info);
         }
     }
 
@@ -1522,6 +1551,33 @@ impl Shell {
         self.redirect_open_handler = Some(handler);
     }
 
+    /// Handle newly launched background jobs immediately instead of deferring
+    /// their launch information until `take_new_child_jobs` is called.
+    pub fn set_background_job_launch_handler(&mut self, handler: BackgroundJobLaunchHandler) {
+        self.background_job_launch_handler = Some(handler);
+    }
+
+    /// Configure how an interactive frontend confirms exits with stopped jobs.
+    pub fn set_repl_exit_handler(&mut self, handler: ReplExitHandler) {
+        self.repl_exit_handler = Some(handler);
+    }
+
+    /// Suppress the default stopped-process diagnostic in REPL mode.
+    pub fn suppress_repl_stopped_diagnostic(&mut self, suppress: bool) {
+        self.suppress_repl_stopped_diagnostic = suppress;
+    }
+
+    fn request_repl_exit(&mut self, status: ExitStatus) -> bool {
+        let Some(mut handler) = self.repl_exit_handler.take() else {
+            self.repl_exit_warned = false;
+            return false;
+        };
+        let blocked = handler(self, status, self.repl_exit_warned);
+        self.repl_exit_warned = blocked;
+        self.repl_exit_handler = Some(handler);
+        blocked
+    }
+
     pub(crate) fn has_external_handler(&self) -> bool {
         self.external_handler.is_some()
     }
@@ -1635,6 +1691,7 @@ impl Shell {
                 result
             }
             Err(error) => {
+                self.repl_exit_warned = false;
                 self.err_msg(&format!("epsh: {error}"));
                 self.exit_status = ExitStatus::MISUSE;
                 ControlFlow::Continue(self.exit_status)
@@ -1652,6 +1709,16 @@ impl Shell {
         status
     }
 
+    /// Finish a REPL at EOF unless its frontend asks to confirm the exit.
+    pub fn try_finish_repl(&mut self) -> Option<ExitStatus> {
+        let status = self.exit_status;
+        if self.request_repl_exit(status) {
+            return None;
+        }
+        self.run_exit_trap();
+        Some(status)
+    }
+
     fn run_program_inner(
         &mut self,
         program: &crate::ast::Program,
@@ -1660,9 +1727,11 @@ impl Shell {
         for cmd in &program.commands {
             match self.eval_command_internal(cmd) {
                 Ok(status) => {
+                    self.repl_exit_warned = false;
                     self.exit_status = status;
                 }
                 Err(EvalError::RecoverableSpecialBuiltin(n)) => {
+                    self.repl_exit_warned = false;
                     if self.interrupted.take().is_some() {
                         self.exit_status = n;
                         return ControlFlow::Continue(n);
@@ -1674,6 +1743,7 @@ impl Shell {
                     return ControlFlow::Break(n);
                 }
                 Err(EvalError::Shell(e @ (ShellError::Cancelled | ShellError::TimedOut))) => {
+                    self.repl_exit_warned = false;
                     self.kill_children();
                     if repl {
                         self.err_msg(&format!("epsh: {e}"));
@@ -1684,7 +1754,10 @@ impl Shell {
                 }
                 Err(EvalError::Shell(e @ ShellError::Stopped { .. })) => {
                     if repl {
-                        self.err_msg(&format!("epsh: {e}"));
+                        if !self.suppress_repl_stopped_diagnostic {
+                            self.err_msg(&format!("epsh: {e}"));
+                        }
+                        self.repl_exit_warned = false;
                         self.exit_status = ExitStatus::from(148);
                         return ControlFlow::Continue(self.exit_status);
                     }
@@ -1695,13 +1768,18 @@ impl Shell {
                 }
                 Err(EvalError::Shell(ShellError::Exit(n))) => {
                     if self.interrupted.take().is_some() {
+                        self.repl_exit_warned = false;
                         self.exit_status = n;
                         return ControlFlow::Continue(n);
+                    }
+                    if repl && self.request_repl_exit(n) {
+                        return ControlFlow::Continue(self.exit_status);
                     }
                     self.run_exit_trap();
                     return ControlFlow::Break(n);
                 }
                 Err(EvalError::Shell(e)) => {
+                    self.repl_exit_warned = false;
                     self.err_msg(&format!("epsh: {e}"));
                     if repl {
                         return self.repl_shell_error();

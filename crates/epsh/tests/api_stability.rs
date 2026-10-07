@@ -119,6 +119,15 @@ fn embedder_builtin_api_is_additive() {
 }
 
 #[test]
+fn interactive_job_callback_api_is_additive() {
+    let _: fn(&mut eval::Shell, eval::BackgroundJobLaunchHandler) =
+        eval::Shell::set_background_job_launch_handler;
+    let _: fn(&mut eval::Shell, eval::ReplExitHandler) = eval::Shell::set_repl_exit_handler;
+    let _: fn(&mut eval::Shell, bool) = eval::Shell::suppress_repl_stopped_diagnostic;
+    let _: fn(&mut eval::Shell) -> Option<error::ExitStatus> = eval::Shell::try_finish_repl;
+}
+
+#[test]
 fn owned_child_job_api_is_additive() {
     let _: fn(&mut eval::Shell) -> Vec<eval::ChildJobInfo> = eval::Shell::take_new_child_jobs;
     let _: fn(&mut eval::Shell) -> Vec<eval::ChildJobUpdate> = eval::Shell::poll_child_jobs;

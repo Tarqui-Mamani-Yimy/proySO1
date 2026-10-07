@@ -1345,4 +1345,148 @@ mod startup_rc {
             exited(&mut session, 0);
         }
     }
+
+    #[test]
+    fn foreground_without_jobs_returns_failure_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session(&dir, None, Some(dir.path().as_os_str()));
+        assert_no_output(&session.exp_string("$ ").unwrap());
+        submit(&mut session, "fg; echo $?");
+        session.exp_string("fg: no current job\r\n").unwrap();
+        assert_no_output(&session.exp_string("1\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+}
+
+#[test]
+fn stopped_job_can_be_foregrounded_and_interrupted() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sleep 100");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let pgid = loop {
+        let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+        if group != shell_group {
+            break group;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "foreground sleep did not start"
+        );
+        std::thread::yield_now();
+    };
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    let stopped = session.exp_string("$ ").unwrap();
+    assert!(
+        String::from_utf8(strip_ansi_escapes::strip(stopped))
+            .unwrap()
+            .contains("Stopped")
+    );
+    submit(&mut session, "fg");
+    assert!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == pgid);
+    session.send("\x03").unwrap();
+    session.flush().unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo $?");
+    assert_no_output(&session.exp_string("130\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    assert_eq!(unsafe { libc::kill(pgid, 0) }, -1);
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn stopped_job_can_be_backgrounded_then_waited_by_job_spec() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    use std::os::fd::AsRawFd;
+    let tty = session.process().get_file_handle().unwrap();
+    let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    submit(&mut session, "sh -c 'sleep 1.5'");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == shell_group {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "foreground child did not start"
+        );
+        std::thread::yield_now();
+    }
+    session.send("\x1a").unwrap();
+    session.flush().unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "bg");
+    session.exp_string("[1]+ sh -c 'sleep 1.5' &\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "jobs");
+    let listing = session.exp_string("$ ").unwrap();
+    let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+    assert!(listing.contains("Running"), "{listing:?}");
+    submit(&mut session, "wait %1; echo $?");
+    assert_no_output(&session.exp_string("0\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn interactive_wait_preserves_background_exit_statuses() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sleep 0.2 & wait $!; echo $?");
+    assert_no_output(&session.exp_string("0\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sh -c 'exit 7' & wait $!; echo $?");
+    assert_no_output(&session.exp_string("7\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn backgrounded_so1sh_can_acquire_tty_after_sigttin_timeout_window() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, &format!("{} &", env!("CARGO_BIN_EXE_so1sh")));
+    let launch = session.exp_string("$ ").unwrap();
+    let pgid = background_pgid(launch.as_bytes());
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        submit(&mut session, "jobs");
+        let listing = session.exp_string("$ ").unwrap();
+        let listing = String::from_utf8(strip_ansi_escapes::strip(listing)).unwrap();
+        if listing.contains("Stopped") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nested so1sh did not stop for SIGTTIN: {listing:?}"
+        );
+        std::thread::yield_now();
+    }
+    // Keep the nested shell stopped beyond its one-second active wait budget
+    // while synchronizing on observable prompt/job-table round trips.
+    let resumed_at = std::time::Instant::now() + std::time::Duration::from_millis(1100);
+    while std::time::Instant::now() < resumed_at {
+        submit(&mut session, "jobs");
+        session.exp_string("$ ").unwrap();
+        std::thread::yield_now();
+    }
+    submit(&mut session, "bg %1");
+    session.exp_string("$ ").unwrap();
+    let listing = wait_for_job_state(&mut session, "Running");
+    assert!(listing.contains("Running"), "{listing:?}");
+    cleanup.terminate();
+    wait_for_job_state(&mut session, "Killed(9)");
+    cleanup.disarm();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
 }

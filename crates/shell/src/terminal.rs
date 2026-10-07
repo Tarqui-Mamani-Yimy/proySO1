@@ -61,7 +61,7 @@ impl Terminal {
             {
                 return Err(io::Error::last_os_error());
             }
-            let deadline = std::time::Instant::now() + FOREGROUND_WAIT_TIMEOUT;
+            let mut deadline = std::time::Instant::now() + FOREGROUND_WAIT_TIMEOUT;
             loop {
                 let foreground = libc::tcgetpgrp(file.as_raw_fd());
                 if foreground == -1 {
@@ -82,7 +82,12 @@ impl Terminal {
                 }
                 // A normal stop suspends us until resumed. An orphan's stop is
                 // discarded, so sleep to avoid a tight signal/syscall loop.
+                let sleep_started = std::time::Instant::now();
                 std::thread::sleep(FOREGROUND_WAIT_INTERVAL);
+                let elapsed = sleep_started.elapsed();
+                // A delivered SIGTTIN suspends this thread until SIGCONT. Do
+                // not charge that stopped interval against the fallback timer.
+                deadline += elapsed.saturating_sub(FOREGROUND_WAIT_INTERVAL);
             }
             let pgid = libc::getpid();
             if libc::getpgrp() != pgid && libc::setpgid(0, pgid) == -1 {

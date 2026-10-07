@@ -23,6 +23,7 @@ struct Job {
     state: JobState,
     command: String,
     activity: u64,
+    terminal_modes: Option<libc::termios>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +59,7 @@ impl JobTable {
             },
             command: info.command,
             activity: self.activity_clock,
+            terminal_modes: None,
         });
         self.update_current_previous();
         number
@@ -200,7 +202,173 @@ pub(crate) fn register(shell: &mut Shell) -> Result<Arc<Mutex<JobTable>>, String
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(list(shell, &mut table, &args))
     })?;
+    let foreground_jobs = jobs.clone();
+    shell.register_embedder_builtin("fg", move |shell, argv| {
+        let args = argv
+            .iter()
+            .skip(1)
+            .map(ShellBytes::to_shell_string)
+            .collect::<Vec<_>>();
+        Ok(foreground(shell, &foreground_jobs, &args))
+    })?;
+    let background_jobs = jobs.clone();
+    shell.register_embedder_builtin("bg", move |shell, argv| {
+        let args = argv
+            .iter()
+            .skip(1)
+            .map(ShellBytes::to_shell_string)
+            .collect::<Vec<_>>();
+        Ok(background(shell, &background_jobs, &args))
+    })?;
     Ok(jobs)
+}
+
+fn select_job(
+    table: &JobTable,
+    args: &[String],
+) -> Result<(usize, i32, String, JobState), &'static str> {
+    if args.len() > 1 {
+        return Err("usage: expected at most one job specification");
+    }
+    let spec = args.first().map(String::as_str).unwrap_or("%+");
+    let number = table.resolve(spec)?;
+    let job = table
+        .jobs
+        .iter()
+        .find(|job| job.number == number)
+        .ok_or("no such job")?;
+    Ok((job.number, job.pgid, job.command.clone(), job.state))
+}
+
+fn background(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) -> ExitStatus {
+    let selected = table.lock().unwrap_or_else(|p| p.into_inner());
+    let (number, pgid, command, state) = match select_job(&selected, args) {
+        Ok(job) => job,
+        Err(error) => {
+            shell.write_stderr(format!("bg: {error}\n").as_bytes());
+            return ExitStatus::FAILURE;
+        }
+    };
+    drop(selected);
+    if !matches!(state, JobState::Running | JobState::Stopped)
+        || shell.signal_owned_job(pgid, libc::SIGCONT).is_err()
+    {
+        shell.write_stderr(b"bg: job cannot be continued\n");
+        return ExitStatus::FAILURE;
+    }
+    sync(shell, table);
+    shell.write_stdout(format!("[{number}]+ {command} &\n").as_bytes());
+    ExitStatus::SUCCESS
+}
+
+fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) -> ExitStatus {
+    let selected = table.lock().unwrap_or_else(|p| p.into_inner());
+    let (number, pgid, command, state) = match select_job(&selected, args) {
+        Ok(job) => job,
+        Err(error) => {
+            shell.write_stderr(format!("fg: {error}\n").as_bytes());
+            return ExitStatus::FAILURE;
+        }
+    };
+    drop(selected);
+    let tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        Ok(tty) => tty,
+        Err(_) => {
+            shell.write_stderr(b"fg: no job control\n");
+            return ExitStatus::FAILURE;
+        }
+    };
+    use std::os::fd::AsRawFd;
+    let fd = tty.as_raw_fd();
+    let shell_group = unsafe { libc::getpgrp() };
+    let mut shell_modes = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetpgrp(fd) } != shell_group
+        || unsafe { libc::tcgetattr(fd, &mut shell_modes) } == -1
+    {
+        shell.write_stderr(b"fg: no job control\n");
+        return ExitStatus::FAILURE;
+    }
+    let mut job_modes = table
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .jobs
+        .iter()
+        .find(|job| job.number == number)
+        .and_then(|job| job.terminal_modes);
+    unsafe {
+        libc::tcsetpgrp(fd, pgid);
+    }
+    if let Some(modes) = job_modes.as_ref() {
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSADRAIN, modes);
+        }
+    }
+    if state == JobState::Stopped && shell.signal_owned_job(pgid, libc::SIGCONT).is_err() {
+        unsafe {
+            libc::tcsetpgrp(fd, shell_group);
+            libc::tcsetattr(fd, libc::TCSADRAIN, &shell_modes);
+        }
+        shell.write_stderr(b"fg: job cannot be continued\n");
+        return ExitStatus::FAILURE;
+    }
+    loop {
+        for update in shell.poll_child_jobs() {
+            table
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .apply(update);
+        }
+        let current = table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .jobs
+            .iter()
+            .find(|job| job.number == number)
+            .map(|job| job.state);
+        if !matches!(current, Some(JobState::Running)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let current = table
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .jobs
+        .iter()
+        .find(|job| job.number == number)
+        .map(|job| job.state);
+    if current == Some(JobState::Stopped) {
+        let mut modes = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut modes) } == 0 {
+            job_modes = Some(modes);
+        }
+    }
+    unsafe {
+        libc::tcsetpgrp(fd, shell_group);
+        libc::tcsetattr(fd, libc::TCSADRAIN, &shell_modes);
+    }
+    if current == Some(JobState::Stopped) {
+        if let Some(job) = table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .jobs
+            .iter_mut()
+            .find(|job| job.number == number)
+        {
+            job.terminal_modes = job_modes;
+        }
+        shell.write_stdout(format!("[{number}]+  Stopped  {command}\n").as_bytes());
+        return ExitStatus::from(128 + libc::SIGTSTP);
+    }
+    match current {
+        Some(JobState::Done(status)) => status.into(),
+        Some(JobState::Killed(signal)) => (128 + signal).into(),
+        _ => ExitStatus::FAILURE,
+    }
 }
 
 pub(crate) fn sync(shell: &mut Shell, table: &Arc<Mutex<JobTable>>) {
@@ -247,6 +415,7 @@ fn list(shell: &mut Shell, table: &mut JobTable, args: &[String]) -> ExitStatus 
     };
     let current = table.current;
     let previous = table.previous;
+    let mut reported = Vec::new();
     for job in selected {
         let marker = if Some(job.number) == current {
             "+"
@@ -270,7 +439,12 @@ fn list(shell: &mut Shell, table: &mut JobTable, args: &[String]) -> ExitStatus 
             format!("[{}]{marker} {state}  {}\n", job.number, job.command)
         };
         shell.write_stdout(line.as_bytes());
+        if matches!(job.state, JobState::Done(_) | JobState::Killed(_)) {
+            reported.push(job.number);
+        }
     }
+    table.jobs.retain(|job| !reported.contains(&job.number));
+    table.update_current_previous();
     ExitStatus::SUCCESS
 }
 

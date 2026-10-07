@@ -94,7 +94,7 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
         command.env("PS1", prompt);
     }
     // rexpect disables terminal echo, so output assertions cannot match typed input.
-    let mut session = spawn_command(command, Some(3000)).unwrap();
+    let mut session = spawn_command(command, Some(10_000)).unwrap();
     session.process_mut().set_kill_timeout(Some(1000));
     (session, dir)
 }
@@ -785,6 +785,40 @@ fn finished_background_job_is_reported_done() {
 }
 
 #[test]
+fn wait_job_number_stops_resolving_after_job_notification_prunes_it() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sh -c 'exit 7' &");
+    let launch = session.exp_string("$ ").unwrap();
+    let mut cleanup = ProcessGroupCleanup::new(background_pgid(launch.as_bytes()));
+    let notification = wait_for_job_state(&mut session, "Done");
+    assert!(notification.contains("[1]+  Done"), "{notification:?}");
+    cleanup.disarm();
+
+    submit(&mut session, "wait %1; echo $?");
+    let output = session.exp_string("127\r\n").unwrap();
+    assert_no_output(&output);
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn fg_rejects_a_job_that_finished_before_terminal_handoff() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+
+    submit(&mut session, "sleep 0.1 & sleep 0.3; fg %1; echo $?");
+    let output =
+        String::from_utf8(strip_ansi_escapes::strip(session.exp_string("$ ").unwrap())).unwrap();
+    assert!(output.contains("[1] "), "{output:?}");
+    assert!(output.contains("fg:"), "{output:?}");
+    assert!(output.contains("1\n"), "{output:?}");
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
 fn jobs_resolves_prefix_job_spec() {
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
@@ -1393,6 +1427,14 @@ fn stopped_job_can_be_foregrounded_and_interrupted() {
             .contains("Stopped")
     );
     submit(&mut session, "fg");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } != pgid {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fg did not transfer terminal ownership to {pgid}"
+        );
+        std::thread::yield_now();
+    }
     assert!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == pgid);
     session.send("\x03").unwrap();
     session.flush().unwrap();

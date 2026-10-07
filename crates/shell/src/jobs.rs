@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::io;
+use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 
 use epsh::error::ExitStatus;
@@ -196,6 +198,14 @@ impl JobTable {
         }
         Ok(selected)
     }
+
+    fn wait_members(&self, spec: &str) -> Option<Vec<i32>> {
+        let number = self.resolve(spec).ok()?;
+        self.jobs
+            .iter()
+            .find(|job| job.number == number)
+            .map(|job| job.members.clone())
+    }
 }
 
 fn result_state(job: &Job) -> JobState {
@@ -220,6 +230,13 @@ pub(crate) fn register(shell: &mut Shell) -> Result<Arc<Mutex<JobTable>>, String
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let number = table.add(info.clone());
         format!("[{number}] {}\n", info.pgid).into_bytes()
+    }));
+    let wait_jobs = jobs.clone();
+    shell.set_wait_job_spec_resolver(Box::new(move |spec| {
+        wait_jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .wait_members(spec)
     }));
     let exit_jobs = jobs.clone();
     shell.set_repl_exit_handler(Box::new(move |shell, _status, confirmed| {
@@ -317,6 +334,12 @@ fn background(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
 }
 
 fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) -> ExitStatus {
+    for update in shell.poll_child_jobs() {
+        table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .apply(update);
+    }
     let selected = table.lock().unwrap_or_else(|p| p.into_inner());
     let (number, pgid, _command, state) = match select_job(&selected, args) {
         Ok(job) => job,
@@ -326,6 +349,10 @@ fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
         }
     };
     drop(selected);
+    if !matches!(state, JobState::Running | JobState::Stopped) {
+        shell.write_stderr(b"fg: job is already completed\n");
+        return ExitStatus::FAILURE;
+    }
     let tty = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -354,18 +381,17 @@ fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
         .iter()
         .find(|job| job.number == number)
         .and_then(|job| job.terminal_modes);
-    unsafe {
-        libc::tcsetpgrp(fd, pgid);
-    }
-    if let Some(modes) = job_modes.as_ref() {
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSADRAIN, modes);
+    if let Err(error) = give_terminal(fd, pgid, job_modes.as_ref()) {
+        let restore = restore_terminal(fd, shell_group, &shell_modes);
+        shell.write_stderr(format!("fg: cannot give terminal to job: {error}\n").as_bytes());
+        if let Err(error) = restore {
+            shell.write_stderr(format!("fg: cannot restore shell terminal: {error}\n").as_bytes());
         }
+        return ExitStatus::FAILURE;
     }
     if state == JobState::Stopped && shell.signal_owned_job(pgid, libc::SIGCONT).is_err() {
-        unsafe {
-            libc::tcsetpgrp(fd, shell_group);
-            libc::tcsetattr(fd, libc::TCSADRAIN, &shell_modes);
+        if let Err(error) = restore_terminal(fd, shell_group, &shell_modes) {
+            shell.write_stderr(format!("fg: cannot restore shell terminal: {error}\n").as_bytes());
         }
         shell.write_stderr(b"fg: job cannot be continued\n");
         return ExitStatus::FAILURE;
@@ -402,9 +428,9 @@ fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
             job_modes = Some(modes);
         }
     }
-    unsafe {
-        libc::tcsetpgrp(fd, shell_group);
-        libc::tcsetattr(fd, libc::TCSADRAIN, &shell_modes);
+    if let Err(error) = restore_terminal(fd, shell_group, &shell_modes) {
+        shell.write_stderr(format!("fg: cannot restore shell terminal: {error}\n").as_bytes());
+        return ExitStatus::FAILURE;
     }
     if current == Some(JobState::Stopped) {
         if let Some(job) = table
@@ -422,6 +448,33 @@ fn foreground(shell: &mut Shell, table: &Arc<Mutex<JobTable>>, args: &[String]) 
         Some(JobState::Done(status)) => status.into(),
         Some(JobState::Killed(signal)) => (128 + signal).into(),
         _ => ExitStatus::FAILURE,
+    }
+}
+
+fn give_terminal(fd: RawFd, pgid: i32, modes: Option<&libc::termios>) -> io::Result<()> {
+    // SAFETY: the descriptor is the shell's controlling terminal.
+    unsafe {
+        if libc::tcsetpgrp(fd, pgid) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Some(modes) = modes
+            && libc::tcsetattr(fd, libc::TCSADRAIN, modes) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn restore_terminal(fd: RawFd, pgid: i32, modes: &libc::termios) -> io::Result<()> {
+    // Attempt both restorations so a failed pgrp handback does not skip modes.
+    let group_result = unsafe { libc::tcsetpgrp(fd, pgid) };
+    let group_error = (group_result == -1).then(io::Error::last_os_error);
+    let modes_result = unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, modes) };
+    let modes_error = (modes_result == -1).then(io::Error::last_os_error);
+    match (group_error, modes_error) {
+        (Some(error), _) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
     }
 }
 
@@ -444,6 +497,7 @@ fn report_notifications(shell: &mut Shell, table: &mut JobTable) {
     let current = table.current;
     let previous = table.previous;
     let mut completed = Vec::new();
+    let mut completed_pids = Vec::new();
     for job in &mut table.jobs {
         if !job.notification_pending {
             continue;
@@ -479,10 +533,12 @@ fn report_notifications(shell: &mut Shell, table: &mut JobTable) {
         }
         if matches!(job.state, JobState::Done(_) | JobState::Killed(_)) {
             completed.push(job.number);
+            completed_pids.extend(job.members.iter().copied());
         }
     }
     table.jobs.retain(|job| !completed.contains(&job.number));
     table.update_current_previous();
+    shell.discard_reaped_job_statuses(&completed_pids);
 }
 
 fn list(shell: &mut Shell, table: &mut JobTable, args: &[String]) -> ExitStatus {
@@ -595,5 +651,44 @@ mod tests {
 
         assert_eq!(table.resolve("%+"), Ok(1));
         assert_eq!(table.resolve("%-"), Ok(2));
+    }
+
+    #[test]
+    fn wait_job_specs_use_job_table_numbering() {
+        let mut table = JobTable::default();
+        table.add(info(101, "sleep 1"));
+        table.add(info(102, "sleep 2"));
+
+        assert_eq!(table.wait_members("%1"), Some(vec![101]));
+        assert_eq!(table.wait_members("%2"), Some(vec![102]));
+        assert_eq!(table.wait_members("%sleep"), None);
+    }
+
+    #[test]
+    fn completed_job_notification_prunes_job_table_entry() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut shell = Shell::builder().stdout_sink(output.clone()).build();
+        let mut table = JobTable::default();
+        table.add(info(101, "sleep 1"));
+        table.apply(ChildJobUpdate {
+            pgid: 101,
+            pid: 101,
+            status: ChildJobStatus::Exited(7),
+        });
+        report_notifications(&mut shell, &mut table);
+
+        assert!(table.jobs.is_empty());
+        assert!(
+            String::from_utf8(output.lock().unwrap().clone())
+                .unwrap()
+                .contains("Done")
+        );
+    }
+
+    #[test]
+    fn terminal_handoff_helpers_return_bad_descriptor_errors() {
+        let modes = unsafe { std::mem::zeroed::<libc::termios>() };
+        assert!(give_terminal(-1, 123, None).is_err());
+        assert!(restore_terminal(-1, 123, &modes).is_err());
     }
 }

@@ -76,7 +76,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - R2: route atomics readability (`eval.rs:374-377`, `redirect.rs:60-69`); failed dup routes to real fd (`redirect.rs:288-295`).
 - [x] **T2d — Flaky PTY test `pipeline_ctrl_z_is_retained_and_cleaned_up_by_test`** (codex-impl)
   - Failed 4 of 11 full workspace runs in Codex's T2c verification (`crates/shell/tests/repl.rs:636`). Find the race and make it deterministic.
-- [ ] **T2e — `make ci` hang with a terminal stdin** (investigate)
+- [x] **T2e — `make ci` hang with a terminal stdin** (investigate) — hang not reproduced; real defect fixed in `8794c70`: isolated test children could open the caller's /dev/tty despite null stdin -> `setsid`; 3/3 runs with PTY stdin, 3/3 with /dev/null. `b073d39` reformatted a848e3f (orchestrator committed it without rustfmt; make ci fmt check had failed).
   - Codex reported `make ci` (run without `< /dev/null`, from its interactive terminal) hanging ~5 min in the workspace test phase; orchestrator could not reproduce with stdin=/dev/null (3/3 workspace runs ~6 s, make ci 7 s). Hypothesis: a test inherits a terminal stdin and blocks. Reproduce under a PTY and make the suite independent of the caller's stdin.
 - [x] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
@@ -107,7 +107,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Commands (builtins, functions, embedder builtins, PATH executables), file paths (quoting spaces), `$VAR` names.
 - [x] **T7 — Hints and syntax highlighting** (codex-impl)
   - History-based ghost-text hints; highlighting via the epsh lexer (commands found/not found, strings, operators).
-- [ ] **T6c — Completion follow-ups from the T5-T7 review** (codex-impl, after T2e)
+- [ ] **T6c — Completion follow-ups from the T5-T7 review** (codex-impl, RUNNING)
   - R3-path-symlink-executables-dropped: `executable_names` uses `DirEntry::metadata`, which does not follow symlinks, so symlinked executables in PATH (python3, alternatives, Homebrew/Nix/asdf shims) never complete and — through the shared cache — are highlighted as unknown (`completion.rs:165-168`).
   - R3-path-prefixed-command-completion-empty: a command-position prefix containing `/` (`./scr<Tab>`, `/usr/bin/py<Tab>`) offers nothing; it must fall back to executable file completion (`completion.rs:132-136`).
   - Suggestions: highlighter byte/char offset unit test (`highlighter.rs:32-37`); a terminal write failure of integration marks should not end the REPL (`repl.rs:230-231`); per-prompt PATH scan cost (`repl.rs:225`).

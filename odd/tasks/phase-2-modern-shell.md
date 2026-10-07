@@ -97,7 +97,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - R3-launch-notice-uses-redirected-stdout: the `[n] pgid` launch notice is written through the current stdout route, so `{ sleep 1 & } > file` puts it into the file (`eval.rs:1253-1259`); job notices belong on the terminal (bash writes them to stderr/tty).
   - R3-fg-restop-notification-unproved: a job resumed with `fg` and stopped again must print `[n]+  Stopped` (`jobs.rs:321`); add the PTY test.
   - Suggestion: test that the stopped-jobs exit warning resets after a non-exit command (`eval.rs:1730`).
-- [ ] **T2f — Systematic PTY test reliability** (codex-impl, running)
+- [x] **T2f — Systematic PTY test reliability** (codex-impl)
   - PTY tests time out intermittently under parallel load (Codex T3c run: `foreground_ctrl_z_is_reported_and_cleaned_up_by_test` 1/5; orchestrator T4b runs under review load). Serialize PTY tests in the repl binary, centralize generous timeouts (env-overridable), remove remaining fixed sleeps; prove with 10 workspace runs under an artificial CPU hog.
 - [ ] **T5 — Shell integration marks** (codex-impl)
   - Emit OSC 133 A/B/C/D (prompt start, command start, output start, command end with exit code) and OSC 7 (cwd as file:// URL) when interactive; opt-out variable.
@@ -144,5 +144,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 
 - T3c (`1533745` epsh: no fabricated waitpid statuses — EINTR retry, ECHILD not-found, other errors failure; `e0ea0ac` shell: notifications keep the cached status so `wait $!` after `Done` returns the real status, verified against bash PTY = 7; exact fg-rejection assertion). Codex honestly reported a parallel PTY flake (1/5) -> T2f.
 
+- T2f (`58076a7`): process-wide mutex serializes the 78 PTY tests, one 20 s timeout (`SO1SH_TEST_TIMEOUT_SECS`), state-synchronized polling. Codex 10/10 and orchestrator 3/3 workspace runs green with CPU hogs; repl binary ~6 s -> ~50 s (accepted tradeoff).
+  Native consolidated review of `f377798..58076a7` (T4b, T3c, T2f): medium, user granted, approved with suggestions only (no WARNINGs), acknowledged. Suggestion: `yield_now` spin polling under load (`repl.rs:1112`).
+
 ## Progress / Next step
-- T2f running on `codex-impl`; review of `f377798..e0ea0ac` when due; then T2e, T5, T6, T7, T8.
+- T5 (OSC 133 / OSC 7) running on `codex-impl`; then T6, T7, T2e, T8.

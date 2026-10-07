@@ -40,12 +40,23 @@ fn isolated_test_capture(name: &str) -> Option<std::process::Output> {
     if std::env::var("EPSH_EMBEDDING_CHILD").as_deref() == Ok(name) {
         return None;
     }
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--exact", name, "--nocapture"])
         .env("EPSH_EMBEDDING_CHILD", name)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
+        .stdin(std::process::Stdio::null());
+    // SAFETY: setsid is async-signal-safe and detaches this isolated test
+    // process from the caller's controlling terminal before it can run tests.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().unwrap();
     check_child_test(name, &out).unwrap();
     Some(out)
 }
@@ -67,6 +78,20 @@ mod hermeticity {
         assert!(String::from_utf8_lossy(&out.stdout).contains("running 0 tests"));
         let error = check_child_test(name, &out).unwrap_err();
         assert!(error.contains("exactly one test"), "{error}");
+    }
+
+    #[test]
+    fn isolated_children_are_detached_from_controlling_terminal() {
+        if isolated_test("hermeticity::isolated_children_are_detached_from_controlling_terminal") {
+            return;
+        }
+        assert!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open("/dev/tty")
+                .is_err(),
+            "isolated test child retained the caller's controlling terminal"
+        );
     }
 
     #[test]
@@ -1774,9 +1799,9 @@ mod interactive_wait {
         if isolated_test("interactive_wait::cancel_and_timeout_never_signal_the_shell_group") {
             return;
         }
-        // Confine the baseline SIGKILL to this private test and its children.
-        assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+        // The isolated test process is its own session and process-group leader.
         let group = unsafe { libc::getpgrp() };
+        assert_eq!(group, std::process::id() as i32);
         for timeout in [false, true] {
             let temp = tempdir().unwrap();
             let release_handler = temp.path().join("release-handler");
@@ -1784,6 +1809,7 @@ mod interactive_wait {
             let mut host = std::process::Command::new("/bin/sh")
                 .env_clear()
                 .args(["-c", "/bin/sleep 0.1; exit 7"])
+                .stdin(std::process::Stdio::null())
                 .spawn()
                 .unwrap();
             let mut shell = Shell::builder()

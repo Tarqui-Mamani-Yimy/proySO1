@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::io;
+use std::io::{self, Write};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -221,14 +221,19 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
             Err(error) => eprintln!("so1sh: history: {error}"),
         }
     }
+    let mut integration_failure_reported = false;
     loop {
         completion_state.refresh(shell);
         if shell_integration_enabled {
             let terminal = terminal
                 .as_ref()
                 .expect("enabled integration has a terminal");
-            terminal.report_cwd(shell.cwd())?;
-            terminal.write_shell_integration(OSC133_PROMPT_START)?;
+            if let Err(error) = terminal.report_cwd(shell.cwd()) {
+                report_integration_error(error, &mut integration_failure_reported);
+            }
+            if let Err(error) = terminal.write_shell_integration(OSC133_PROMPT_START) {
+                report_integration_error(error, &mut integration_failure_reported);
+            }
             marker_state.begin_line();
         }
         match editor.read_line(&ShellPrompt::from_shell(shell))? {
@@ -240,11 +245,13 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                 if let Some(terminal) = &terminal {
                     terminal.reclaim()?;
                 }
-                if shell_integration_enabled {
-                    terminal
+                if shell_integration_enabled
+                    && let Err(error) = terminal
                         .as_ref()
                         .expect("enabled integration has a terminal")
-                        .write_shell_integration(OSC133_COMMAND_EXECUTED)?;
+                        .write_shell_integration(OSC133_COMMAND_EXECUTED)
+                {
+                    report_integration_error(error, &mut integration_failure_reported);
                 }
                 let result = shell.eval_repl_line(&source);
                 crate::jobs::sync(shell, &jobs);
@@ -256,10 +263,13 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                         ControlFlow::Continue(status) | ControlFlow::Break(status) => status.code(),
                     };
                     let finished = format!("\x1b]133;D;{status}\x1b\\");
-                    terminal
+                    if let Err(error) = terminal
                         .as_ref()
                         .expect("enabled integration has a terminal")
-                        .write_shell_integration(finished.as_bytes())?;
+                        .write_shell_integration(finished.as_bytes())
+                    {
+                        report_integration_error(error, &mut integration_failure_reported);
+                    }
                 }
                 if let ControlFlow::Break(status) = result {
                     return Ok(status.code());
@@ -276,10 +286,33 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     }
 }
 
+fn mark_integration_failure_reported(reported: &mut bool) -> bool {
+    if *reported {
+        false
+    } else {
+        *reported = true;
+        true
+    }
+}
+
+fn report_integration_error(error: io::Error, reported: &mut bool) {
+    if mark_integration_failure_reported(reported) {
+        let _ = writeln!(io::stderr().lock(), "so1sh: shell integration: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use epsh::shell_bytes::ShellBytes;
+
+    #[test]
+    fn shell_integration_write_failures_are_reported_once() {
+        let mut reported = false;
+        assert!(mark_integration_failure_reported(&mut reported));
+        assert!(reported);
+        assert!(!mark_integration_failure_reported(&mut reported));
+    }
 
     #[test]
     fn unicode_prompt_replacement_does_not_change_engine_bytes() {

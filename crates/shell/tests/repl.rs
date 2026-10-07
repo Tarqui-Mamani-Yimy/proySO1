@@ -681,8 +681,15 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
         cleanup.disarm();
     }
     jobs.0.clear(); // Never signal an already reaped PID that could be reused.
-    submit(&mut session, "echo after");
-    let after = session.exp_string("after\r\n").unwrap();
+    let after = if status == 148 {
+        // A job notification is asynchronous stderr output; avoid treating its
+        // newline as the command editor's submission boundary.
+        session.send_line("echo after").unwrap();
+        session.exp_string("after\r\n").unwrap()
+    } else {
+        submit(&mut session, "echo after");
+        session.exp_string("after\r\n").unwrap()
+    };
     if status != 148 {
         assert_no_output(&after);
     }
@@ -811,9 +818,40 @@ fn fg_rejects_a_job_that_finished_before_terminal_handoff() {
     submit(&mut session, "sleep 0.1 & sleep 0.3; fg %1; echo $?");
     let output =
         String::from_utf8(strip_ansi_escapes::strip(session.exp_string("$ ").unwrap())).unwrap();
-    assert!(output.contains("[1] "), "{output:?}");
-    assert!(output.contains("fg:"), "{output:?}");
-    assert!(output.contains("1\n"), "{output:?}");
+    let lines = output.lines().collect::<Vec<_>>();
+    assert!(
+        lines.contains(&"fg: job is already completed"),
+        "{output:?}"
+    );
+    assert!(lines.contains(&"1"), "{output:?}");
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn wait_dollar_bang_keeps_status_after_done_notification() {
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "sh -c \"exit 7\" &");
+    let mut output = session.exp_string("$ ").unwrap();
+    let pgid = background_pgid(output.as_bytes());
+    let mut cleanup = ProcessGroupCleanup::new(pgid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !output.contains("Exit 7") {
+        submit(&mut session, "");
+        output = session.exp_string("$ ").unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Done notification did not arrive: {output:?}"
+        );
+    }
+    assert!(output.contains("[1]+  Done"), "{output:?}");
+    cleanup.disarm();
+
+    submit(&mut session, "wait $!; echo $?");
+    let status = session.exp_string("7\r\n").unwrap();
+    assert_no_output(&status);
+    session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");
     exited(&mut session, 0);
 }

@@ -497,7 +497,6 @@ fn report_notifications(shell: &mut Shell, table: &mut JobTable) {
     let current = table.current;
     let previous = table.previous;
     let mut completed = Vec::new();
-    let mut completed_pids = Vec::new();
     for job in &mut table.jobs {
         if !job.notification_pending {
             continue;
@@ -533,12 +532,10 @@ fn report_notifications(shell: &mut Shell, table: &mut JobTable) {
         }
         if matches!(job.state, JobState::Done(_) | JobState::Killed(_)) {
             completed.push(job.number);
-            completed_pids.extend(job.members.iter().copied());
         }
     }
     table.jobs.retain(|job| !completed.contains(&job.number));
     table.update_current_previous();
-    shell.discard_reaped_job_statuses(&completed_pids);
 }
 
 fn list(shell: &mut Shell, table: &mut JobTable, args: &[String]) -> ExitStatus {

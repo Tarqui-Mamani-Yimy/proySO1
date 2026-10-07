@@ -764,22 +764,47 @@ impl Shell {
             for pid in self.background_pids.clone() {
                 self.wait_background_pid(pid);
             }
+            self.reaped_job_statuses.clear();
             return ExitStatus::SUCCESS;
         }
 
         let mut status = ExitStatus::NOT_FOUND;
         for arg in args.iter().skip(1) {
-            status = match arg.parse::<i32>() {
-                Ok(pid) if pid > 0 && arg.bytes().all(|b| b.is_ascii_digit()) => {
-                    self.wait_background_pid(pid)
+            status = if let Some(number) = arg
+                .strip_prefix('%')
+                .and_then(|number| number.parse::<usize>().ok())
+            {
+                let pids = number
+                    .checked_sub(1)
+                    .and_then(|index| self.owned_job_history.get(index))
+                    .map(|(_, members)| members.clone());
+                match pids {
+                    Some(pids) if !pids.is_empty() => {
+                        pids.into_iter().fold(ExitStatus::SUCCESS, |_, pid| {
+                            self.reaped_job_statuses
+                                .remove(&pid)
+                                .unwrap_or_else(|| self.wait_background_pid(pid))
+                        })
+                    }
+                    _ => ExitStatus::NOT_FOUND,
                 }
-                _ => ExitStatus::NOT_FOUND,
+            } else {
+                match arg.parse::<i32>() {
+                    Ok(pid) if pid > 0 && arg.bytes().all(|b| b.is_ascii_digit()) => {
+                        self.wait_background_pid(pid)
+                    }
+                    _ => ExitStatus::NOT_FOUND,
+                }
             };
         }
         status
     }
 
     fn wait_background_pid(&mut self, pid: i32) -> ExitStatus {
+        if let Some(status) = self.reaped_job_statuses.remove(&pid) {
+            self.background_pids.retain(|&job| job != pid);
+            return status;
+        }
         let Some(index) = self.background_pids.iter().position(|&job| job == pid) else {
             return ExitStatus::NOT_FOUND;
         };

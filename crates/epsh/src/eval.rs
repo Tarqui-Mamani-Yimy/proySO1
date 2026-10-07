@@ -263,9 +263,9 @@ pub struct ChildJobUpdate {
     pub status: ChildJobStatus,
 }
 
-struct OwnedJob {
-    pgid: i32,
-    members: Vec<i32>,
+pub(crate) struct OwnedJob {
+    pub(crate) pgid: i32,
+    pub(crate) members: Vec<i32>,
 }
 
 struct RegisteredEmbedderBuiltin {
@@ -384,8 +384,11 @@ pub struct Shell {
     pub(crate) child_pids: Vec<i32>,
     /// Unconsumed asynchronous jobs owned by this shell execution environment.
     pub(crate) background_pids: Vec<i32>,
+    /// Wait statuses reaped by the embedder-facing job poller, retained until wait consumes them.
+    pub(crate) reaped_job_statuses: FxHashMap<i32, ExitStatus>,
     stopped_jobs: Vec<StoppedJob>,
-    owned_jobs: Vec<OwnedJob>,
+    pub(crate) owned_jobs: Vec<OwnedJob>,
+    pub(crate) owned_job_history: Vec<(i32, Vec<i32>)>,
     pending_job_infos: Vec<ChildJobInfo>,
     pending_job_updates: Vec<ChildJobUpdate>,
     current_command_text: String,
@@ -737,8 +740,10 @@ impl ShellBuilder {
             stderr_sink_route: Arc::new(AtomicU8::new(SINK_ROUTE_STDERR)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
+            reaped_job_statuses: FxHashMap::default(),
             stopped_jobs: Vec::new(),
             owned_jobs: Vec::new(),
+            owned_job_history: Vec::new(),
             pending_job_infos: Vec::new(),
             pending_job_updates: Vec::new(),
             current_command_text: String::new(),
@@ -789,8 +794,10 @@ impl Shell {
             stderr_sink_route: Arc::new(AtomicU8::new(SINK_ROUTE_STDERR)),
             child_pids: Vec::new(),
             background_pids: Vec::new(),
+            reaped_job_statuses: FxHashMap::default(),
             stopped_jobs: Vec::new(),
             owned_jobs: Vec::new(),
+            owned_job_history: Vec::new(),
             pending_job_infos: Vec::new(),
             pending_job_updates: Vec::new(),
             current_command_text: String::new(),
@@ -1170,6 +1177,24 @@ impl Shell {
     }
 
     fn track_owned_job(&mut self, pgid: i32, pids: &[i32], state: ChildJobState) {
+        if let Some((_, members)) = self
+            .owned_job_history
+            .iter_mut()
+            .find(|(group, _)| *group == pgid)
+        {
+            for &pid in pids {
+                if !members.contains(&pid) {
+                    members.push(pid);
+                }
+            }
+        } else {
+            self.owned_job_history.push((pgid, pids.to_vec()));
+        }
+        for &pid in pids {
+            if self.child_pids.contains(&pid) && !self.background_pids.contains(&pid) {
+                self.background_pids.push(pid);
+            }
+        }
         if let Some(job) = self.owned_jobs.iter_mut().find(|job| job.pgid == pgid) {
             for &pid in pids {
                 if self.child_pids.contains(&pid) && !job.members.contains(&pid) {
@@ -1221,7 +1246,20 @@ impl Shell {
             status,
             ChildJobStatus::Exited(_) | ChildJobStatus::Signaled(_)
         ) {
+            let exit_status = match status {
+                ChildJobStatus::Exited(code) => code.into(),
+                ChildJobStatus::Signaled(signal) => (128 + signal).into(),
+                _ => unreachable!(),
+            };
+            self.reaped_job_statuses.insert(pid, exit_status);
             job.members.retain(|member| *member != pid);
+            for stopped in &mut self.stopped_jobs {
+                if stopped.pgid == pgid {
+                    stopped.members.retain(|member| *member != pid);
+                }
+            }
+            self.stopped_jobs
+                .retain(|stopped| stopped.pgid != pgid || !stopped.members.is_empty());
         }
         self.owned_jobs.retain(|job| !job.members.is_empty());
         true
@@ -1291,6 +1329,36 @@ impl Shell {
             }
         }
         std::mem::take(&mut self.pending_job_updates)
+    }
+
+    /// Send a job-control signal only to a process group owned by this shell.
+    pub fn signal_owned_job(&mut self, pgid: i32, signal: i32) -> std::io::Result<()> {
+        if !self
+            .owned_jobs
+            .iter()
+            .any(|job| job.pgid == pgid && !job.members.is_empty())
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        // SAFETY: the exact process group was registered by this Shell.
+        if unsafe { libc::kill(-pgid, signal) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if signal == libc::SIGCONT {
+            self.pending_job_updates.extend(
+                self.owned_jobs
+                    .iter()
+                    .find(|job| job.pgid == pgid)
+                    .into_iter()
+                    .flat_map(|job| job.members.iter().copied())
+                    .map(|pid| ChildJobUpdate {
+                        pgid,
+                        pid,
+                        status: ChildJobStatus::Continued,
+                    }),
+            );
+        }
+        Ok(())
     }
 
     /// Terminate and reap stopped jobs created by this engine, never host jobs.
@@ -2883,6 +2951,27 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_returns_status_after_job_poller_reaps_child() {
+        let mut shell = Shell::builder().env_clear().build();
+        assert_eq!(shell.run_script("(exit 7) & p=$!"), 0);
+        let pid = shell.get_var("p").unwrap().parse::<i32>().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reaped = false;
+        while std::time::Instant::now() < deadline {
+            let updates = shell.poll_child_jobs();
+            if updates.iter().any(|update| {
+                update.pid == pid && matches!(update.status, ChildJobStatus::Exited(7))
+            }) {
+                reaped = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(reaped, "job poller did not report the child's exit");
+        assert_eq!(shell.run_script(&format!("wait {pid}")), 7);
+    }
 
     #[test]
     fn run_echo() {

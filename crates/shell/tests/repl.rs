@@ -130,12 +130,20 @@ fn session() -> (PtySession, TempDir) {
 }
 
 fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
+    session_with_term(args, prompt, "dumb")
+}
+
+fn session_with_term(
+    args: &[&str],
+    prompt: Option<&str>,
+    term: &str,
+) -> (PtySession, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("TERM", "dumb")
+        .env("TERM", term)
         .env("SO1SH_SHELL_INTEGRATION", "0")
         .env("SO1SH_HIGHLIGHT", "0")
         .env("HOME", dir.path())
@@ -2314,7 +2322,7 @@ fn tab_completes_a_unique_builtin_command() {
 #[test]
 fn tab_lists_multiple_file_matches() {
     let _pty_test_guard = serialize_pty_test();
-    let (mut session, dir) = session();
+    let (mut session, dir) = session_with_term(&[], None, "xterm-256color");
     std::fs::write(dir.path().join("multi-first.txt"), "").unwrap();
     std::fs::write(dir.path().join("multi-second.txt"), "").unwrap();
 
@@ -2322,8 +2330,11 @@ fn tab_lists_multiple_file_matches() {
     session.send("cat multi-").unwrap();
     session.send("\t").unwrap();
     session.flush().unwrap();
-    session.exp_string("MULTI-FIRST.TXT").unwrap();
-    session.exp_string("multi-second.txt").unwrap();
+    let mut menu_output = session.exp_string("second.txt").unwrap();
+    menu_output.push_str("second.txt");
+    let menu = String::from_utf8(strip_ansi_escapes::strip(menu_output)).unwrap();
+    assert!(menu.contains("multi-first.txt"), "menu: {menu:?}");
+    assert!(menu.contains("multi-second.txt"), "menu: {menu:?}");
     session.send_control('c').unwrap();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");

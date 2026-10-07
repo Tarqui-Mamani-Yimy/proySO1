@@ -1631,7 +1631,7 @@ impl Shell {
         status
     }
 
-    /// Discard cached statuses after a frontend has reported a completed job.
+    /// Discard cached statuses when they should no longer be available to `wait`.
     pub fn discard_reaped_job_statuses(&mut self, pids: &[i32]) {
         for &pid in pids {
             self.reaped_job_statuses.remove(&pid);

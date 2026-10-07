@@ -813,7 +813,6 @@ impl Shell {
         let Some(index) = self.background_pids.iter().position(|&job| job == pid) else {
             return ExitStatus::NOT_FOUND;
         };
-        self.background_pids.remove(index);
         let pgid = self
             .owned_job_history
             .iter()
@@ -830,9 +829,16 @@ impl Shell {
                     break (ExitStatus::from_wait(raw), raw);
                 }
                 Err(rustix::io::Errno::INTR) => continue,
-                _ => break (ExitStatus::NOT_FOUND, 0),
+                Err(rustix::io::Errno::CHILD) => {
+                    self.background_pids.remove(index);
+                    self.child_pids.retain(|&child| child != pid);
+                    return ExitStatus::NOT_FOUND;
+                }
+                Err(_) => return ExitStatus::FAILURE,
+                Ok(None) => continue,
             }
         };
+        self.background_pids.remove(index);
         self.child_pids.retain(|&child| child != pid);
         if let Some(pgid) = pgid {
             self.record_owned_wait_status(pgid, pid, raw_status);
@@ -1334,6 +1340,25 @@ mod wait_job_status_tests {
         assert!(shell.background_pids.contains(&4242));
         assert!(!shell.background_pids.contains(&5252));
         assert!(shell.reaped_job_statuses.contains_key(&4242));
+    }
+
+    #[test]
+    fn waitpid_echild_does_not_fabricate_success_for_owned_pid() {
+        let pid = i32::MAX;
+        let mut shell = Shell::builder().env_clear().build();
+        shell.child_pids.push(pid);
+        shell.background_pids.push(pid);
+        shell.owned_job_history.push((pid, vec![pid]));
+        shell.owned_jobs.push(crate::eval::OwnedJob {
+            pgid: pid,
+            members: vec![pid],
+        });
+
+        let status = shell.wait_background_pid(pid);
+
+        assert_eq!(status, ExitStatus::NOT_FOUND);
+        assert!(shell.poll_child_jobs().is_empty());
+        assert!(!shell.reaped_job_statuses.contains_key(&pid));
     }
 }
 

@@ -133,11 +133,7 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
     session_with_term(args, prompt, "dumb")
 }
 
-fn session_with_term(
-    args: &[&str],
-    prompt: Option<&str>,
-    term: &str,
-) -> (PtySession, TempDir) {
+fn session_with_term(args: &[&str], prompt: Option<&str>, term: &str) -> (PtySession, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command

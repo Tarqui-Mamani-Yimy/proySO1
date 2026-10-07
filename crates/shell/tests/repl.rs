@@ -2,7 +2,56 @@ use std::process::Command;
 
 use rexpect::process::WaitStatus;
 use rexpect::session::{PtySession, spawn_command};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
+
+#[test]
+fn pty_timeout_override_is_respected() {
+    let _pty_test_guard = serialize_pty_test();
+    assert_eq!(
+        pty_timeout_from_override(Some("17")),
+        std::time::Duration::from_secs(17)
+    );
+    for value in [Some("invalid"), Some("0"), None] {
+        assert_eq!(
+            pty_timeout_from_override(value),
+            std::time::Duration::from_secs(DEFAULT_PTY_TIMEOUT_SECS)
+        );
+    }
+}
+
+const DEFAULT_PTY_TIMEOUT_SECS: u64 = 20;
+static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn pty_timeout_from_override(value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&seconds| seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_PTY_TIMEOUT_SECS))
+}
+
+fn pty_test_timeout() -> std::time::Duration {
+    pty_timeout_from_override(std::env::var("SO1SH_TEST_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn pty_deadline() -> std::time::Instant {
+    std::time::Instant::now() + pty_test_timeout()
+}
+
+fn serialize_pty_test() -> MutexGuard<'static, ()> {
+    PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn spawn_pty(command: Command) -> PtySession {
+    let timeout = pty_test_timeout();
+    let millis = timeout.as_millis().min(u64::MAX as u128) as u64;
+    let mut session = spawn_command(command, Some(millis)).unwrap();
+    session.process_mut().set_kill_timeout(Some(millis));
+    session
+}
 
 struct ProcessGroupCleanup(Option<libc::pid_t>);
 
@@ -43,7 +92,7 @@ impl Drop for ProcessGroupCleanup {
 }
 
 fn wait_for_process_group(pids: &[i32], pgid: i32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     loop {
         let joined = pids
             .iter()
@@ -60,7 +109,7 @@ fn wait_for_process_group(pids: &[i32], pgid: i32) {
 }
 
 fn wait_for_job_state(session: &mut PtySession, expected: &str) -> String {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     loop {
         submit(session, "jobs");
         let output = session.exp_string("$ ").unwrap();
@@ -94,8 +143,7 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
         command.env("PS1", prompt);
     }
     // rexpect disables terminal echo, so output assertions cannot match typed input.
-    let mut session = spawn_command(command, Some(10_000)).unwrap();
-    session.process_mut().set_kill_timeout(Some(1000));
+    let session = spawn_pty(command);
     (session, dir)
 }
 
@@ -118,6 +166,7 @@ fn exited(session: &mut PtySession, code: i32) {
 
 #[test]
 fn echo_then_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "echo hi");
@@ -129,6 +178,7 @@ fn echo_then_prompt() {
 
 #[test]
 fn variables_persist_across_lines() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "x=5");
@@ -142,6 +192,7 @@ fn variables_persist_across_lines() {
 
 #[test]
 fn exit_with_explicit_status() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit 3");
@@ -150,6 +201,7 @@ fn exit_with_explicit_status() {
 
 #[test]
 fn control_d_exits_successfully() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     session.send_control('d').unwrap();
@@ -158,6 +210,7 @@ fn control_d_exits_successfully() {
 
 #[test]
 fn cwd_and_functions_persist_across_lines() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, dir) = session();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
     session.exp_string("$ ").unwrap();
@@ -176,6 +229,7 @@ fn cwd_and_functions_persist_across_lines() {
 
 #[test]
 fn previous_status_and_implicit_exit() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "false");
@@ -191,6 +245,7 @@ fn previous_status_and_implicit_exit() {
 
 #[test]
 fn eof_preserves_status_and_defers_exit_trap() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "trap 'echo goodbye' EXIT");
@@ -205,6 +260,7 @@ fn eof_preserves_status_and_defers_exit_trap() {
 
 #[test]
 fn syntax_error_updates_status_and_keeps_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "fi");
@@ -219,6 +275,7 @@ fn syntax_error_updates_status_and_keeps_prompt() {
 
 #[test]
 fn prompt_can_change_and_nested_exit_is_honored() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "PS1='custom> '");
@@ -236,6 +293,7 @@ fn prompt_can_change_and_nested_exit_is_honored() {
 
 #[test]
 fn inherited_ps1_is_used() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session_with(&[], Some("inherited> "));
     session.exp_string("inherited> ").unwrap();
     submit(&mut session, "exit");
@@ -244,6 +302,7 @@ fn inherited_ps1_is_used() {
 
 #[test]
 fn command_string_on_tty_does_not_enter_repl() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session_with(&["-c", "echo hi; exit 3"], None);
     assert_no_output(&session.exp_string("hi\r\n").unwrap());
     exited(&mut session, 3);
@@ -251,6 +310,7 @@ fn command_string_on_tty_does_not_enter_repl() {
 
 #[test]
 fn explicit_exit_defers_exit_trap_and_preserves_requested_status() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     session
@@ -265,6 +325,7 @@ fn explicit_exit_defers_exit_trap_and_preserves_requested_status() {
 
 #[test]
 fn explicit_exit_after_caught_special_builtin_failure_terminates_repl() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "{ command break foo; exit 5; }");
@@ -290,27 +351,32 @@ fn recover_after_error(script: &str, diagnostic: &str) {
 
 #[test]
 fn expansion_error_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     recover_after_error("echo ${nope?missing}; echo unreachable", "missing");
 }
 
 #[test]
 fn special_builtin_redirection_error_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     // The session has a private cwd; this parent directory cannot exist.
     recover_after_error(": > absent/dir/x; echo unreachable", "epsh: ");
 }
 
 #[test]
 fn invalid_break_operand_outside_loop_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     recover_after_error("break foo; echo unreachable", "break: ");
 }
 
 #[test]
 fn invalid_break_operand_inside_loop_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     recover_after_error("while :; do break foo; echo unreachable; done", "break: ");
 }
 
 #[test]
 fn invalid_continue_operand_inside_loop_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     recover_after_error(
         "while :; do continue foo; echo unreachable; done",
         "continue: ",
@@ -319,16 +385,19 @@ fn invalid_continue_operand_inside_loop_returns_to_prompt() {
 
 #[test]
 fn dot_missing_file_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     recover_after_error(". ./missing-script; echo unreachable", ".: ");
 }
 
 #[test]
 fn dot_missing_argument_returns_to_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     recover_after_error(".; echo unreachable", ".: ");
 }
 
 #[test]
 fn errexit_still_ends_session_on_false() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "set -e");
@@ -358,13 +427,14 @@ fn history_session_with_file(dir: &TempDir, path: Option<&std::path::Path>) -> P
     if let Some(path) = path {
         command.env("SO1SH_HISTFILE", path);
     }
-    let mut session = spawn_command(command, Some(3000)).unwrap();
+    let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
     session
 }
 
 #[test]
 fn history_survives_sessions_and_ctrl_r_searches_it() {
+    let _pty_test_guard = serialize_pty_test();
     for explicit in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let mut first = history_session(&dir, explicit);
@@ -414,6 +484,7 @@ fn history_survives_sessions_and_ctrl_r_searches_it() {
 
 #[test]
 fn missing_redirection_target_is_reported_without_continuation() {
+    let _pty_test_guard = serialize_pty_test();
     for input in ["echo >", "cat <<"] {
         let (mut session, _dir) = session();
         session.exp_string("$ ").unwrap();
@@ -433,6 +504,7 @@ fn missing_redirection_target_is_reported_without_continuation() {
 
 #[test]
 fn empty_heredoc_delimiter_finishes_with_one_enter() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     session.send_line("cat <<''").unwrap();
@@ -449,6 +521,7 @@ fn empty_heredoc_delimiter_finishes_with_one_enter() {
 
 #[test]
 fn backslash_newline_uses_continuation_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     session.send_line("echo joined\\").unwrap();
@@ -472,12 +545,14 @@ fn history_error_keeps_session_working(mut session: PtySession) {
 
 #[test]
 fn history_directory_reports_error_and_keeps_session_working() {
+    let _pty_test_guard = serialize_pty_test();
     let dir = tempfile::tempdir().unwrap();
     history_error_keeps_session_working(history_session_with_file(&dir, Some(dir.path())));
 }
 
 #[test]
 fn history_sync_error_keeps_session_working() {
+    let _pty_test_guard = serialize_pty_test();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history");
     let mut session = history_session_with_file(&dir, Some(&path));
@@ -498,6 +573,7 @@ fn history_sync_error_keeps_session_working() {
 
 #[test]
 fn history_unwritable_path_reports_error_and_keeps_session_working() {
+    let _pty_test_guard = serialize_pty_test();
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("read-only-history");
@@ -522,6 +598,7 @@ fn history_unwritable_path_reports_error_and_keeps_session_working() {
 
 #[test]
 fn multiline_if_uses_continuation_prompt() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     session.send_line("if true; then").unwrap();
@@ -537,6 +614,7 @@ fn multiline_if_uses_continuation_prompt() {
 
 #[test]
 fn unterminated_quote_continues_on_next_line() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "echo 'first");
@@ -550,6 +628,7 @@ fn unterminated_quote_continues_on_next_line() {
 
 #[test]
 fn trailing_operators_and_heredoc_need_more_input() {
+    let _pty_test_guard = serialize_pty_test();
     for (start, lines, output) in [
         ("echo pipeline |", vec!["cat"], "pipeline"),
         ("true &&", vec!["echo and-list"], "and-list"),
@@ -573,6 +652,7 @@ fn trailing_operators_and_heredoc_need_more_input() {
 
 #[test]
 fn ctrl_c_discards_prompt_input_without_exiting() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     session.send("echo discarded-input").unwrap();
@@ -700,19 +780,23 @@ fn foreground_signal(pipeline: bool, signal: u8, status: i32) {
 
 #[test]
 fn foreground_ctrl_c_returns_status_130() {
+    let _pty_test_guard = serialize_pty_test();
     foreground_signal(false, 0x03, 130);
 }
 #[test]
 fn foreground_ctrl_backslash_returns_status_131() {
+    let _pty_test_guard = serialize_pty_test();
     foreground_signal(false, 0x1c, 131);
 }
 #[test]
 fn foreground_ctrl_z_is_reported_and_cleaned_up_by_test() {
+    let _pty_test_guard = serialize_pty_test();
     foreground_signal(false, 0x1a, 148);
 }
 
 #[test]
 fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
+    let _pty_test_guard = serialize_pty_test();
     use std::os::fd::AsRawFd;
 
     let (mut session, _dir) = session();
@@ -720,7 +804,7 @@ fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let pgid = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if pgid != shell_group {
@@ -750,6 +834,7 @@ fn foreground_ctrl_z_retains_stopped_job_for_jobs() {
 
 #[test]
 fn background_job_is_registered_and_listed_as_running() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 100 &");
@@ -776,6 +861,7 @@ fn background_job_is_registered_and_listed_as_running() {
 
 #[test]
 fn finished_background_job_is_reported_done() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 0.1 &");
@@ -793,6 +879,7 @@ fn finished_background_job_is_reported_done() {
 
 #[test]
 fn wait_job_number_stops_resolving_after_job_notification_prunes_it() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sh -c 'exit 7' &");
@@ -812,6 +899,7 @@ fn wait_job_number_stops_resolving_after_job_notification_prunes_it() {
 
 #[test]
 fn fg_rejects_a_job_that_finished_before_terminal_handoff() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
 
@@ -830,13 +918,14 @@ fn fg_rejects_a_job_that_finished_before_terminal_handoff() {
 
 #[test]
 fn wait_dollar_bang_keeps_status_after_done_notification() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sh -c \"exit 7\" &");
     let mut output = session.exp_string("$ ").unwrap();
     let pgid = background_pgid(output.as_bytes());
     let mut cleanup = ProcessGroupCleanup::new(pgid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = pty_deadline();
     while !output.contains("Exit 7") {
         submit(&mut session, "");
         output = session.exp_string("$ ").unwrap();
@@ -858,6 +947,7 @@ fn wait_dollar_bang_keeps_status_after_done_notification() {
 
 #[test]
 fn jobs_resolves_prefix_job_spec() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 100 &");
@@ -877,15 +967,18 @@ fn jobs_resolves_prefix_job_spec() {
 }
 #[test]
 fn pipeline_ctrl_c_terminates_every_stage() {
+    let _pty_test_guard = serialize_pty_test();
     foreground_signal(true, 0x03, 130);
 }
 #[test]
 fn pipeline_ctrl_z_is_retained_and_cleaned_up_by_test() {
+    let _pty_test_guard = serialize_pty_test();
     foreground_signal(true, 0x1a, 148);
 }
 
 #[test]
 fn children_see_cooked_modes_and_job_mode_changes_are_restored() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     for command in ["stty -a", "stty -icanon -isig; stty -a"] {
@@ -908,6 +1001,7 @@ fn children_see_cooked_modes_and_job_mode_changes_are_restored() {
 
 #[test]
 fn terminal_control_does_not_reopen_redirected_closed_stdin() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(
@@ -934,7 +1028,7 @@ fn interrupt_loop(builtin_only: bool, signal: u8, status: i32) {
     submit(&mut session, line);
     session.exp_string("running\r\n").unwrap();
     if !builtin_only {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = pty_deadline();
         while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == shell_group {
             assert!(std::time::Instant::now() < deadline, "no foreground child");
             std::thread::yield_now();
@@ -962,23 +1056,28 @@ fn interrupt_loop(builtin_only: bool, signal: u8, status: i32) {
 
 #[test]
 fn interactive_ctrl_c_aborts_sleep_loop() {
+    let _pty_test_guard = serialize_pty_test();
     interrupt_loop(false, 0x03, 130);
 }
 #[test]
 fn interactive_ctrl_quit_aborts_sleep_loop() {
+    let _pty_test_guard = serialize_pty_test();
     interrupt_loop(false, 0x1c, 131);
 }
 #[test]
 fn interactive_ctrl_c_aborts_builtin_loop() {
+    let _pty_test_guard = serialize_pty_test();
     interrupt_loop(true, 0x03, 130);
 }
 #[test]
 fn interactive_ctrl_quit_aborts_builtin_loop() {
+    let _pty_test_guard = serialize_pty_test();
     interrupt_loop(true, 0x1c, 131);
 }
 
 #[test]
 fn background_start_waits_for_foreground_and_restores_parent_terminal() {
+    let _pty_test_guard = serialize_pty_test();
     use std::os::fd::AsRawFd;
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new("/bin/sh");
@@ -992,7 +1091,7 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
         .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
         .env("SO1SH_HISTFILE", dir.path().join("history"))
         .current_dir(dir.path());
-    let mut session = spawn_command(command, Some(3000)).unwrap();
+    let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
     session.exp_string("parent> ").unwrap();
     let tty = session.process().get_file_handle().unwrap();
@@ -1002,7 +1101,7 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
             "PS1='$ ' \"$SO1SH_BIN\" & child=$!; echo $child > child; wait $child; echo waited:$?",
         )
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while !std::fs::read_to_string(dir.path().join("child"))
         .is_ok_and(|raw| raw.trim().parse::<i32>().is_ok())
     {
@@ -1010,7 +1109,7 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
             std::time::Instant::now() < deadline,
             "parent never started child"
         );
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     }
     let pid = std::fs::read_to_string(dir.path().join("child"))
         .unwrap()
@@ -1040,6 +1139,7 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
 
 #[test]
 fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
+    let _pty_test_guard = serialize_pty_test();
     use std::os::unix::process::CommandExt;
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
@@ -1067,7 +1167,7 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
             Ok(())
         });
     }
-    let mut session = spawn_command(command, Some(3000)).unwrap();
+    let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
     session.exp_string("so1sh: terminal:").unwrap();
     session.exp_string("$ ").unwrap();
@@ -1081,6 +1181,7 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
 
 #[test]
 fn background_startup_saves_modes_after_foreground_permission() {
+    let _pty_test_guard = serialize_pty_test();
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new("/bin/sh");
     command
@@ -1092,11 +1193,11 @@ fn background_startup_saves_modes_after_foreground_permission() {
         .env("PS1", "parent> ")
         .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
         .current_dir(dir.path());
-    let mut session = spawn_command(command, Some(3000)).unwrap();
+    let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
     session.exp_string("parent> ").unwrap();
     session.send_line("stty -icanon; PS1='$ ' \"$SO1SH_BIN\" & child=$!; echo $child > child; wait $child; stty icanon; echo ready-for-fg").unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pid = loop {
         if let Ok(raw) = std::fs::read_to_string(dir.path().join("child"))
             && let Ok(pid) = raw.trim().parse::<i32>()
@@ -1104,7 +1205,7 @@ fn background_startup_saves_modes_after_foreground_permission() {
             break pid;
         }
         assert!(std::time::Instant::now() < deadline, "job did not start");
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     };
     let mut child = TestJobs(vec![pid]);
     session.exp_string("ready-for-fg\r\n").unwrap();
@@ -1131,6 +1232,7 @@ fn background_startup_saves_modes_after_foreground_permission() {
 #[cfg(target_os = "linux")]
 #[test]
 fn orphaned_background_startup_falls_back_without_spinning() {
+    let _pty_test_guard = serialize_pty_test();
     use std::os::fd::AsRawFd;
     const NAME: &str = "orphaned_background_startup_falls_back_without_spinning";
     if std::env::var("SO1SH_ORPHAN_TEST").as_deref() != Ok(NAME) {
@@ -1179,7 +1281,7 @@ fn orphaned_background_startup_falls_back_without_spinning() {
         .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
         .env("SO1SH_RC", dir.path().join("rc"))
         .current_dir(dir.path());
-    let mut session = spawn_command(command, Some(3000)).unwrap();
+    let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
     session.exp_string("parent> ").unwrap();
     let tty = session.process().get_file_handle().unwrap();
@@ -1192,7 +1294,7 @@ fn orphaned_background_startup_falls_back_without_spinning() {
     // The subshell exits before the background job starts so1sh. Its new parent
     // (this subreaper) belongs to another session, making its group orphaned.
     session.send_line("( /bin/sh -c 'while [ ! -e ready ]; do /bin/sleep 0.01; done; exec \"$SO1SH_BIN\"' </dev/tty >/dev/tty 2>&1 & echo $! > child ); : > ready").unwrap();
-    let deadline = started + std::time::Duration::from_secs(2);
+    let deadline = started + pty_test_timeout();
     let pid = loop {
         if let Ok(raw) = std::fs::read_to_string(dir.path().join("child"))
             && let Ok(pid) = raw.trim().parse::<i32>()
@@ -1200,7 +1302,7 @@ fn orphaned_background_startup_falls_back_without_spinning() {
             break pid;
         }
         assert!(std::time::Instant::now() < deadline, "job did not start");
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     };
     let mut orphan = Orphan(pid);
     assert_ne!(unsafe { libc::getpgid(pid) }, owner);
@@ -1259,13 +1361,14 @@ mod startup_rc {
         if let Some(home) = home {
             command.env("HOME", home);
         }
-        let mut session = spawn_command(command, Some(3000)).unwrap();
+        let mut session = spawn_pty(command);
         session.process_mut().set_kill_timeout(Some(1000));
         session
     }
 
     #[test]
     fn default_file_configures_prompts_variables_and_cwd() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(
@@ -1295,6 +1398,7 @@ mod startup_rc {
 
     #[test]
     fn explicit_file_preserves_path_bytes_and_defines_function() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let rc = dir
             .path()
@@ -1313,6 +1417,7 @@ mod startup_rc {
 
     #[test]
     fn relative_rc_without_slash_is_loaded_from_current_directory() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("rcfile"), "PS1='cwd> '; echo cwd-rc\n").unwrap();
         let path_dir = tempfile::tempdir().unwrap();
@@ -1332,7 +1437,7 @@ mod startup_rc {
             .env("HOME", dir.path())
             .env("SO1SH_RC", "rcfile")
             .current_dir(&dir);
-        let mut session = spawn_command(command, Some(3000)).unwrap();
+        let mut session = spawn_pty(command);
         session.process_mut().set_kill_timeout(Some(1000));
         session.exp_string("cwd-rc\r\n").unwrap();
         session.exp_regex("cwd> ").unwrap();
@@ -1362,16 +1467,19 @@ mod startup_rc {
 
     #[test]
     fn syntax_error_keeps_session_working() {
+        let _pty_test_guard = serialize_pty_test();
         rc_error("if true; then\n", "syntax error");
     }
 
     #[test]
     fn runtime_error_keeps_session_working() {
+        let _pty_test_guard = serialize_pty_test();
         rc_error("echo ${nope?rc-missing}; echo forbidden\n", "rc-missing");
     }
 
     #[test]
     fn missing_explicit_file_reports_error_without_default_fallback() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join("missing-rc");
         std::fs::write(dir.path().join(".so1shrc"), "exit 9\n").unwrap();
@@ -1383,6 +1491,7 @@ mod startup_rc {
 
     #[test]
     fn exit_in_file_ends_session_before_first_prompt() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join("rc");
         std::fs::write(&rc, "exit 3\n").unwrap();
@@ -1392,6 +1501,7 @@ mod startup_rc {
 
     #[test]
     fn return_in_file_keeps_session_and_skips_rest_of_file() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join("rc");
         std::fs::write(&rc, "x=before; return 7; x=forbidden\n").unwrap();
@@ -1406,6 +1516,7 @@ mod startup_rc {
 
     #[test]
     fn missing_default_and_unset_or_empty_home_are_silent() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let mut absent = session(&dir, None, Some(dir.path().as_os_str()));
         assert_no_output(&absent.exp_string("$ ").unwrap());
@@ -1423,6 +1534,7 @@ mod startup_rc {
 
     #[test]
     fn foreground_without_jobs_returns_failure_status() {
+        let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let mut session = session(&dir, None, Some(dir.path().as_os_str()));
         assert_no_output(&session.exp_string("$ ").unwrap());
@@ -1437,13 +1549,14 @@ mod startup_rc {
 
 #[test]
 fn stopped_job_can_be_foregrounded_and_interrupted() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if group != shell_group {
@@ -1465,7 +1578,7 @@ fn stopped_job_can_be_foregrounded_and_interrupted() {
             .contains("Stopped")
     );
     submit(&mut session, "fg");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } != pgid {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1488,13 +1601,14 @@ fn stopped_job_can_be_foregrounded_and_interrupted() {
 
 #[test]
 fn stopped_job_can_be_backgrounded_then_waited_by_job_spec() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sh -c 'sleep 1.5'");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == shell_group {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1521,6 +1635,7 @@ fn stopped_job_can_be_backgrounded_then_waited_by_job_spec() {
 
 #[test]
 fn interactive_wait_preserves_background_exit_statuses() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 0.2 & wait $!; echo $?");
@@ -1539,13 +1654,14 @@ fn interactive_wait_preserves_background_exit_statuses() {
 
 #[test]
 fn backgrounded_so1sh_can_acquire_tty_after_sigttin_timeout_window() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, &format!("{} &", env!("CARGO_BIN_EXE_so1sh")));
     let launch = session.exp_string("$ ").unwrap();
     let pgid = background_pgid(launch.as_bytes());
     let mut cleanup = ProcessGroupCleanup::new(pgid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = pty_deadline();
     loop {
         submit(&mut session, "jobs");
         let listing = session.exp_string("$ ").unwrap();
@@ -1580,6 +1696,7 @@ fn backgrounded_so1sh_can_acquire_tty_after_sigttin_timeout_window() {
 
 #[test]
 fn background_launch_notice_precedes_later_commands_on_same_line() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 100 & echo tail");
@@ -1600,6 +1717,7 @@ fn background_launch_notice_precedes_later_commands_on_same_line() {
 
 #[test]
 fn background_done_notification_includes_nonzero_exit_and_is_removed() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sh -c 'exit 3' &");
@@ -1607,7 +1725,7 @@ fn background_done_notification_includes_nonzero_exit_and_is_removed() {
     let pgid = background_pgid(launch.as_bytes());
     let mut cleanup = ProcessGroupCleanup::new(pgid);
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let mut observed = String::new();
     while !observed.contains("Done") {
         submit(&mut session, "jobs");
@@ -1636,6 +1754,7 @@ fn background_done_notification_includes_nonzero_exit_and_is_removed() {
 
 #[test]
 fn killed_background_job_notifies_before_removal() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "sleep 100 &");
@@ -1643,7 +1762,7 @@ fn killed_background_job_notifies_before_removal() {
     let pgid = background_pgid(launch.as_bytes());
     let cleanup = ProcessGroupCleanup::new(pgid);
     cleanup.terminate();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let mut notification = String::new();
     while !notification.contains("Killed") {
         submit(&mut session, "jobs");
@@ -1665,13 +1784,14 @@ fn killed_background_job_notifies_before_removal() {
 
 #[test]
 fn ctrl_z_reports_only_the_shell_job_notification() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if group != shell_group {
@@ -1694,7 +1814,7 @@ fn ctrl_z_reports_only_the_shell_job_notification() {
     );
     assert!(output.contains("[1]+  Stopped  sleep 100"), "{output:?}");
     cleanup.terminate();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     loop {
         submit(&mut session, "jobs");
         let output = session.exp_string("$ ").unwrap();
@@ -1715,13 +1835,14 @@ fn ctrl_z_reports_only_the_shell_job_notification() {
 
 #[test]
 fn first_exit_with_stopped_jobs_warns_and_second_exits() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if group != shell_group {
@@ -1743,7 +1864,7 @@ fn first_exit_with_stopped_jobs_warns_and_second_exits() {
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");
     exited(&mut session, 148);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while unsafe { libc::kill(pgid, 0) } == 0 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1756,13 +1877,14 @@ fn first_exit_with_stopped_jobs_warns_and_second_exits() {
 
 #[test]
 fn ctrl_d_with_stopped_jobs_requires_confirmation() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if group != shell_group {
@@ -1784,7 +1906,7 @@ fn ctrl_d_with_stopped_jobs_requires_confirmation() {
     session.exp_string("$ ").unwrap();
     session.send_control('d').unwrap();
     exited(&mut session, 148);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while unsafe { libc::kill(pgid, 0) } == 0 {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1797,6 +1919,7 @@ fn ctrl_d_with_stopped_jobs_requires_confirmation() {
 
 #[test]
 fn background_launch_notice_bypasses_compound_stdout_redirection() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, dir) = session();
     session.exp_string("$ ").unwrap();
     let output_file = dir.path().join("launch-output");
@@ -1827,13 +1950,14 @@ fn background_launch_notice_bypasses_compound_stdout_redirection() {
 
 #[test]
 fn foregrounded_job_stopped_again_is_reported_stopped() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if group != shell_group {
@@ -1855,7 +1979,7 @@ fn foregrounded_job_stopped_again_is_reported_stopped() {
     );
 
     submit(&mut session, "fg");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } != pgid {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1879,13 +2003,14 @@ fn foregrounded_job_stopped_again_is_reported_stopped() {
 
 #[test]
 fn stopped_job_exit_warning_resets_after_a_non_exit_command() {
+    let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
     use std::os::fd::AsRawFd;
     let tty = session.process().get_file_handle().unwrap();
     let shell_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     submit(&mut session, "sleep 100");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     let pgid = loop {
         let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
         if group != shell_group {
@@ -1913,7 +2038,7 @@ fn stopped_job_exit_warning_resets_after_a_non_exit_command() {
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit 7");
     exited(&mut session, 7);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = pty_deadline();
     while unsafe { libc::kill(pgid, 0) } == 0 {
         assert!(
             std::time::Instant::now() < deadline,

@@ -81,7 +81,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - [x] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
   - Fix: SIGTTIN acquisition deadline must not count time spent stopped (`terminal.rs:74-79`).
-- [ ] **T3b — fg/bg/wait follow-ups from the consolidated review** (codex-impl, after T4)
+- [x] **T3b — fg/bg/wait follow-ups from the consolidated review** (codex-impl, after T4)
   - `wait %n` numbers jobs from epsh's append-only `owned_job_history`, while `jobs`/`fg`/`bg` use the shell's JobTable (pruned/renumbered) -> `%n` can name different jobs (`builtins.rs:777-786`); a single source of truth for job specs.
   - `wait %n` with a cached status leaves the pid in `background_pids`; a later bare `wait` waits on a reaped/reused pid.
   - `reaped_job_statuses` grows without bound and can return a stale status for a recycled pid (`eval.rs:1249-1255`).
@@ -89,7 +89,11 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - New PTY test races `fg`'s tcsetpgrp (`repl.rs:1392-1393`): synchronize like T2d.
 - [x] **T4 — Job notifications** (codex-impl)
   - Before each prompt report `[n]+ Done/Stopped/Killed` for changed background jobs; `exit` with stopped jobs warns once (like bash).
-- [ ] **T4b — Job notification follow-ups from review** (codex-impl, after T3b)
+- [x] **T4b — Job notification follow-ups from review**
+- [ ] **T3c — wait/notification follow-ups from the T3b review** (codex-impl, next)
+  - R3-notification-discards-wait-pid-status: prompt-time notifications discard the cached reaped status while the pid stays in `background_pids`, so `sleep 0.1 &` ... (Done notified) ... `wait $!` returns 127 instead of the status (`jobs.rs:541`). bash still returns the status; match it.
+  - R3-wait-failure-records-fake-exit-zero: a non-EINTR waitpid failure yields raw status 0 and records a fake `Exited(0)` for an owned pid (`builtins.rs:837-839`).
+  - R3-fg-completed-test-weak-assertions: the fg-rejection test matches any `fg:` error and `1\n` can match a pgid (`repl.rs:814-816`); assert the exact message and status. (codex-impl, after T3b)
   - R3-launch-notice-uses-redirected-stdout: the `[n] pgid` launch notice is written through the current stdout route, so `{ sleep 1 & } > file` puts it into the file (`eval.rs:1253-1259`); job notices belong on the terminal (bash writes them to stderr/tty).
   - R3-fg-restop-notification-unproved: a job resumed with `fg` and stopped again must print `[n]+  Stopped` (`jobs.rs:321`); add the PTY test.
   - Suggestion: test that the stopped-jobs exit warning resets after a non-exit command (`eval.rs:1730`).
@@ -133,5 +137,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T4 (`541d37b` epsh: immediate launch callbacks, opt-out of the stopped diagnostic; `79fcedc` shell: prompt-time Done/Exit/Killed/Stopped notifications with pruning, two-step exit with stopped jobs + SIGHUP/SIGCONT, Ctrl-Z prints only the job line). 8 existing PTY tests updated to the new behavior without weakening (per-test report from Codex). Orchestrator: 3/3 workspace runs, epsh alone green.
   Native consolidated review (medium): user granted, approved, acknowledged; 2 WARNINGs -> T4b.
 
+- T3b (`076053c` epsh: interactive `wait %n` resolves through the frontend job table, cached-status waits clear background pids, bounded reaped-status cache; `e64f35b` shell: fg rejects Done/Killed jobs, checks terminal handoff, fg PTY test synchronized). Orchestrator 3/3 workspace runs. Native consolidated review approved; 3 WARNINGs -> T3c.
+- T4b (`f377798`): job notices use the stderr route; RED proved `{ sleep 1 & } > file` wrote the notice into the file (bash shows it on the terminal). Orchestrator: 2 of 3 workspace runs failed while the native review was running in parallel (machine under load), then 4/4 clean runs -> PTY timing under load to watch.
+
 ## Progress / Next step
-- T3b running on `codex-impl`; then T4b, T2e, T5, T6, T7, T8.
+- T3c on `codex-impl`; then T2e, T5, T6, T7, T8.

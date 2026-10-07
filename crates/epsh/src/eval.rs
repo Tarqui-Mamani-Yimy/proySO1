@@ -1,4 +1,5 @@
 use fxhash::FxHashMap;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::ops::ControlFlow;
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -254,6 +255,18 @@ pub type BackgroundJobLaunchHandler = Box<dyn FnMut(&ChildJobInfo) -> Vec<u8> + 
 /// REPL alive; `confirmed` is true after a previous consecutive request was held.
 pub type ReplExitHandler = Box<dyn FnMut(&mut Shell, ExitStatus, bool) -> bool + Send>;
 
+/// Resolve a frontend-owned job specification to its member process IDs.
+/// Returning `None` means the specification is not known to that frontend.
+pub type WaitJobSpecResolver = Box<dyn FnMut(&str) -> Option<Vec<i32>> + Send>;
+
+pub(crate) enum WaitJobSpecResolution {
+    Unconfigured,
+    Resolved(Vec<i32>),
+    NotFound,
+}
+
+const REAPED_JOB_STATUS_LIMIT: usize = 256;
+
 /// A wait-status transition for one of this shell's owned job members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildJobStatus {
@@ -394,6 +407,7 @@ pub struct Shell {
     pub(crate) background_pids: Vec<i32>,
     /// Wait statuses reaped by the embedder-facing job poller, retained until wait consumes them.
     pub(crate) reaped_job_statuses: FxHashMap<i32, ExitStatus>,
+    pub(crate) reaped_job_status_order: VecDeque<i32>,
     stopped_jobs: Vec<StoppedJob>,
     pub(crate) owned_jobs: Vec<OwnedJob>,
     pub(crate) owned_job_history: Vec<(i32, Vec<i32>)>,
@@ -401,6 +415,7 @@ pub struct Shell {
     pending_job_updates: Vec<ChildJobUpdate>,
     background_job_launch_handler: Option<BackgroundJobLaunchHandler>,
     repl_exit_handler: Option<ReplExitHandler>,
+    wait_job_spec_resolver: Option<WaitJobSpecResolver>,
     repl_exit_warned: bool,
     suppress_repl_stopped_diagnostic: bool,
     current_command_text: String,
@@ -753,6 +768,7 @@ impl ShellBuilder {
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             reaped_job_statuses: FxHashMap::default(),
+            reaped_job_status_order: VecDeque::new(),
             stopped_jobs: Vec::new(),
             owned_jobs: Vec::new(),
             owned_job_history: Vec::new(),
@@ -760,6 +776,7 @@ impl ShellBuilder {
             pending_job_updates: Vec::new(),
             background_job_launch_handler: None,
             repl_exit_handler: None,
+            wait_job_spec_resolver: None,
             repl_exit_warned: false,
             suppress_repl_stopped_diagnostic: false,
             current_command_text: String::new(),
@@ -811,6 +828,7 @@ impl Shell {
             child_pids: Vec::new(),
             background_pids: Vec::new(),
             reaped_job_statuses: FxHashMap::default(),
+            reaped_job_status_order: VecDeque::new(),
             stopped_jobs: Vec::new(),
             owned_jobs: Vec::new(),
             owned_job_history: Vec::new(),
@@ -818,6 +836,7 @@ impl Shell {
             pending_job_updates: Vec::new(),
             background_job_launch_handler: None,
             repl_exit_handler: None,
+            wait_job_spec_resolver: None,
             repl_exit_warned: false,
             suppress_repl_stopped_diagnostic: false,
             current_command_text: String::new(),
@@ -1161,11 +1180,21 @@ impl Shell {
     fn clear_child_tracking(&mut self) {
         self.child_pids.clear();
         self.background_pids.clear();
+        self.reaped_job_statuses.clear();
+        self.reaped_job_status_order.clear();
         self.stopped_jobs.clear();
         self.owned_jobs.clear();
         self.pending_job_infos.clear();
         self.pending_job_updates.clear();
         self.interrupted = None;
+    }
+
+    fn register_child_pid(&mut self, pid: i32) {
+        self.discard_reaped_job_statuses(&[pid]);
+        for (_, members) in &mut self.owned_job_history {
+            members.retain(|&member| member != pid);
+        }
+        self.child_pids.push(pid);
     }
 
     fn reset_child_tracking_after_fork(&mut self) {
@@ -1263,10 +1292,10 @@ impl Shell {
     }
 
     fn record_owned_job_update(&mut self, pgid: i32, pid: i32, status: ChildJobStatus) -> bool {
-        let Some(job) = self.owned_jobs.iter_mut().find(|job| job.pgid == pgid) else {
+        let Some(job_index) = self.owned_jobs.iter().position(|job| job.pgid == pgid) else {
             return false;
         };
-        if !job.members.contains(&pid) {
+        if !self.owned_jobs[job_index].members.contains(&pid) {
             return false;
         }
         self.pending_job_updates
@@ -1280,8 +1309,10 @@ impl Shell {
                 ChildJobStatus::Signaled(signal) => (128 + signal).into(),
                 _ => unreachable!(),
             };
-            self.reaped_job_statuses.insert(pid, exit_status);
-            job.members.retain(|member| *member != pid);
+            self.cache_reaped_job_status(pid, exit_status);
+            self.owned_jobs[job_index]
+                .members
+                .retain(|member| *member != pid);
             for stopped in &mut self.stopped_jobs {
                 if stopped.pgid == pgid {
                     stopped.members.retain(|member| *member != pid);
@@ -1294,7 +1325,7 @@ impl Shell {
         true
     }
 
-    fn record_owned_wait_status(&mut self, pgid: i32, pid: i32, raw: i32) {
+    pub(crate) fn record_owned_wait_status(&mut self, pgid: i32, pid: i32, raw: i32) {
         let status = if libc::WIFSTOPPED(raw) {
             Some(ChildJobStatus::Stopped(libc::WSTOPSIG(raw)))
         } else if libc::WIFCONTINUED(raw) {
@@ -1560,6 +1591,52 @@ impl Shell {
     /// Configure how an interactive frontend confirms exits with stopped jobs.
     pub fn set_repl_exit_handler(&mut self, handler: ReplExitHandler) {
         self.repl_exit_handler = Some(handler);
+    }
+
+    /// Let an interactive frontend resolve its own numbered job table for
+    /// `wait %job`, while unconfigured shells retain epsh's historical mapping.
+    pub fn set_wait_job_spec_resolver(&mut self, resolver: WaitJobSpecResolver) {
+        self.wait_job_spec_resolver = Some(resolver);
+    }
+
+    pub(crate) fn resolve_wait_job_spec(&mut self, spec: &str) -> WaitJobSpecResolution {
+        let Some(mut resolver) = self.wait_job_spec_resolver.take() else {
+            return WaitJobSpecResolution::Unconfigured;
+        };
+        let result = resolver(spec).filter(|pids| !pids.is_empty());
+        self.wait_job_spec_resolver = Some(resolver);
+        match result {
+            Some(pids) => WaitJobSpecResolution::Resolved(pids),
+            None => WaitJobSpecResolution::NotFound,
+        }
+    }
+
+    fn cache_reaped_job_status(&mut self, pid: i32, status: ExitStatus) {
+        self.discard_reaped_job_statuses(&[pid]);
+        self.reaped_job_statuses.insert(pid, status);
+        self.reaped_job_status_order.push_back(pid);
+        while self.reaped_job_status_order.len() > REAPED_JOB_STATUS_LIMIT {
+            if let Some(expired) = self.reaped_job_status_order.pop_front() {
+                self.reaped_job_statuses.remove(&expired);
+            }
+        }
+    }
+
+    pub(crate) fn take_reaped_job_status(&mut self, pid: i32) -> Option<ExitStatus> {
+        let status = self.reaped_job_statuses.remove(&pid);
+        if status.is_some() {
+            self.reaped_job_status_order.retain(|&queued| queued != pid);
+        }
+        status
+    }
+
+    /// Discard cached statuses after a frontend has reported a completed job.
+    pub fn discard_reaped_job_statuses(&mut self, pids: &[i32]) {
+        for &pid in pids {
+            self.reaped_job_statuses.remove(&pid);
+        }
+        self.reaped_job_status_order
+            .retain(|pid| !pids.contains(pid));
     }
 
     /// Suppress the default stopped-process diagnostic in REPL mode.
@@ -2511,7 +2588,7 @@ impl Shell {
                         rustix::process::Pid::from_raw(child_id),
                     );
                 }
-                self.child_pids.push(child_id);
+                self.register_child_pid(child_id);
 
                 // Spawn relay threads for sinks, keeping handles to join later
                 let mut handles = Vec::new();
@@ -2717,7 +2794,7 @@ impl Shell {
                     );
                 }
                 children.push(pid);
-                self.child_pids.push(pid);
+                self.register_child_pid(pid);
             }
         }
 
@@ -2827,7 +2904,7 @@ impl Shell {
             }
 
             // Parent
-            self.child_pids.push(pid);
+            self.register_child_pid(pid);
             Ok(self.wait_child(pid)?)
         }
     }
@@ -2864,7 +2941,7 @@ impl Shell {
                 sys::exit_child(status);
             }
 
-            self.child_pids.push(pid);
+            self.register_child_pid(pid);
             self.background_pids.push(pid);
             self.last_bg_pid = Some(pid as u32);
             // The leader establishes its own group in the child; repeat it in
@@ -3007,7 +3084,7 @@ impl Shell {
 
             // Parent: read from read end
             sys::close(fds[1]);
-            self.child_pids.push(pid);
+            self.register_child_pid(pid);
 
             let mut raw_output = Vec::new();
             let mut read_file = std::fs::File::from_raw_fd(fds[0]);
@@ -3029,6 +3106,34 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaped_job_status_cache_is_bounded_and_evicts_oldest() {
+        let mut shell = Shell::builder().env_clear().build();
+        for pid in 1..=(REAPED_JOB_STATUS_LIMIT as i32 + 1) {
+            shell.cache_reaped_job_status(pid, ExitStatus::from(pid % 100));
+        }
+
+        assert_eq!(shell.reaped_job_statuses.len(), REAPED_JOB_STATUS_LIMIT);
+        assert_eq!(shell.take_reaped_job_status(1), None);
+        assert_eq!(
+            shell.take_reaped_job_status(REAPED_JOB_STATUS_LIMIT as i32 + 1),
+            Some(ExitStatus::from((REAPED_JOB_STATUS_LIMIT as i32 + 1) % 100))
+        );
+    }
+
+    #[test]
+    fn reported_job_statuses_are_removed_from_cache() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.cache_reaped_job_status(101, ExitStatus::from(7));
+        shell.cache_reaped_job_status(102, ExitStatus::from(8));
+
+        shell.discard_reaped_job_statuses(&[101]);
+
+        assert!(!shell.reaped_job_statuses.contains_key(&101));
+        assert!(shell.reaped_job_statuses.contains_key(&102));
+        assert_eq!(shell.reaped_job_status_order, VecDeque::from([102]));
+    }
 
     #[test]
     fn wait_returns_status_after_job_poller_reaps_child() {

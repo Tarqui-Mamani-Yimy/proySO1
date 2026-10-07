@@ -124,6 +124,9 @@ fn interactive_job_callback_api_is_additive() {
         eval::Shell::set_background_job_launch_handler;
     let _: fn(&mut eval::Shell, eval::ReplExitHandler) = eval::Shell::set_repl_exit_handler;
     let _: fn(&mut eval::Shell, bool) = eval::Shell::suppress_repl_stopped_diagnostic;
+    let _: fn(&mut eval::Shell, eval::WaitJobSpecResolver) =
+        eval::Shell::set_wait_job_spec_resolver;
+    let _: fn(&mut eval::Shell, &[i32]) = eval::Shell::discard_reaped_job_statuses;
     let _: fn(&mut eval::Shell) -> Option<error::ExitStatus> = eval::Shell::try_finish_repl;
 }
 

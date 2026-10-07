@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::error::{ExitStatus, ShellError, Span};
-use crate::eval::Shell;
+use crate::eval::{Shell, WaitJobSpecResolution};
 use crate::parser::Parser;
 use crate::shell_bytes::ShellBytes;
 use crate::sys;
@@ -765,27 +765,27 @@ impl Shell {
                 self.wait_background_pid(pid);
             }
             self.reaped_job_statuses.clear();
+            self.reaped_job_status_order.clear();
             return ExitStatus::SUCCESS;
         }
 
         let mut status = ExitStatus::NOT_FOUND;
         for arg in args.iter().skip(1) {
-            status = if let Some(number) = arg
-                .strip_prefix('%')
-                .and_then(|number| number.parse::<usize>().ok())
-            {
-                let pids = number
-                    .checked_sub(1)
-                    .and_then(|index| self.owned_job_history.get(index))
-                    .map(|(_, members)| members.clone());
+            status = if arg.starts_with('%') {
+                let pids = match self.resolve_wait_job_spec(arg) {
+                    WaitJobSpecResolution::Resolved(pids) => Some(pids),
+                    WaitJobSpecResolution::NotFound => None,
+                    WaitJobSpecResolution::Unconfigured => arg
+                        .strip_prefix('%')
+                        .and_then(|number| number.parse::<usize>().ok())
+                        .and_then(|number| number.checked_sub(1))
+                        .and_then(|index| self.owned_job_history.get(index))
+                        .map(|(_, members)| members.clone()),
+                };
                 match pids {
-                    Some(pids) if !pids.is_empty() => {
-                        pids.into_iter().fold(ExitStatus::SUCCESS, |_, pid| {
-                            self.reaped_job_statuses
-                                .remove(&pid)
-                                .unwrap_or_else(|| self.wait_background_pid(pid))
-                        })
-                    }
+                    Some(pids) if !pids.is_empty() => pids
+                        .into_iter()
+                        .fold(ExitStatus::SUCCESS, |_, pid| self.wait_background_pid(pid)),
                     _ => ExitStatus::NOT_FOUND,
                 }
             } else {
@@ -801,26 +801,43 @@ impl Shell {
     }
 
     fn wait_background_pid(&mut self, pid: i32) -> ExitStatus {
-        if let Some(status) = self.reaped_job_statuses.remove(&pid) {
+        let known = self.background_pids.contains(&pid)
+            || self
+                .owned_job_history
+                .iter()
+                .any(|(_, members)| members.contains(&pid));
+        if let Some(status) = self.take_reaped_job_status(pid) {
             self.background_pids.retain(|&job| job != pid);
-            return status;
+            return if known { status } else { ExitStatus::NOT_FOUND };
         }
         let Some(index) = self.background_pids.iter().position(|&job| job == pid) else {
             return ExitStatus::NOT_FOUND;
         };
         self.background_pids.remove(index);
+        let pgid = self
+            .owned_job_history
+            .iter()
+            .find(|(_, members)| members.contains(&pid))
+            .map(|(pgid, _)| *pgid);
         // Wait only for a registered job; never consume an embedder's children.
-        let status = loop {
+        let (status, raw_status) = loop {
             match rustix::process::waitpid(
                 rustix::process::Pid::from_raw(pid),
                 rustix::process::WaitOptions::empty(),
             ) {
-                Ok(Some((_, status))) => break ExitStatus::from_wait(status.as_raw()),
+                Ok(Some((_, status))) => {
+                    let raw = status.as_raw();
+                    break (ExitStatus::from_wait(raw), raw);
+                }
                 Err(rustix::io::Errno::INTR) => continue,
-                _ => break ExitStatus::NOT_FOUND,
+                _ => break (ExitStatus::NOT_FOUND, 0),
             }
         };
         self.child_pids.retain(|&child| child != pid);
+        if let Some(pgid) = pgid {
+            self.record_owned_wait_status(pgid, pid, raw_status);
+            self.take_reaped_job_status(pid);
+        }
         status
     }
 
@@ -1268,6 +1285,55 @@ impl Shell {
 
         self.write_out(&out);
         ExitStatus::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod wait_job_status_tests {
+    use super::*;
+
+    fn shell_with_cached_job(pid: i32) -> Shell {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.owned_job_history.push((pid, vec![pid]));
+        shell.background_pids.push(pid);
+        shell.reaped_job_statuses.insert(pid, ExitStatus::from(7));
+        shell
+    }
+
+    #[test]
+    fn wait_job_spec_removes_cached_pid_from_background_tracking() {
+        let mut shell = shell_with_cached_job(4242);
+
+        let status = shell.builtin_wait(&["wait".into(), "%1".into()]);
+
+        assert_eq!(status.code(), 7);
+        assert!(!shell.background_pids.contains(&4242));
+    }
+
+    #[test]
+    fn wait_does_not_return_cached_status_for_an_unowned_pid() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.reaped_job_statuses.insert(4242, ExitStatus::from(7));
+
+        let status = shell.builtin_wait(&["wait".into(), "4242".into()]);
+
+        assert_eq!(status.code(), ExitStatus::NOT_FOUND.code());
+        assert!(!shell.reaped_job_statuses.contains_key(&4242));
+    }
+
+    #[test]
+    fn configured_wait_resolver_overrides_engine_job_numbers() {
+        let mut shell = shell_with_cached_job(4242);
+        shell.background_pids.push(5252);
+        shell.reaped_job_statuses.insert(5252, ExitStatus::from(3));
+        shell.set_wait_job_spec_resolver(Box::new(|spec| (spec == "%1").then_some(vec![5252])));
+
+        let status = shell.builtin_wait(&["wait".into(), "%1".into()]);
+
+        assert_eq!(status.code(), 3);
+        assert!(shell.background_pids.contains(&4242));
+        assert!(!shell.background_pids.contains(&5252));
+        assert!(shell.reaped_job_statuses.contains_key(&4242));
     }
 }
 

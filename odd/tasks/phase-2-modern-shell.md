@@ -60,7 +60,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - R3/R2: special-builtin names without an epsh implementation (e.g. `times`) now fail with CommandNotFound instead of falling back; decide and test; simplify the double dispatch.
 - [x] **T2 — Job table and `jobs`** (codex-impl)
   - Ctrl-Z keeps the stopped job (no discard); `cmd &` registers a job; `jobs` lists `[n]+ Running/Stopped/Done  cmd`; `%n`, `%+`, `%-`, `%string` job specs.
-- [ ] **T2b — Job table follow-ups from review** (codex-impl, with T3/T4)
+- [x] **T2b — Job table follow-ups from review** (codex-impl, with T3/T4)
   - R3/R4-poll-reaps: the job poller reaps a background job's wait status before the script's `wait $!` can collect it, so `wait` returns 127 instead of the job's status (`eval.rs:1233-1237`); keep the status available to `wait` (POSIX: `wait pid` must return a known job's status).
   - R4-unreaped-job-stuck-running (`eval.rs:1211-1232`) and stopped-jobs entry not cleared on reap.
   - Job table never prunes Done/Killed jobs (`jobs.rs:43-74`): remove after they are reported (with T4 notifications).
@@ -78,9 +78,15 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Failed 4 of 11 full workspace runs in Codex's T2c verification (`crates/shell/tests/repl.rs:636`). Find the race and make it deterministic.
 - [ ] **T2e — `make ci` hang with a terminal stdin** (investigate)
   - Codex reported `make ci` (run without `< /dev/null`, from its interactive terminal) hanging ~5 min in the workspace test phase; orchestrator could not reproduce with stdin=/dev/null (3/3 workspace runs ~6 s, make ci 7 s). Hypothesis: a test inherits a terminal stdin and blocks. Reproduce under a PTY and make the suite independent of the caller's stdin.
-- [ ] **T3 — `fg` and `bg`** (codex-impl)
+- [x] **T3 — `fg` and `bg`** (codex-impl)
   - `fg %n` gives the job the terminal, SIGCONT to the group, waits, restores modes; `bg %n` resumes in background; status codes per POSIX.
   - Fix: SIGTTIN acquisition deadline must not count time spent stopped (`terminal.rs:74-79`).
+- [ ] **T3b — fg/bg/wait follow-ups from the consolidated review** (codex-impl, after T4)
+  - `wait %n` numbers jobs from epsh's append-only `owned_job_history`, while `jobs`/`fg`/`bg` use the shell's JobTable (pruned/renumbered) -> `%n` can name different jobs (`builtins.rs:777-786`); a single source of truth for job specs.
+  - `wait %n` with a cached status leaves the pid in `background_pids`; a later bare `wait` waits on a reaped/reused pid.
+  - `reaped_job_statuses` grows without bound and can return a stale status for a recycled pid (`eval.rs:1249-1255`).
+  - `fg` ignores tcsetpgrp/tcsetattr failures and does not reject Done/Killed jobs (`jobs.rs:301-303`).
+  - New PTY test races `fg`'s tcsetpgrp (`repl.rs:1392-1393`): synchronize like T2d.
 - [ ] **T4 — Job notifications** (codex-impl)
   - Before each prompt report `[n]+ Done/Stopped/Killed` for changed background jobs; `exit` with stopped jobs warns once (like bash).
 - [ ] **T5 — Shell integration marks** (codex-impl)
@@ -117,5 +123,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T2d (`fd15f4b`): pipeline Ctrl-Z test assumed a returned prompt meant all killed members were reaped; now waits for pgid membership and observable Killed/Done states, no fixed sleeps. Orchestrator: 5/5 full workspace runs with 0 failures.
 - T1d (`eb83a98`): confirmed real bug — `{ v=$(echo hi); echo "[$v]"; } > out` wrote `hi\n[]` to the file; fork-free substitution now overrides the sink route; RedirectionGuard on compound/EV_EXIT/function paths; named route states; failed dup keeps errno. Orchestrator: 3/3 workspace runs green (~6 s), make ci only regression-37.
 
+- T2b+T3 (`57783ec` epsh: reaped statuses kept for `wait`, stuck-running fix; `01e60a5` shell: `fg`/`bg`, Done/Killed pruned after `jobs`, SIGTTIN deadline excludes stopped time). Orchestrator: 5/5 workspace runs, make ci, PTY probe (Ctrl-Z, jobs, bg, fg+Ctrl-C=130, `sh -c "exit 7" & wait $!`=7). Codex confirmed the earlier make ci hang came from running it with a terminal stdin (T2e).
+  Native consolidated review (`49243c1..01e60a5`, medium, slice budget): user granted, approved, acknowledged; 5 WARNINGs -> T3b.
+
 ## Progress / Next step
-- Next: native review of `49243c1..HEAD` when due; T2b+T3 (fg/bg) on `codex-impl`; T2e investigation; then T4.
+- T4 running on `codex-impl`; then T3b, T2e, T5, T6, T7, T8.

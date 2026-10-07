@@ -87,8 +87,12 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - `reaped_job_statuses` grows without bound and can return a stale status for a recycled pid (`eval.rs:1249-1255`).
   - `fg` ignores tcsetpgrp/tcsetattr failures and does not reject Done/Killed jobs (`jobs.rs:301-303`).
   - New PTY test races `fg`'s tcsetpgrp (`repl.rs:1392-1393`): synchronize like T2d.
-- [ ] **T4 — Job notifications** (codex-impl)
+- [x] **T4 — Job notifications** (codex-impl)
   - Before each prompt report `[n]+ Done/Stopped/Killed` for changed background jobs; `exit` with stopped jobs warns once (like bash).
+- [ ] **T4b — Job notification follow-ups from review** (codex-impl, after T3b)
+  - R3-launch-notice-uses-redirected-stdout: the `[n] pgid` launch notice is written through the current stdout route, so `{ sleep 1 & } > file` puts it into the file (`eval.rs:1253-1259`); job notices belong on the terminal (bash writes them to stderr/tty).
+  - R3-fg-restop-notification-unproved: a job resumed with `fg` and stopped again must print `[n]+  Stopped` (`jobs.rs:321`); add the PTY test.
+  - Suggestion: test that the stopped-jobs exit warning resets after a non-exit command (`eval.rs:1730`).
 - [ ] **T5 — Shell integration marks** (codex-impl)
   - Emit OSC 133 A/B/C/D (prompt start, command start, output start, command end with exit code) and OSC 7 (cwd as file:// URL) when interactive; opt-out variable.
   - Accept: PTY tests assert exact sequences and ordering.
@@ -126,5 +130,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T2b+T3 (`57783ec` epsh: reaped statuses kept for `wait`, stuck-running fix; `01e60a5` shell: `fg`/`bg`, Done/Killed pruned after `jobs`, SIGTTIN deadline excludes stopped time). Orchestrator: 5/5 workspace runs, make ci, PTY probe (Ctrl-Z, jobs, bg, fg+Ctrl-C=130, `sh -c "exit 7" & wait $!`=7). Codex confirmed the earlier make ci hang came from running it with a terminal stdin (T2e).
   Native consolidated review (`49243c1..01e60a5`, medium, slice budget): user granted, approved, acknowledged; 5 WARNINGs -> T3b.
 
+- T4 (`541d37b` epsh: immediate launch callbacks, opt-out of the stopped diagnostic; `79fcedc` shell: prompt-time Done/Exit/Killed/Stopped notifications with pruning, two-step exit with stopped jobs + SIGHUP/SIGCONT, Ctrl-Z prints only the job line). 8 existing PTY tests updated to the new behavior without weakening (per-test report from Codex). Orchestrator: 3/3 workspace runs, epsh alone green.
+  Native consolidated review (medium): user granted, approved, acknowledged; 2 WARNINGs -> T4b.
+
 ## Progress / Next step
-- T4 running on `codex-impl`; then T3b, T2e, T5, T6, T7, T8.
+- T3b running on `codex-impl`; then T4b, T2e, T5, T6, T7, T8.

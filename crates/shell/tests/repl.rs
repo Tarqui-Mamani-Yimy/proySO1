@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use rexpect::process::WaitStatus;
-use rexpect::session::{PtySession, spawn_command};
+use rexpect::session::{PtySession, ReadUntil, spawn_command};
 use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
@@ -136,6 +136,7 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
+        .env("SO1SH_SHELL_INTEGRATION", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     command.args(args);
@@ -145,6 +146,55 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
     // rexpect disables terminal echo, so output assertions cannot match typed input.
     let session = spawn_pty(command);
     (session, dir)
+}
+
+fn session_with_shell_integration(value: Option<&str>) -> (PtySession, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("HOME", dir.path())
+        .current_dir(dir.path());
+    if let Some(value) = value {
+        command.env("SO1SH_SHELL_INTEGRATION", value);
+    }
+    (spawn_pty(command), dir)
+}
+
+const OSC133_A: &str = "\x1b]133;A\x1b\\";
+const OSC133_B: &str = "\x1b]133;B\x1b\\";
+const OSC133_C: &str = "\x1b]133;C\x1b\\";
+const OSC133_D0: &str = "\x1b]133;D;0\x1b\\";
+const OSC133_D1: &str = "\x1b]133;D;1\x1b\\";
+
+fn expect_sequence(session: &mut PtySession, sequence: &str) -> String {
+    let (_, matched) = session
+        .exp_any(vec![ReadUntil::String(sequence.to_owned())])
+        .unwrap();
+    assert_eq!(matched, sequence);
+    matched
+}
+
+fn capture_primary_prompt(session: &mut PtySession) -> String {
+    let (before_prompt, matched) = session
+        .exp_any(vec![ReadUntil::String(OSC133_A.to_owned())])
+        .unwrap();
+    assert_eq!(matched, OSC133_A);
+    let visible_prompt = session.exp_string("$ ").unwrap();
+    let matched_input = expect_sequence(session, OSC133_B);
+    format!("{before_prompt}{matched}{visible_prompt}{matched_input}")
+}
+
+fn assert_sequences_in_order(output: &str, sequences: &[&str]) {
+    let mut offset = 0;
+    for sequence in sequences {
+        let next = output[offset..]
+            .find(sequence)
+            .unwrap_or_else(|| panic!("missing {sequence:?} after byte {offset}: {output:?}"));
+        offset += next + sequence.len();
+    }
 }
 
 // Consume the editor's echoed submission before checking real command output.
@@ -1353,6 +1403,7 @@ mod startup_rc {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
+            .env("SO1SH_SHELL_INTEGRATION", "0")
             .env("SO1SH_HISTFILE", dir.path().join("history"))
             .current_dir(dir.path());
         if let Some(rc) = rc {
@@ -2047,4 +2098,171 @@ fn stopped_job_exit_warning_resets_after_a_non_exit_command() {
         std::thread::yield_now();
     }
     cleanup.disarm();
+}
+
+#[test]
+fn shell_integration_starts_primary_prompt_with_osc133() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(None);
+    let prompt = session.exp_string("$ ").unwrap();
+    assert!(
+        prompt
+            .as_bytes()
+            .windows(b"\x1b]133;A\x1b\\".len())
+            .any(|window| window == b"\x1b]133;A\x1b\\"),
+        "primary prompt is missing OSC 133;A: {prompt:?}"
+    );
+    session.send_line("exit").unwrap();
+    session.exp_eof().unwrap();
+    assert!(matches!(
+        session.process().wait().unwrap(),
+        WaitStatus::Exited(_, 0)
+    ));
+}
+
+fn submit_until_sequence(session: &mut PtySession, line: &str, end: &str) -> String {
+    session.send_line(line).unwrap();
+    let accepted = session.exp_string("\r\n").unwrap();
+    let (output, matched) = session
+        .exp_any(vec![ReadUntil::String(end.to_owned())])
+        .unwrap();
+    assert_eq!(matched, end);
+    format!("{accepted}{output}{matched}")
+}
+
+#[test]
+fn shell_integration_marks_echo_false_and_empty_lines() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(None);
+    let prompt = capture_primary_prompt(&mut session);
+    assert_sequences_in_order(&prompt, &["\x1b]7;file://", OSC133_A, OSC133_B]);
+
+    let echo = submit_until_sequence(&mut session, "echo hi", OSC133_D0);
+    assert_sequences_in_order(&echo, &[OSC133_C, "hi\r\n", OSC133_D0]);
+    capture_primary_prompt(&mut session);
+
+    let redirected = submit_until_sequence(&mut session, "echo file-only > output", OSC133_D0);
+    assert_sequences_in_order(&redirected, &[OSC133_C, OSC133_D0]);
+    assert_eq!(
+        std::fs::read_to_string(_dir.path().join("output")).unwrap(),
+        "file-only\n"
+    );
+    capture_primary_prompt(&mut session);
+
+    let false_line = submit_until_sequence(&mut session, "false", OSC133_D1);
+    assert_sequences_in_order(&false_line, &[OSC133_C, OSC133_D1]);
+    capture_primary_prompt(&mut session);
+
+    let empty_line = submit_until_sequence(&mut session, "", OSC133_D1);
+    assert_sequences_in_order(&empty_line, &[OSC133_C, OSC133_D1]);
+    capture_primary_prompt(&mut session);
+    submit_until_sequence(&mut session, "exit", OSC133_D1);
+    exited(&mut session, 1);
+}
+
+#[test]
+fn shell_integration_reports_cwd_after_cd() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(None);
+    capture_primary_prompt(&mut session);
+    let cd = submit_until_sequence(&mut session, "cd /tmp", OSC133_D0);
+    assert_sequences_in_order(&cd, &[OSC133_C, OSC133_D0]);
+    let prompt = capture_primary_prompt(&mut session);
+    assert!(prompt.contains("\x1b]7;file://"), "{prompt:?}");
+    assert!(
+        prompt.contains("/tmp\x1b\\"),
+        "OSC 7 did not report /tmp: {prompt:?}"
+    );
+    assert_sequences_in_order(&prompt, &["/tmp\x1b\\", OSC133_A, OSC133_B]);
+    submit_until_sequence(&mut session, "exit", OSC133_D0);
+    exited(&mut session, 0);
+}
+
+#[test]
+fn shell_integration_multiline_input_has_one_prompt_and_command_block() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(None);
+    let prompt = capture_primary_prompt(&mut session);
+    assert_eq!(prompt.matches(OSC133_A).count(), 1);
+    assert_eq!(prompt.matches(OSC133_B).count(), 1);
+
+    session.send_line("if true; then").unwrap();
+    let first_continuation = session.exp_string("> ").unwrap();
+    assert!(!first_continuation.contains(OSC133_A));
+    assert!(!first_continuation.contains(OSC133_B));
+    session.send_line("echo multiline-ok").unwrap();
+    let second_continuation = session.exp_string("> ").unwrap();
+    assert!(!second_continuation.contains(OSC133_A));
+    assert!(!second_continuation.contains(OSC133_B));
+    let output = submit_until_sequence(&mut session, "fi", "\x1b]133;D;0\x1b\\");
+    assert_sequences_in_order(&output, &[OSC133_C, "multiline-ok\r\n", OSC133_D0]);
+    assert_eq!(output.matches(OSC133_C).count(), 1);
+    assert_eq!(output.matches(OSC133_D0).count(), 1);
+    capture_primary_prompt(&mut session);
+    submit_until_sequence(&mut session, "exit", OSC133_D0);
+    exited(&mut session, 0);
+}
+
+#[test]
+fn shell_integration_ctrl_c_discards_input_without_command_marks() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(None);
+    capture_primary_prompt(&mut session);
+    session.send("echo should-not-run").unwrap();
+    session.flush().unwrap();
+    session.send_control('c').unwrap();
+    let cancelled = session.exp_string("$ ").unwrap();
+    assert!(!cancelled.contains(OSC133_C), "{cancelled:?}");
+    assert!(!cancelled.contains("\x1b]133;D;"), "{cancelled:?}");
+    expect_sequence(&mut session, OSC133_B);
+    submit_until_sequence(&mut session, "exit", OSC133_D0);
+    exited(&mut session, 0);
+}
+
+#[test]
+fn shell_integration_can_be_disabled() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(Some("0"));
+    let first = session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo integration-disabled");
+    let output = session.exp_string("integration-disabled\r\n").unwrap();
+    let next = session.exp_string("$ ").unwrap();
+    session.send_line("exit").unwrap();
+    let tail = session.exp_eof().unwrap();
+    let combined = format!("{first}{output}{next}{tail}");
+    for marker in ["\x1b]7;", "\x1b]133;"] {
+        assert!(
+            !combined.contains(marker),
+            "opt-out leaked {marker:?}: {combined:?}"
+        );
+    }
+    assert!(matches!(
+        session.process().wait().unwrap(),
+        WaitStatus::Exited(_, 0)
+    ));
+}
+
+#[test]
+fn shell_integration_prompt_markers_do_not_break_wrapped_input() {
+    use std::os::fd::AsRawFd;
+
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_shell_integration(None);
+    let tty = session.process().get_file_handle().unwrap();
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 18,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
+    capture_primary_prompt(&mut session);
+    let output = submit_until_sequence(&mut session, "printf '%s\\n' wrapped-input-ok", OSC133_D0);
+    assert_sequences_in_order(&output, &[OSC133_C, "wrapped-input-ok\r\n", OSC133_D0]);
+    capture_primary_prompt(&mut session);
+    submit_until_sequence(&mut session, "exit", OSC133_D0);
+    exited(&mut session, 0);
 }

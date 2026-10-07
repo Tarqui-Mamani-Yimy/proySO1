@@ -2,13 +2,59 @@ use std::borrow::Cow;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use epsh::eval::Shell;
 use epsh::parser::Parser;
 use reedline::{
     DefaultPrompt, FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
-    Signal, ValidationResult, Validator,
+    SemanticPromptMarkers, Signal, ValidationResult, Validator,
 };
+
+const OSC133_PROMPT_START: &[u8] = b"\x1b]133;A\x1b\\";
+const OSC133_COMMAND_EXECUTED: &[u8] = b"\x1b]133;C\x1b\\";
+
+#[derive(Default)]
+struct PromptMarkerState {
+    command_input_started: AtomicBool,
+    prompt_kind: AtomicU8,
+}
+
+impl PromptMarkerState {
+    fn begin_line(&self) {
+        self.command_input_started.store(false, Ordering::Relaxed);
+        self.prompt_kind.store(0, Ordering::Relaxed);
+    }
+}
+
+struct ShellSemanticMarkers(Arc<PromptMarkerState>);
+
+impl SemanticPromptMarkers for ShellSemanticMarkers {
+    fn prompt_start(&self, kind: reedline::PromptKind) -> Cow<'_, str> {
+        // OSC 133;A is sent to /dev/tty immediately before Reedline paints.
+        // Continuation prompts remain inside that same input block.
+        let kind = match kind {
+            reedline::PromptKind::Primary => 1,
+            reedline::PromptKind::Secondary => 2,
+            reedline::PromptKind::Right => 3,
+        };
+        self.0.prompt_kind.store(kind, Ordering::Relaxed);
+        Cow::Borrowed("")
+    }
+
+    fn command_input_start(&self) -> Cow<'_, str> {
+        if self.0.prompt_kind.load(Ordering::Relaxed) != 1 {
+            return Cow::Borrowed("");
+        }
+        let was_started = self.0.command_input_started.swap(true, Ordering::Relaxed);
+        if was_started {
+            Cow::Borrowed("")
+        } else {
+            Cow::Borrowed("\x1b]133;B\x1b\\")
+        }
+    }
+}
 
 struct ShellValidator;
 
@@ -119,6 +165,11 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     };
     shell.opts_mut().interactive = true;
+    let shell_integration_enabled = std::env::var("SO1SH_SHELL_INTEGRATION").as_deref() != Ok("0")
+        && terminal
+            .as_ref()
+            .is_some_and(crate::terminal::Terminal::stdout_is_controlling_tty);
+    let marker_state = Arc::new(PromptMarkerState::default());
     if let Some(command) = startup_rc_command(shell) {
         // Quoted variable expansion preserves path bytes without interpreting
         // the filename as shell syntax. Reuse '.' and normal REPL error/exit flow.
@@ -132,6 +183,11 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     }
     let mut editor = Reedline::create().with_validator(Box::new(ShellValidator));
+    if shell_integration_enabled {
+        editor = editor.with_semantic_markers(Some(Box::new(ShellSemanticMarkers(Arc::clone(
+            &marker_state,
+        )))));
+    }
     if let Some(path) = history_path(shell) {
         match FileBackedHistory::with_file(reedline::HISTORY_SIZE, path) {
             Ok(history) => editor = editor.with_history(Box::new(history)),
@@ -139,6 +195,14 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     }
     loop {
+        if shell_integration_enabled {
+            let terminal = terminal
+                .as_ref()
+                .expect("enabled integration has a terminal");
+            terminal.report_cwd(shell.cwd())?;
+            terminal.write_shell_integration(OSC133_PROMPT_START)?;
+            marker_state.begin_line();
+        }
         match editor.read_line(&ShellPrompt::from_shell(shell))? {
             Signal::Success(source) => {
                 // Flush before evaluation, including exit, so history survives sessions.
@@ -148,10 +212,26 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                 if let Some(terminal) = &terminal {
                     terminal.reclaim()?;
                 }
+                if shell_integration_enabled {
+                    terminal
+                        .as_ref()
+                        .expect("enabled integration has a terminal")
+                        .write_shell_integration(OSC133_COMMAND_EXECUTED)?;
+                }
                 let result = shell.eval_repl_line(&source);
                 crate::jobs::sync(shell, &jobs);
                 if let Some(terminal) = &terminal {
                     terminal.reclaim()?;
+                }
+                if shell_integration_enabled {
+                    let status = match &result {
+                        ControlFlow::Continue(status) | ControlFlow::Break(status) => status.code(),
+                    };
+                    let finished = format!("\x1b]133;D;{status}\x1b\\");
+                    terminal
+                        .as_ref()
+                        .expect("enabled integration has a terminal")
+                        .write_shell_integration(finished.as_bytes())?;
                 }
                 if let ControlFlow::Break(status) = result {
                     return Ok(status.code());

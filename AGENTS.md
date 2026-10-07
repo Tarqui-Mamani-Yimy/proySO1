@@ -261,6 +261,17 @@ primitives for an interactive shell to be built on top:
 Everything else (prompt, history, line editing, `fg`/`bg`/`jobs`) is the
 interactive shell's responsibility.
 
+so1sh emits terminal shell-integration metadata when running interactively and
+stdout is the acquired controlling terminal. OSC 7 reports the current working
+directory before each prompt; OSC 133 uses `A` for prompt start, `B` for the
+end of the primary prompt/start of input, `C` before each accepted command
+line (including an empty line), and `D;<status>` after it finishes. A line
+cancelled with Ctrl-C before acceptance emits no `C` or `D`; the next prompt
+starts a fresh block. Multiline PS2 input remains within one block. Metadata is
+written to the terminal, not through shell output or command redirections.
+Sequences use the 7-bit ST terminator (`ESC \\`). Set
+`SO1SH_SHELL_INTEGRATION=0` to disable all shell-integration sequences.
+
 ### Embedder Builtins
 
 Applications can register shell-local builtins on a `Shell` instance with

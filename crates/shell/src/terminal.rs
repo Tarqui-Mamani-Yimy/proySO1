@@ -1,6 +1,8 @@
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 const FOREGROUND_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const FOREGROUND_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -121,6 +123,58 @@ impl Terminal {
         }
         Ok(())
     }
+
+    /// Write shell-integration metadata directly to the controlling terminal.
+    pub fn write_shell_integration(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut file = &self.file;
+        file.write_all(bytes)
+    }
+
+    /// Reedline renders prompts to stdout; only enable its prompt markers when
+    /// stdout is the same terminal acquired for interactive input.
+    pub fn stdout_is_controlling_tty(&self) -> bool {
+        unsafe {
+            libc::isatty(libc::STDOUT_FILENO) == 1
+                && libc::tcgetpgrp(libc::STDOUT_FILENO) == self.pgid
+                && libc::tcgetpgrp(self.file.as_raw_fd()) == self.pgid
+        }
+    }
+
+    /// Report the cwd as an OSC 7 file URL without routing through shell output.
+    pub fn report_cwd(&self, cwd: &Path) -> io::Result<()> {
+        let hostname = hostname_bytes().unwrap_or_else(|| b"localhost".to_vec());
+        let mut sequence = b"\x1b]7;file://".to_vec();
+        append_url_bytes(&mut sequence, &hostname, false);
+        append_url_bytes(&mut sequence, cwd.as_os_str().as_bytes(), true);
+        sequence.extend_from_slice(b"\x1b\\");
+        self.write_shell_integration(&sequence)
+    }
+}
+
+fn hostname_bytes() -> Option<Vec<u8>> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: buffer is writable and its length is passed to gethostname.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == -1 {
+        return None;
+    }
+    let len = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    Some(buffer[..len].to_vec())
+}
+
+fn append_url_bytes(out: &mut Vec<u8>, bytes: &[u8], keep_slash: bool) {
+    for &byte in bytes {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && byte == b'/')
+        {
+            out.push(byte);
+        } else {
+            out.extend_from_slice(format!("%{byte:02X}").as_bytes());
+        }
+    }
 }
 
 impl Drop for Terminal {
@@ -130,5 +184,18 @@ impl Drop for Terminal {
             libc::tcsetattr(self.file.as_raw_fd(), libc::TCSADRAIN, &self.modes);
             libc::tcsetpgrp(self.file.as_raw_fd(), self.original_group);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_url_bytes;
+
+    #[test]
+    fn osc7_url_bytes_are_percent_encoded_without_losing_path_slashes() {
+        let mut url = Vec::new();
+        append_url_bytes(&mut url, b"host name", false);
+        append_url_bytes(&mut url, b"/tmp/a b%", true);
+        assert_eq!(url, b"host%20name/tmp/a%20b%25");
     }
 }

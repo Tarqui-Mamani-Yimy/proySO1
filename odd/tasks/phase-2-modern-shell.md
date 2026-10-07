@@ -103,10 +103,14 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Emit OSC 133 A/B/C/D (prompt start, command start, output start, command end with exit code) and OSC 7 (cwd as file:// URL) when interactive; opt-out variable.
   - Accept: PTY tests assert exact sequences and ordering.
 - [x] **T6 — Tab completion** (codex-impl) — `77c88ce` OSC 7 hostname, `8115caf` completion.
-- [ ] **T6b — Review correction (PENDING, plan 40 lines)**: native review lineage review-065e210f56cc033f returned correction_required for `tab_lists_multiple_file_matches` (`crates/shell/tests/repl.rs:2318`) expecting `MULTI-FIRST.TXT`; real terminal output is lowercase (orchestrator probe) yet the test passes -> it does not prove what it claims. Fix the expectation, explain why uppercase matched, commit, then re-query STATUS for that lineage (expect corrected_candidate -> targeted validation -> acknowledge).
+- [x] **T6b — Review correction (plan 40 lines)** — `a848e3f`; root cause: PTY helper uses TERM=dumb and reedline's plain menu uppercases the selected candidate.: native review lineage review-065e210f56cc033f returned correction_required for `tab_lists_multiple_file_matches` (`crates/shell/tests/repl.rs:2318`) expecting `MULTI-FIRST.TXT`; real terminal output is lowercase (orchestrator probe) yet the test passes -> it does not prove what it claims. Fix the expectation, explain why uppercase matched, commit, then re-query STATUS for that lineage (expect corrected_candidate -> targeted validation -> acknowledge).
   - Commands (builtins, functions, embedder builtins, PATH executables), file paths (quoting spaces), `$VAR` names.
 - [x] **T7 — Hints and syntax highlighting** (codex-impl)
   - History-based ghost-text hints; highlighting via the epsh lexer (commands found/not found, strings, operators).
+- [ ] **T6c — Completion follow-ups from the T5-T7 review** (codex-impl, after T2e)
+  - R3-path-symlink-executables-dropped: `executable_names` uses `DirEntry::metadata`, which does not follow symlinks, so symlinked executables in PATH (python3, alternatives, Homebrew/Nix/asdf shims) never complete and — through the shared cache — are highlighted as unknown (`completion.rs:165-168`).
+  - R3-path-prefixed-command-completion-empty: a command-position prefix containing `/` (`./scr<Tab>`, `/usr/bin/py<Tab>`) offers nothing; it must fall back to executable file completion (`completion.rs:132-136`).
+  - Suggestions: highlighter byte/char offset unit test (`highlighter.rs:32-37`); a terminal write failure of integration marks should not end the REPL (`repl.rs:230-231`); per-prompt PATH scan cost (`repl.rs:225`).
 - [ ] **T8 — Phase verification** (fresh Claude verifier subagent)
 
 ## Verification evidence
@@ -157,6 +161,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - Pending: T6b correction (above), T7, T2e, T8. Then Phase 2 closes.
 
 - T7 (`38d6e97`): history ghost-text hints (Right/End accept), epsh-lexer highlighting (resolved vs unknown commands via per-prompt PATH cache, strings, operators, variables, comments), never alters submitted text, plain-text fallback on lexer errors, `SO1SH_HIGHLIGHT=0` opt-out; dependency nu-ansi-term (MIT, already in reedline's tree). Orchestrator 2/2 workspace runs green.
+
+- Native review for T5..T7+T6b: correction -> `a848e3f` -> provider `recover` (scope_changed, lineage review-bd6c08d86940dc7f) -> consolidated review approved, acknowledged; 2 WARNINGs -> T6c.
 
 ## Progress / Next step
 - Next: T6 (tab completion) on `codex-impl` (+ OSC 7 hostname); then T7, T2e, T8.

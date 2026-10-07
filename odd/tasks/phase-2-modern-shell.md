@@ -99,7 +99,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Suggestion: test that the stopped-jobs exit warning resets after a non-exit command (`eval.rs:1730`).
 - [x] **T2f — Systematic PTY test reliability** (codex-impl)
   - PTY tests time out intermittently under parallel load (Codex T3c run: `foreground_ctrl_z_is_reported_and_cleaned_up_by_test` 1/5; orchestrator T4b runs under review load). Serialize PTY tests in the repl binary, centralize generous timeouts (env-overridable), remove remaining fixed sleeps; prove with 10 workspace runs under an artificial CPU hog.
-- [ ] **T5 — Shell integration marks** (codex-impl)
+- [x] **T5 — Shell integration marks** (codex-impl)
   - Emit OSC 133 A/B/C/D (prompt start, command start, output start, command end with exit code) and OSC 7 (cwd as file:// URL) when interactive; opt-out variable.
   - Accept: PTY tests assert exact sequences and ordering.
 - [ ] **T6 — Tab completion** (codex-impl)
@@ -147,5 +147,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T2f (`58076a7`): process-wide mutex serializes the 78 PTY tests, one 20 s timeout (`SO1SH_TEST_TIMEOUT_SECS`), state-synchronized polling. Codex 10/10 and orchestrator 3/3 workspace runs green with CPU hogs; repl binary ~6 s -> ~50 s (accepted tradeoff).
   Native consolidated review of `f377798..58076a7` (T4b, T3c, T2f): medium, user granted, approved with suggestions only (no WARNINGs), acknowledged. Suggestion: `yield_now` spin polling under load (`repl.rs:1112`).
 
+- T5 (`9b8b256`): OSC 7 before each prompt + OSC 133 A/B/C/D (ST terminator), terminal-only, one block for multiline, none for Ctrl-C-discarded input, `SO1SH_SHELL_INTEGRATION=0` opt-out; reedline secondary-prompt callbacks no longer consume B early; 12 new PTY tests incl. wrapped long input; legacy PTY fixtures opt out of marks. Orchestrator PTY probe: `false` -> `133;D;1`, `cd /tmp` -> `7;file://localhost/tmp`.
+  Follow-up: OSC 7 uses host `localhost`; terminals use the real hostname to detect remote sessions -> use gethostname.
+
 ## Progress / Next step
-- T5 (OSC 133 / OSC 7) running on `codex-impl`; then T6, T7, T2e, T8.
+- Next: T6 (tab completion) on `codex-impl` (+ OSC 7 hostname); then T7, T2e, T8.

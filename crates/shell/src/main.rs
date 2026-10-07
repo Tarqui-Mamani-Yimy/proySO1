@@ -1,3 +1,4 @@
+mod completion;
 mod jobs;
 mod repl;
 mod terminal;

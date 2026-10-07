@@ -207,6 +207,24 @@ fn assert_no_output(output: &str) {
     assert!(strip_ansi_escapes::strip(output).is_empty(), "{output:?}");
 }
 
+fn encoded_local_hostname() -> String {
+    let mut hostname = [0u8; 256];
+    assert_eq!(
+        unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) },
+        0
+    );
+    let hostname = &hostname[..hostname.iter().position(|&byte| byte == 0).unwrap_or(256)];
+    let mut encoded = String::new();
+    for &byte in hostname {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn exited(session: &mut PtySession, code: i32) {
     session.exp_eof().unwrap();
     assert!(
@@ -2169,9 +2187,10 @@ fn shell_integration_reports_cwd_after_cd() {
     assert_sequences_in_order(&cd, &[OSC133_C, OSC133_D0]);
     let prompt = capture_primary_prompt(&mut session);
     assert!(prompt.contains("\x1b]7;file://"), "{prompt:?}");
+    let expected_url = format!("\x1b]7;file://{}/tmp\x1b\\", encoded_local_hostname());
     assert!(
-        prompt.contains("/tmp\x1b\\"),
-        "OSC 7 did not report /tmp: {prompt:?}"
+        prompt.contains(&expected_url),
+        "OSC 7 did not report the system hostname and /tmp ({expected_url:?}): {prompt:?}"
     );
     assert_sequences_in_order(&prompt, &["/tmp\x1b\\", OSC133_A, OSC133_B]);
     submit_until_sequence(&mut session, "exit", OSC133_D0);
@@ -2264,5 +2283,42 @@ fn shell_integration_prompt_markers_do_not_break_wrapped_input() {
     assert_sequences_in_order(&output, &[OSC133_C, "wrapped-input-ok\r\n", OSC133_D0]);
     capture_primary_prompt(&mut session);
     submit_until_sequence(&mut session, "exit", OSC133_D0);
+    exited(&mut session, 0);
+}
+
+#[test]
+fn tab_completes_a_unique_builtin_command() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session();
+
+    session.exp_string("$ ").unwrap();
+    session.send("ech").unwrap();
+    session.send("\t").unwrap();
+    session.send("tab-completed").unwrap();
+    session.flush().unwrap();
+    session.send_line("").unwrap();
+    session.exp_string("\r\n").unwrap();
+    assert_no_output(&session.exp_string("tab-completed\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn tab_lists_multiple_file_matches() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, dir) = session();
+    std::fs::write(dir.path().join("multi-first.txt"), "").unwrap();
+    std::fs::write(dir.path().join("multi-second.txt"), "").unwrap();
+
+    session.exp_string("$ ").unwrap();
+    session.send("cat multi-").unwrap();
+    session.send("\t").unwrap();
+    session.flush().unwrap();
+    session.exp_string("MULTI-FIRST.TXT").unwrap();
+    session.exp_string("multi-second.txt").unwrap();
+    session.send_control('c').unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
     exited(&mut session, 0);
 }

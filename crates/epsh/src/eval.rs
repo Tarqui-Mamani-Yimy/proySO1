@@ -875,6 +875,11 @@ impl Shell {
     pub fn functions(&self) -> &FxHashMap<String, Command> {
         &self.functions
     }
+
+    /// Iterate over names registered as embedder builtins on this shell.
+    pub fn embedder_builtin_names(&self) -> impl Iterator<Item = &str> {
+        self.embedder_builtins.keys().map(String::as_str)
+    }
     /// Last command's exit status (`$?`).
     pub fn exit_status(&self) -> ExitStatus {
         self.exit_status

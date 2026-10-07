@@ -158,6 +158,11 @@ impl Variables {
         self.vars.get(name).and_then(|v| v.value.as_ref())
     }
 
+    /// Iterate over shell variable names, including unset exported/readonly names.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.vars.keys().map(String::as_str)
+    }
+
     /// Get a variable's value as UTF-8, if valid. Returns None if unset or not UTF-8.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.get_bytes(name).and_then(ShellBytes::as_utf8_str)

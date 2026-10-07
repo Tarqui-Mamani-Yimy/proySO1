@@ -5,11 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use crate::completion::{CompletionState, ShellCompleter};
 use epsh::eval::Shell;
 use epsh::parser::Parser;
 use reedline::{
-    DefaultPrompt, FileBackedHistory, Prompt, PromptEditMode, PromptHistorySearch, Reedline,
-    SemanticPromptMarkers, Signal, ValidationResult, Validator,
+    ColumnarMenu, DefaultPrompt, Emacs, FileBackedHistory, KeyCode, KeyModifiers, MenuBuilder,
+    Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu,
+    SemanticPromptMarkers, Signal, ValidationResult, Validator, default_emacs_keybindings,
 };
 
 const OSC133_PROMPT_START: &[u8] = b"\x1b]133;A\x1b\\";
@@ -182,7 +184,24 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
             return Ok(status.code());
         }
     }
-    let mut editor = Reedline::create().with_validator(Box::new(ShellValidator));
+    let completion_state = CompletionState::new(shell);
+    let completion_menu = Box::new(ColumnarMenu::default().with_name("shell_completion_menu"));
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("shell_completion_menu".to_owned()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    let edit_mode = Box::new(Emacs::new(keybindings));
+    let mut editor = Reedline::create()
+        .with_validator(Box::new(ShellValidator))
+        .with_completer(Box::new(ShellCompleter::new(completion_state.clone())))
+        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_quick_completions(true)
+        .with_edit_mode(edit_mode);
     if shell_integration_enabled {
         editor = editor.with_semantic_markers(Some(Box::new(ShellSemanticMarkers(Arc::clone(
             &marker_state,
@@ -195,6 +214,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     }
     loop {
+        completion_state.refresh(shell);
         if shell_integration_enabled {
             let terminal = terminal
                 .as_ref()

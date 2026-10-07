@@ -1,3 +1,4 @@
 /target
 .atl/
 .codegraph/
+rustc-ice-*.txt

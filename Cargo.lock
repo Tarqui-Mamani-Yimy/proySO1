@@ -710,6 +710,7 @@ version = "0.1.0"
 dependencies = [
  "epsh",
  "libc",
+ "nu-ansi-term",
  "reedline",
  "rexpect",
  "strip-ansi-escapes",

@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::completion::{CompletionState, ShellCompleter};
+use crate::highlighter::ShellHighlighter;
+use crate::history_hint::HistoryHinter;
 use epsh::eval::Shell;
 use epsh::parser::Parser;
 use reedline::{
@@ -202,6 +204,12 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_quick_completions(true)
         .with_edit_mode(edit_mode);
+    let highlighting_enabled = std::env::var("SO1SH_HIGHLIGHT").as_deref() != Ok("0");
+    if highlighting_enabled {
+        editor = editor
+            .with_highlighter(Box::new(ShellHighlighter::new(completion_state.clone())))
+            .with_hinter(Box::new(HistoryHinter::default()));
+    }
     if shell_integration_enabled {
         editor = editor.with_semantic_markers(Some(Box::new(ShellSemanticMarkers(Arc::clone(
             &marker_state,

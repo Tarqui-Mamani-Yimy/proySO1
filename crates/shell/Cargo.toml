@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 epsh = { path = "../epsh" }
 libc = "0.2"
+nu-ansi-term = "0.50.3"
 reedline = "0.52.1"
 
 [dev-dependencies]

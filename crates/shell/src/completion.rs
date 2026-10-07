@@ -12,10 +12,7 @@ use reedline::{Completer, CompletionResult, Span, Suggestion};
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CompletionContext {
     cwd: PathBuf,
-    path: Vec<PathBuf>,
-    builtins: Vec<String>,
-    embedder_builtins: Vec<String>,
-    functions: Vec<String>,
+    command_names: BTreeSet<String>,
     variables: Vec<String>,
 }
 
@@ -33,22 +30,26 @@ impl CompletionContext {
                             cwd.join(directory)
                         }
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let embedder_builtins = shell.embedder_builtin_names().map(str::to_owned).collect();
+        let mut command_names = BUILTIN_NAMES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<BTreeSet<_>>();
+        command_names.extend(shell.embedder_builtin_names().map(str::to_owned));
+        command_names.extend(shell.functions().keys().cloned());
+        command_names.extend(executable_names(&path));
 
         Self {
             cwd,
-            path,
-            builtins: BUILTIN_NAMES
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
-            embedder_builtins,
-            functions: shell.functions().keys().cloned().collect(),
+            command_names,
             variables: shell.vars().names().map(str::to_owned).collect(),
         }
+    }
+
+    pub(crate) fn resolves_command(&self, name: &str) -> bool {
+        self.command_names.contains(name)
     }
 }
 
@@ -66,6 +67,14 @@ impl CompletionState {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             CompletionContext::from_shell(shell);
+    }
+
+    pub(crate) fn with_context<T>(&self, use_context: impl FnOnce(&CompletionContext) -> T) -> T {
+        let context = self
+            .0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use_context(&context)
     }
 }
 
@@ -133,11 +142,22 @@ fn command_completions(
     pos: usize,
     context: &CompletionContext,
 ) -> Vec<Suggestion> {
+    context
+        .command_names
+        .iter()
+        .filter(|name| name.starts_with(prefix))
+        .map(|name| Suggestion {
+            value: escape_shell_word(name),
+            span: Span::new(start, pos),
+            append_whitespace: true,
+            ..Suggestion::default()
+        })
+        .collect()
+}
+
+fn executable_names(path: &[PathBuf]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    names.extend(context.builtins.iter().cloned());
-    names.extend(context.embedder_builtins.iter().cloned());
-    names.extend(context.functions.iter().cloned());
-    for directory in &context.path {
+    for directory in path {
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
         };
@@ -154,15 +174,6 @@ fn command_completions(
         }
     }
     names
-        .into_iter()
-        .filter(|name| name.starts_with(prefix))
-        .map(|name| Suggestion {
-            value: escape_shell_word(&name),
-            span: Span::new(start, pos),
-            append_whitespace: true,
-            ..Suggestion::default()
-        })
-        .collect()
 }
 
 fn file_completions(
@@ -214,7 +225,7 @@ fn file_completions(
     suggestions
 }
 
-fn command_position(prefix: &str) -> bool {
+pub(crate) fn command_position(prefix: &str) -> bool {
     let mut lexer = Lexer::new(prefix);
     let mut command_seen = false;
     let mut redirection_target = false;
@@ -335,7 +346,7 @@ fn variable_prefix(raw: &str) -> Option<(usize, &str, bool)> {
     Some((name_start, prefix, braced))
 }
 
-fn unescape_shell_word(raw: &str) -> String {
+pub(crate) fn unescape_shell_word(raw: &str) -> String {
     let mut out = String::new();
     let mut quote = None;
     let mut escaped = false;
@@ -380,7 +391,7 @@ fn escape_shell_word(word: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionContext, complete};
+    use super::{CompletionContext, complete, executable_names};
     use epsh::error::ExitStatus;
     use epsh::eval::Shell;
     use std::fs;
@@ -391,10 +402,11 @@ mod tests {
     fn context(cwd: &Path, path: Vec<PathBuf>) -> CompletionContext {
         CompletionContext {
             cwd: cwd.to_path_buf(),
-            path,
-            builtins: vec!["echo".into()],
-            embedder_builtins: vec!["jobs".into()],
-            functions: vec!["greet".into()],
+            command_names: ["echo", "jobs", "greet"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(executable_names(&path))
+                .collect(),
             variables: vec!["PATH".into(), "PROJECT_ROOT".into()],
         }
     }
@@ -535,8 +547,8 @@ mod tests {
             .unwrap();
 
         let context = CompletionContext::from_shell(&shell);
-        assert!(context.functions.contains(&"greet".to_owned()));
-        assert!(context.embedder_builtins.contains(&"host_job".to_owned()));
+        assert!(context.resolves_command("greet"));
+        assert!(context.resolves_command("host_job"));
         assert!(context.variables.contains(&"PROJECT_ROOT".to_owned()));
         assert_eq!(values(complete("uni", 3, &context)), vec!["unique-tool"]);
     }

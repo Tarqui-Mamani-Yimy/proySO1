@@ -137,6 +137,7 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("SO1SH_SHELL_INTEGRATION", "0")
+        .env("SO1SH_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     command.args(args);
@@ -156,6 +157,7 @@ fn session_with_shell_integration(value: Option<&str>) -> (PtySession, TempDir) 
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("HOME", dir.path())
+        .env("SO1SH_HIGHLIGHT", "0")
         .current_dir(dir.path());
     if let Some(value) = value {
         command.env("SO1SH_SHELL_INTEGRATION", value);
@@ -490,6 +492,7 @@ fn history_session_with_file(dir: &TempDir, path: Option<&std::path::Path>) -> P
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
+        .env("SO1SH_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     if let Some(path) = path {
@@ -1154,6 +1157,7 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
+        .env("SO1SH_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .env("PS1", "parent> ")
         .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
@@ -1215,6 +1219,7 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
+        .env("SO1SH_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     // SAFETY: child-only async-signal-safe detachment; keep stdin's tty fd open.
@@ -1422,6 +1427,7 @@ mod startup_rc {
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
             .env("SO1SH_SHELL_INTEGRATION", "0")
+            .env("SO1SH_HIGHLIGHT", "0")
             .env("SO1SH_HISTFILE", dir.path().join("history"))
             .current_dir(dir.path());
         if let Some(rc) = rc {
@@ -1503,6 +1509,7 @@ mod startup_rc {
                 format!("{}:/usr/bin:/bin", path_dir.path().display()),
             )
             .env("TERM", "dumb")
+            .env("SO1SH_HIGHLIGHT", "0")
             .env("HOME", dir.path())
             .env("SO1SH_RC", "rcfile")
             .current_dir(&dir);
@@ -2318,6 +2325,55 @@ fn tab_lists_multiple_file_matches() {
     session.exp_string("MULTI-FIRST.TXT").unwrap();
     session.exp_string("multi-second.txt").unwrap();
     session.send_control('c').unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn history_hint_is_visible_and_right_arrow_accepts_it() {
+    let _pty_test_guard = serialize_pty_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("SO1SH_SHELL_INTEGRATION", "0")
+        .env("SO1SH_HIGHLIGHT", "1")
+        .env("SO1SH_HISTFILE", dir.path().join("history"))
+        .env("HOME", dir.path())
+        .current_dir(dir.path());
+    let mut session = spawn_pty(command);
+    session.process_mut().set_kill_timeout(Some(1000));
+
+    session.exp_string("$ ").unwrap();
+    session.send("echo t7-history-hint").unwrap();
+    session.flush().unwrap();
+    session.exp_string("echo t7-history-hint").unwrap();
+    session.send_line("").unwrap();
+    session.exp_string("\r\n").unwrap();
+    assert_no_output(&session.exp_string("t7-history-hint\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+
+    session.send("echo t7-").unwrap();
+    session.flush().unwrap();
+    session.exp_string("history-hint").unwrap();
+    session.send("\x1b[C").unwrap();
+    session.flush().unwrap();
+    session.send_line("").unwrap();
+    session.exp_string("\r\n").unwrap();
+    assert_no_output(&session.exp_string("t7-history-hint\r\n").unwrap());
+    session.exp_string("$ ").unwrap();
+
+    session.send("echo t7-").unwrap();
+    session.flush().unwrap();
+    session.exp_string("history-hint").unwrap();
+    session.send("\x1b[F").unwrap();
+    session.flush().unwrap();
+    session.send_line("").unwrap();
+    session.exp_string("\r\n").unwrap();
+    assert_no_output(&session.exp_string("t7-history-hint\r\n").unwrap());
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");
     exited(&mut session, 0);

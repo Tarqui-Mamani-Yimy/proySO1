@@ -52,7 +52,7 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 
 ## Tasks (refined after T0)
 - [x] **T0 — Exploration and stack decision** (Codex, read-only)
-- [ ] **T1 — Crate skeleton + stack spike**: `crates/terminal`, open a window, clear it with wgpu; type-check Term; GPU init failure reported clearly.
+- [x] **T1 — Crate skeleton + stack spike** — `35f0b83`: window opens on Linux (adapter Intel UHD Graphics TGL GT1), wgpu clear, close/resize, clear GPU-init errors; unit tests for per-platform shell candidates and surface clamping. Windows/macOS cross-checks skipped: targets not installed.: `crates/terminal`, open a window, clear it with wgpu; type-check Term; GPU init failure reported clearly.
 - [ ] **T2 — OSC observer**: pure incremental parser for OSC 133 A/B/C/D and OSC 7, split at every byte boundary, malformed input (Phase 4 seam).
 - [ ] **T3 — PTY lifecycle**: spawn `so1sh`, stream output, write input, resize, child exit, cleanup.
 - [ ] **T4 — VT model adapter**: PTY chunks -> alacritty_terminal; tests for grid contents, cursor, scrollback without a window.
@@ -69,4 +69,4 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 _(filled per task)_
 
 ## Progress / Next step
-- T0 done; platforms decided (Linux/macOS/Windows). Next: T1 on `codex-impl`.
+- T1 done. Next: T2 (OSC observer) on `codex-impl`. Pending user decision: install rustup targets for Windows/macOS compile checks.

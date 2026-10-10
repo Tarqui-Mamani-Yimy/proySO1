@@ -53,6 +53,34 @@ mod tests {
         assert_eq!(status.exit_code(), 23);
     }
 
+    #[test]
+    fn output_reader_notifies_when_silent_child_exits() {
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let mut pty = Pty::spawn_notified_with_args(
+            "/bin/sh",
+            ["-c", "exit 23"],
+            Path::new("/"),
+            80,
+            24,
+            move || {
+                let _ = notify_tx.send(());
+            },
+        )
+        .unwrap();
+        notify_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("EOF should wake the event loop");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = pty.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "silent child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.exit_code(), 23);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn drop_terminates_child() {
@@ -136,19 +164,37 @@ impl Pty {
 
     /// Spawn the configured shell, preferring a sibling `so1sh` on Unix.
     pub fn spawn_shell(cwd: impl AsRef<Path>, cols: u16, rows: u16) -> io::Result<Self> {
+        Self::spawn_shell_notified(cwd, cols, rows, || {})
+    }
+
+    /// Spawn the shell and notify the UI after every output chunk is queued.
+    pub fn spawn_shell_notified<F>(
+        cwd: impl AsRef<Path>,
+        cols: u16,
+        rows: u16,
+        notify: F,
+    ) -> io::Result<Self>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let notify = std::sync::Arc::new(notify);
         if let Some(override_path) = std::env::var_os("SO1TERM_SHELL") {
-            return Self::spawn(override_path, cwd, cols, rows);
+            let callback = std::sync::Arc::clone(&notify);
+            return Self::spawn_notified(override_path, cwd, cols, rows, move || callback());
         }
         #[cfg(unix)]
         {
-            Self::spawn(resolve_shell(), cwd, cols, rows)
+            let callback = std::sync::Arc::clone(&notify);
+            Self::spawn_notified(resolve_shell(), cwd, cols, rows, move || callback())
         }
         #[cfg(windows)]
         {
             let candidates = crate::default_shell_candidates_for(true);
             let mut last_error = None;
             for candidate in candidates {
-                match Self::spawn(candidate, cwd.as_ref(), cols, rows) {
+                let callback = std::sync::Arc::clone(&notify);
+                match Self::spawn_notified(candidate, cwd.as_ref(), cols, rows, move || callback())
+                {
                     Ok(pty) => return Ok(pty),
                     Err(error) => last_error = Some(error),
                 }
@@ -164,6 +210,64 @@ impl Pty {
                 "PTY shell unsupported on this platform",
             ))
         }
+    }
+
+    fn spawn_notified(
+        executable: impl AsRef<Path>,
+        cwd: impl AsRef<Path>,
+        cols: u16,
+        rows: u16,
+        notify: impl Fn() + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_notified_with_args(
+            executable,
+            std::iter::empty::<&str>(),
+            cwd,
+            cols,
+            rows,
+            notify,
+        )
+    }
+
+    fn spawn_notified_with_args<I, S>(
+        executable: impl AsRef<Path>,
+        args: I,
+        cwd: impl AsRef<Path>,
+        cols: u16,
+        rows: u16,
+        notify: impl Fn() + Send + 'static,
+    ) -> io::Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let system = native_pty_system();
+        let pair = system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(other_io)?;
+        let mut command = CommandBuilder::new(executable.as_ref().as_os_str());
+        command.args(args);
+        command.cwd(cwd.as_ref().as_os_str());
+        command.env("TERM", "xterm-256color");
+        let child = pair.slave.spawn_command(command).map_err(other_io)?;
+        let reader = pair.master.try_clone_reader().map_err(other_io)?;
+        let writer = pair.master.take_writer().map_err(other_io)?;
+        let (sender, output) = mpsc::channel();
+        let reader = thread::Builder::new()
+            .name("so1term-pty-reader".into())
+            .spawn(move || read_output_notified(reader, sender, notify))?;
+        Ok(Self {
+            child,
+            master: Some(pair.master),
+            writer: Some(writer),
+            output,
+            reader: Some(reader),
+        })
     }
 
     /// Send raw terminal bytes to the child.
@@ -245,6 +349,28 @@ fn read_output(mut reader: Box<dyn Read + Send>, sender: mpsc::Sender<Vec<u8>>) 
     }
 }
 
+fn read_output_notified(
+    mut reader: Box<dyn Read + Send>,
+    sender: mpsc::Sender<Vec<u8>>,
+    notify: impl Fn(),
+) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => {
+                notify();
+                break;
+            }
+            Ok(length) => {
+                if sender.send(buffer[..length].to_vec()).is_err() {
+                    break;
+                }
+                notify();
+            }
+        }
+    }
+}
+
 fn other_io(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -265,5 +391,45 @@ pub fn resolve_shell() -> PathBuf {
     ) {
         "sibling-so1sh" => sibling.unwrap_or_else(|| PathBuf::from("so1sh")),
         selected => PathBuf::from(selected),
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::read_output_notified;
+    use std::{
+        io::{self, Cursor, Read},
+        sync::mpsc,
+    };
+
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("synthetic reader failure"))
+        }
+    }
+
+    #[test]
+    fn reader_notifies_after_data_and_after_eof_or_error() {
+        let (events, received) = mpsc::channel();
+        let (output, chunks) = mpsc::channel();
+        read_output_notified(Box::new(Cursor::new(b"data")), output, || {
+            events.send(()).unwrap()
+        });
+        assert_eq!(chunks.try_iter().collect::<Vec<_>>(), [b"data".to_vec()]);
+        assert_eq!(
+            received.try_iter().count(),
+            2,
+            "data and EOF each wake the event loop"
+        );
+
+        let (events, received) = mpsc::channel();
+        let (output, _chunks) = mpsc::channel();
+        read_output_notified(Box::new(FailingReader), output, || events.send(()).unwrap());
+        assert_eq!(
+            received.try_iter().count(),
+            1,
+            "read errors wake the event loop"
+        );
     }
 }

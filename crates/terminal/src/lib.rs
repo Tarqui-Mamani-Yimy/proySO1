@@ -1,6 +1,7 @@
 pub mod model;
 pub mod osc;
 pub mod pty;
+pub mod renderer;
 
 /// Default interactive-shell command candidates, in preference order.
 pub fn default_shell_candidates() -> &'static [&'static str] {

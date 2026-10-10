@@ -107,6 +107,44 @@ fn block_marker_bounds(cell_width: f32, cell_height: f32) -> [f32; 4] {
     ]
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockShortcut {
+    Previous,
+    Next,
+    Select,
+    CopyOutput,
+    CopyInput,
+}
+
+fn block_shortcut(key: &Key, mods: KeyModifiers, macos: bool) -> Option<BlockShortcut> {
+    let control_shift = mods.control && mods.shift;
+    match key {
+        Key::Named(NamedKey::ArrowUp)
+            if (mods.control && mods.shift) || (macos && mods.super_key && !mods.shift) =>
+        {
+            Some(BlockShortcut::Previous)
+        }
+        Key::Named(NamedKey::ArrowDown)
+            if (mods.control && mods.shift) || (macos && mods.super_key && !mods.shift) =>
+        {
+            Some(BlockShortcut::Next)
+        }
+        Key::Character(text)
+            if (control_shift || (macos && mods.super_key && mods.shift))
+                && text.eq_ignore_ascii_case("a") =>
+        {
+            Some(BlockShortcut::Select)
+        }
+        Key::Character(text) if control_shift && text.eq_ignore_ascii_case("o") => {
+            Some(BlockShortcut::CopyOutput)
+        }
+        Key::Character(text) if control_shift && text.eq_ignore_ascii_case("l") => {
+            Some(BlockShortcut::CopyInput)
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_overlay_rect(
     vertices: &mut Vec<RectVertex>,
@@ -429,6 +467,48 @@ impl TerminalWindow {
         }
     }
 
+    fn copy_block_text(&mut self, input: bool) {
+        let text = self.model.as_ref().and_then(|model| {
+            if input {
+                model.selected_block_input_text()
+            } else {
+                model.selected_block_output_text()
+            }
+        });
+        let Some(text) = text else { return };
+        let Some(clipboard) = self.clipboard() else {
+            return;
+        };
+        if let Err(error) = clipboard.set_text(text) {
+            eprintln!("so1term: clipboard copy failed: {error}");
+        }
+    }
+
+    fn handle_block_shortcut(&mut self, action: BlockShortcut) {
+        match action {
+            BlockShortcut::Previous => {
+                if let Some(model) = self.model.as_mut() {
+                    model.navigate_block(
+                        so1_terminal::block_navigation::NavigationDirection::Previous,
+                    );
+                }
+            }
+            BlockShortcut::Next => {
+                if let Some(model) = self.model.as_mut() {
+                    model.navigate_block(so1_terminal::block_navigation::NavigationDirection::Next);
+                }
+            }
+            BlockShortcut::Select => {
+                if let Some(model) = self.model.as_mut() {
+                    model.select_block_at_viewport();
+                }
+            }
+            BlockShortcut::CopyOutput => self.copy_block_text(false),
+            BlockShortcut::CopyInput => self.copy_block_text(true),
+        }
+        self.request_redraw();
+    }
+
     fn paste_clipboard(&mut self) {
         let text = match self
             .clipboard()
@@ -528,9 +608,10 @@ impl TerminalWindow {
         // Block marks are overlays inside the existing first cell; they do not
         // reserve columns or alter the PTY grid dimensions.
         let viewport = BlockViewport {
-            evicted_rows: model.evicted_rows(),
+            evicted_rows: model.block_row_base(),
             history_size: model.history_size(),
             display_offset: model.display_offset(),
+            first_visible_line: Some(model.visible_top_line()),
             screen_lines: rows.len(),
             alternate_screen: model.alternate_screen_active(),
         };
@@ -821,6 +902,12 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     control: self.modifiers.contains(ModifiersState::CONTROL),
                     super_key: self.modifiers.contains(ModifiersState::SUPER),
                 };
+                if let Some(action) =
+                    block_shortcut(&event.logical_key, mods, cfg!(target_os = "macos"))
+                {
+                    self.handle_block_shortcut(action);
+                    return;
+                }
                 let terminal_key = match &event.logical_key {
                     Key::Named(NamedKey::Enter) => Some(TerminalKey::Enter),
                     Key::Named(NamedKey::Tab) => Some(TerminalKey::Tab),
@@ -1021,9 +1108,73 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlyphKey, block_marker_bounds, glyph_key_requires_reshape, invalidate_glyph_cache,
-        overlay_vertex_range,
+        BlockShortcut, GlyphKey, block_marker_bounds, block_shortcut, glyph_key_requires_reshape,
+        invalidate_glyph_cache, overlay_vertex_range,
     };
+    use so1_terminal::keyboard::Modifiers;
+    use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn block_shortcuts_are_distinct_from_copy_and_paste() {
+        let control_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            block_shortcut(&Key::Named(NamedKey::ArrowUp), control_shift, false),
+            Some(BlockShortcut::Previous)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Named(NamedKey::ArrowDown), control_shift, false),
+            Some(BlockShortcut::Next)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Character("a".into()), control_shift, false),
+            Some(BlockShortcut::Select)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Character("o".into()), control_shift, false),
+            Some(BlockShortcut::CopyOutput)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Character("l".into()), control_shift, false),
+            Some(BlockShortcut::CopyInput)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Character("c".into()), control_shift, false),
+            None
+        );
+        assert_eq!(
+            block_shortcut(&Key::Character("v".into()), control_shift, false),
+            None
+        );
+        let command_shift = Modifiers {
+            super_key: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            block_shortcut(&Key::Character("a".into()), command_shift, true),
+            Some(BlockShortcut::Select)
+        );
+        let command = Modifiers {
+            super_key: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            block_shortcut(&Key::Named(NamedKey::ArrowUp), command, true),
+            Some(BlockShortcut::Previous)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Named(NamedKey::ArrowDown), command, true),
+            Some(BlockShortcut::Next)
+        );
+        assert_eq!(
+            block_shortcut(&Key::Character("o".into()), command_shift, true),
+            None
+        );
+    }
 
     #[test]
     fn decoration_vertices_are_separate_for_compositing_after_text() {

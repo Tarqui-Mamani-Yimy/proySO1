@@ -49,6 +49,7 @@ crates/terminal/
   src/main.rs     so1term window/event loop, PTY wiring, and GPU renderer
   src/lib.rs      Public module declarations, shell selection, and surface helpers
   src/blocks.rs   OSC 133 command-block state and grid anchors
+  src/block_navigation.rs Pure block navigation targets and retained-grid text extraction
   src/keyboard.rs Xterm key encoding, paste helpers, and IME preedit gate
   src/model.rs    alacritty_terminal adapter, snapshots, selections, and write-back events
   src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
@@ -281,6 +282,15 @@ starts a fresh block. Multiline PS2 input remains within one block. Metadata is
 written to the terminal, not through shell output or command redirections.
 Sequences use the 7-bit ST terminator (`ESC \\`). Set
 `SO1SH_SHELL_INTEGRATION=0` to disable all shell-integration sequences.
+
+In `so1term`, Ctrl+Shift+Up/Down (Cmd+Up/Down on macOS) navigates to the
+previous/next anchored block prompt. Ctrl+Shift+A (Cmd+Shift+A on macOS)
+selects the block output at or below the viewport focus, falling back to the
+most recent finished block. Ctrl+Shift+O copies that selected block's output;
+Ctrl+Shift+L copies its command line. These bindings do not overlap the
+existing Ctrl+Shift+C/V copy/paste bindings. Block copying refuses blocks whose
+required start/end anchors were evicted or whose marks belong to the alternate
+screen; no partial text is silently presented as a complete block.
 
 ### Embedder Builtins
 

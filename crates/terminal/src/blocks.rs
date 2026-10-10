@@ -225,6 +225,12 @@ impl BlockList {
     pub(crate) fn invalidate_primary_anchors(&mut self) {
         for block in &mut self.blocks {
             block.grid_anchors.clear_primary();
+            if matches!(
+                block.state,
+                BlockState::Prompt | BlockState::Input | BlockState::Running
+            ) {
+                block.state = BlockState::Cancelled;
+            }
         }
     }
 
@@ -238,7 +244,7 @@ impl BlockList {
         });
     }
 
-    fn push(&mut self, block: Block) {
+    pub(crate) fn push(&mut self, block: Block) {
         self.blocks.push(block);
         if self.blocks.len() > MAX_BLOCKS {
             let removable = self

@@ -20,6 +20,7 @@ pub struct BlockViewport {
     pub evicted_rows: u64,
     pub history_size: usize,
     pub display_offset: usize,
+    pub first_visible_line: Option<i64>,
     pub screen_lines: usize,
     pub alternate_screen: bool,
 }
@@ -50,10 +51,15 @@ pub fn project_block_decorations(
         return Vec::new();
     }
 
-    let first_line = viewport.evicted_rows.saturating_add(
-        viewport
-            .history_size
-            .saturating_sub(viewport.display_offset) as u64,
+    let first_line = viewport.first_visible_line.map_or_else(
+        || {
+            viewport.evicted_rows.saturating_add(
+                viewport
+                    .history_size
+                    .saturating_sub(viewport.display_offset) as u64,
+            )
+        },
+        |line| line.max(0) as u64,
     );
     let end_line = first_line.saturating_add(viewport.screen_lines as u64);
     blocks
@@ -453,6 +459,7 @@ mod tests {
             evicted_rows: 0,
             history_size: start as usize + display_offset,
             display_offset,
+            first_visible_line: None,
             screen_lines,
             alternate_screen: false,
         }

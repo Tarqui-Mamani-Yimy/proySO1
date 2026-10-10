@@ -1,3 +1,4 @@
+pub mod block_navigation;
 pub mod blocks;
 pub mod model;
 pub mod osc;

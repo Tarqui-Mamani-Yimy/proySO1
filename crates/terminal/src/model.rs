@@ -73,12 +73,17 @@ pub struct Model {
     scrollback_limit: usize,
     /// Number of primary history rows actually evicted since the model was created.
     evicted_rows: u64,
+    /// Epoch offset preserves monotonic row identities when ED 2 or RIS clears the grid.
+    stable_row_base: u64,
     /// Current DECSTBM region, tracked because Term does not expose it.
     scroll_region: std::ops::Range<usize>,
     selection_anchor: Option<Point>,
     selection_anchor_is_start: bool,
     selection_kind: Option<SelectionType>,
     selection_snapshot: Option<String>,
+    selected_block_id: Option<u64>,
+    /// Optional absolute row used to align a selected block inside the live grid.
+    viewport_top_line: Option<i64>,
 }
 
 /// VTE handler proxy that delegates every operation to Term while observing
@@ -87,6 +92,7 @@ struct EvictionTracker<'a> {
     term: &'a mut Term<Listener>,
     blocks: &'a mut crate::blocks::BlockList,
     evicted_rows: &'a mut u64,
+    stable_row_base: &'a mut u64,
     history_limit: usize,
     region: std::ops::Range<usize>,
 }
@@ -120,13 +126,25 @@ impl EvictionTracker<'_> {
         self.is_full_primary_region()
             && self.term.grid().cursor.point.line.0 + 1 == self.region.end as i32
     }
+
+    fn advance_row_epoch(&mut self) {
+        self.advance_row_epoch_from(self.term.grid().history_size());
+    }
+
+    fn advance_row_epoch_from(&mut self, history_size: usize) {
+        let span = self
+            .evicted_rows
+            .saturating_add(history_size as u64)
+            .saturating_add(self.term.screen_lines() as u64)
+            .saturating_add(1);
+        *self.stable_row_base = self.stable_row_base.saturating_add(span);
+    }
 }
 
 impl vte::ansi::Handler for EvictionTracker<'_> {
     fn input(&mut self, character: char) {
         let cursor = &self.term.grid().cursor;
         let pending_wrap = cursor.input_needs_wrap;
-        let at_last_column = cursor.point.column.0 + 1 == self.term.columns();
         let bottom_row = cursor.point.line.0 + 1 == self.region.end as i32;
         let character_width = crate::renderer::unicode_cell_width(character);
         let can_wrap = self.is_full_primary_region()
@@ -135,9 +153,7 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
                 .term
                 .mode()
                 .contains(alacritty_terminal::term::TermMode::LINE_WRAP);
-        let causes_scroll = can_wrap
-            && character_width > 0
-            && (pending_wrap || (at_last_column && character_width == 2));
+        let causes_scroll = can_wrap && character_width > 0 && pending_wrap;
         let history_before = self.term.grid().history_size();
         self.term.input(character);
         if causes_scroll {
@@ -182,9 +198,9 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
     }
 
     fn reset_state(&mut self) {
+        self.advance_row_epoch();
         self.term.reset_state();
-        self.blocks.invalidate_anchors();
-        *self.evicted_rows = 0;
+        self.blocks.invalidate_primary_anchors();
         self.region = 0..self.term.screen_lines();
     }
 
@@ -205,14 +221,15 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
             let removed = history_before.saturating_sub(self.term.grid().history_size());
             *self.evicted_rows = self.evicted_rows.saturating_add(removed as u64);
             if removed > 0 {
-                self.blocks
-                    .expire_primary_anchors_before(*self.evicted_rows);
+                self.blocks.expire_primary_anchors_before(
+                    self.stable_row_base.saturating_add(*self.evicted_rows),
+                );
             }
         } else if all {
-            // ED 2 destroys the visible primary rows. Start a fresh row-coordinate
-            // epoch after invalidating their anchors; old semantic records remain.
+            // ED 2 destroys the visible primary rows. Start a fresh monotonic
+            // row-coordinate epoch after invalidating their anchors.
             self.blocks.invalidate_primary_anchors();
-            *self.evicted_rows = 0;
+            self.advance_row_epoch_from(history_before);
         }
     }
 
@@ -328,14 +345,18 @@ impl Model {
             stream_bytes_seen: 0,
             scrollback_limit,
             evicted_rows: 0,
+            stable_row_base: 0,
             scroll_region: 0..rows.max(1),
             selection_anchor: None,
             selection_anchor_is_start: true,
             selection_kind: None,
             selection_snapshot: None,
+            selected_block_id: None,
+            viewport_top_line: None,
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<crate::osc::ObservedEvent> {
+        let previous_epoch = self.stable_row_base;
         let mut selected_damage = false;
         let mut full_damage = false;
         let events = self.osc.feed(bytes);
@@ -363,6 +384,12 @@ impl Model {
         full_damage |= full;
         offscreen_mutation |= mutation;
         self.stream_bytes_seen = self.stream_bytes_seen.saturating_add(bytes.len() as u64);
+        if self.stable_row_base != previous_epoch {
+            self.viewport_top_line = None;
+        } else if let Some(top) = self.viewport_top_line.as_mut() {
+            let earliest = self.stable_row_base.saturating_add(self.evicted_rows) as i64;
+            *top = (*top).max(earliest);
+        }
 
         if !bytes.is_empty() && self.term.selection.is_some() {
             let range = self
@@ -399,13 +426,16 @@ impl Model {
             term: &mut self.term,
             blocks: &mut self.blocks,
             evicted_rows: &mut self.evicted_rows,
+            stable_row_base: &mut self.stable_row_base,
             history_limit: self.scrollback_limit,
             region: self.scroll_region.clone(),
         };
         self.processor.advance(&mut tracker, bytes);
         self.scroll_region = tracker.region;
         if self.evicted_rows > evicted_before {
-            self.blocks.expire_primary_anchors_before(self.evicted_rows);
+            self.blocks.expire_primary_anchors_before(
+                self.stable_row_base.saturating_add(self.evicted_rows),
+            );
         }
         let range = self
             .term
@@ -459,7 +489,10 @@ impl Model {
             line: if alternate {
                 point.line.0.max(0) as i64
             } else {
-                self.evicted_rows as i64 + grid.history_size() as i64 + point.line.0 as i64
+                self.stable_row_base as i64
+                    + self.evicted_rows as i64
+                    + grid.history_size() as i64
+                    + point.line.0 as i64
             },
             column: point.column.0,
             screen: if alternate {
@@ -482,6 +515,18 @@ impl Model {
         self.evicted_rows
     }
 
+    pub fn block_row_base(&self) -> u64 {
+        self.stable_row_base.saturating_add(self.evicted_rows)
+    }
+
+    pub fn block_viewport_top(&self) -> i64 {
+        self.viewport_top_line.unwrap_or_else(|| {
+            (self.stable_row_base + self.evicted_rows + self.term.grid().history_size() as u64)
+                as i64
+                - self.display_offset() as i64
+        })
+    }
+
     pub fn alternate_screen_active(&self) -> bool {
         self.term
             .mode()
@@ -493,6 +538,7 @@ impl Model {
         let rows = rows.max(1);
         if self.term.columns() != cols || self.term.screen_lines() != rows {
             self.blocks.invalidate_anchors();
+            self.viewport_top_line = None;
         }
         self.term.resize(Size { cols, rows });
         self.scroll_region = 0..rows;
@@ -516,13 +562,149 @@ impl Model {
     }
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+        self.viewport_top_line = None;
+    }
+
+    pub fn navigate_block(&mut self, direction: crate::block_navigation::NavigationDirection) {
+        let Some(target) = crate::block_navigation::navigation_target(
+            &self.blocks,
+            self.block_viewport_top(),
+            direction,
+        ) else {
+            return;
+        };
+        let min_line = self.block_row_base() as i64;
+        let max_line =
+            min_line + self.term.grid().history_size() as i64 + self.term.screen_lines() as i64 - 1;
+        self.viewport_top_line = Some(target.clamp(min_line, max_line));
+    }
+
+    pub fn select_block_at_viewport(&mut self) -> bool {
+        let Some(block) =
+            crate::block_navigation::block_at_or_under(&self.blocks, self.block_viewport_top())
+        else {
+            return false;
+        };
+        let id = block.id;
+        let Some((start, end)) = self.block_anchor_range(block, false) else {
+            return false;
+        };
+        let (start_point, end_point) = (self.anchor_point(start), self.anchor_point(end));
+        self.term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            start_point,
+            Side::Left,
+        ));
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(end_point, Side::Left);
+        }
+        self.selection_anchor = Some(start_point);
+        self.selection_anchor_is_start = true;
+        self.selection_kind = Some(SelectionType::Simple);
+        self.selection_snapshot = self.term.selection_to_string();
+        self.selected_block_id = Some(id);
+        true
+    }
+
+    pub fn selected_block_output_text(&self) -> Option<String> {
+        let id = self.selected_block_id?;
+        let block = self.blocks.blocks().iter().find(|block| block.id == id)?;
+        self.block_range_text(block, false)
+    }
+
+    pub fn selected_block_input_text(&self) -> Option<String> {
+        let id = self.selected_block_id?;
+        let block = self.blocks.blocks().iter().find(|block| block.id == id)?;
+        self.block_range_text(block, true)
+    }
+
+    fn block_range_text(&self, block: &crate::blocks::Block, input: bool) -> Option<String> {
+        let (start, end) = self.block_anchor_range(block, input)?;
+        let (rows, wraps) = self.retained_grid_text();
+        let retained_start = start.line.max(self.block_row_base() as i64);
+        let first = retained_start.saturating_sub(self.block_row_base() as i64) as usize;
+        let last = end.line.saturating_sub(self.block_row_base() as i64) as usize;
+        if first >= rows.len() || last >= rows.len() || last < first {
+            return None;
+        }
+        let start_column = if retained_start > start.line {
+            0
+        } else {
+            start.column
+        };
+        crate::block_navigation::extract_range_text(
+            &rows,
+            &wraps,
+            (first, start_column),
+            (last, end.column),
+        )
+    }
+
+    fn block_anchor_range(
+        &self,
+        block: &crate::blocks::Block,
+        input: bool,
+    ) -> Option<(crate::blocks::GridAnchor, crate::blocks::GridAnchor)> {
+        if self.alternate_screen_active() {
+            return None;
+        }
+        let (start, end) = if input {
+            (
+                block.grid_anchors.input_start?,
+                block.grid_anchors.output_start?,
+            )
+        } else {
+            (block.grid_anchors.output_start?, block.grid_anchors.end?)
+        };
+        (start.screen == crate::blocks::GridScreen::Primary
+            && end.screen == crate::blocks::GridScreen::Primary)
+            .then_some((start, end))
+    }
+
+    fn anchor_point(&self, anchor: crate::blocks::GridAnchor) -> Point {
+        let history = self.term.grid().history_size() as i64;
+        Point::new(
+            Line(
+                (anchor.line - self.stable_row_base as i64 - self.evicted_rows as i64 - history)
+                    .clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            ),
+            Column(anchor.column.min(self.term.columns().saturating_sub(1))),
+        )
+    }
+
+    fn retained_grid_text(&self) -> (Vec<Vec<char>>, Vec<bool>) {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let mut rows = Vec::with_capacity(history + grid.screen_lines());
+        let mut wraps = Vec::with_capacity(history + grid.screen_lines());
+        for row in 0..history + grid.screen_lines() {
+            let line = Line(row as i32 - history as i32);
+            let cells = (0..grid.columns())
+                .map(|column| grid[Point::new(line, Column(column))].c)
+                .collect();
+            let wrapped = grid[Point::new(line, Column(grid.columns() - 1))]
+                .flags
+                .contains(Flags::WRAPLINE);
+            rows.push(cells);
+            wraps.push(wrapped);
+        }
+        (rows, wraps)
     }
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
     }
+    pub fn visible_top_line(&self) -> i64 {
+        self.block_viewport_top()
+    }
+    fn visible_grid_top_line(&self) -> i32 {
+        (self.visible_top_line()
+            - (self.stable_row_base + self.evicted_rows + self.term.grid().history_size() as u64)
+                as i64)
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
     fn selection_point(&self, column: usize, row: usize) -> Point {
         Point::new(
-            Line(row as i32 - self.term.grid().display_offset() as i32),
+            Line(self.visible_grid_top_line() + row as i32),
             Column(column.min(self.term.grid().columns() - 1)),
         )
     }
@@ -531,6 +713,7 @@ impl Model {
         self.selection_anchor = Some(point);
         self.selection_anchor_is_start = true;
         self.selection_kind = Some(kind);
+        self.selected_block_id = None;
         self.term.selection = Some(Selection::new(kind, point, Side::Left));
         self.term.reset_damage();
         self.selection_snapshot = self.term.selection_to_string();
@@ -556,6 +739,7 @@ impl Model {
         self.selection_anchor_is_start = true;
         self.selection_kind = None;
         self.selection_snapshot = None;
+        self.selected_block_id = None;
     }
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
@@ -577,10 +761,10 @@ impl Model {
         else {
             return Vec::new();
         };
-        let offset = grid.display_offset() as i32;
+        let top = self.visible_grid_top_line();
         let mut selected = Vec::new();
         for row in 0..grid.screen_lines() {
-            let line = Line(row as i32 - offset);
+            let line = Line(top + row as i32);
             for column in 0..grid.columns() {
                 if range.contains(Point::new(line, Column(column))) {
                     selected.push((column, row));
@@ -590,28 +774,60 @@ impl Model {
         selected
     }
     pub fn scroll_up(&mut self, lines: usize) {
-        self.term
-            .scroll_display(Scroll::Delta(lines.min(i32::MAX as usize) as i32));
+        if let Some(top) = self.viewport_top_line {
+            self.viewport_top_line = Some(
+                top.saturating_sub(lines.min(i64::MAX as usize) as i64)
+                    .max(self.block_row_base() as i64),
+            );
+        } else {
+            self.term
+                .scroll_display(Scroll::Delta(lines.min(i32::MAX as usize) as i32));
+        }
     }
     pub fn scroll_down(&mut self, lines: usize) {
-        self.term
-            .scroll_display(Scroll::Delta(-(lines.min(i32::MAX as usize) as i32)));
+        if let Some(top) = self.viewport_top_line {
+            let max = self.block_row_base() as i64
+                + self.term.grid().history_size() as i64
+                + self.term.screen_lines() as i64
+                - 1;
+            self.viewport_top_line = Some(
+                top.saturating_add(lines.min(i64::MAX as usize) as i64)
+                    .min(max),
+            );
+        } else {
+            self.term
+                .scroll_display(Scroll::Delta(-(lines.min(i32::MAX as usize) as i32)));
+        }
     }
     pub fn cursor(&self) -> Cursor {
         let p = self.term.grid().cursor.point;
+        let row = p.line.0 - self.visible_grid_top_line();
         Cursor {
             column: p.column.0,
-            row: p.line.0.max(0) as usize,
+            row: if (0..self.term.screen_lines() as i32).contains(&row) {
+                row as usize
+            } else {
+                usize::MAX
+            },
             shape: self.term.cursor_style().shape,
         }
     }
     pub fn visible_cells(&self) -> Vec<Vec<VisibleCell>> {
         let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let top = self.visible_grid_top_line();
+        let blank = Cell::default();
         (0..grid.screen_lines())
             .map(|row| {
-                let line = Line(row as i32 - grid.display_offset() as i32);
+                let line = Line(top + row as i32);
                 (0..grid.columns())
-                    .map(|col| visible(&grid[Point::new(line, Column(col))]))
+                    .map(|col| {
+                        if line.0 < -history || line.0 >= grid.screen_lines() as i32 {
+                            visible(&blank)
+                        } else {
+                            visible(&grid[Point::new(line, Column(col))])
+                        }
+                    })
                     .collect()
             })
             .collect()
@@ -982,6 +1198,135 @@ mod tests {
     }
 
     #[test]
+    fn clear_all_and_reset_keep_new_anchor_coordinates_monotonic() {
+        for control in [b"\x1b[2J".as_slice(), b"\x1bc".as_slice()] {
+            let mut model = Model::new(20, 3);
+            model.feed(b"old\r\nrows\r\nmore\r\nlast\r\n");
+            model.feed(b"\x1b]133;A\x1b\\");
+            let old = model
+                .blocks()
+                .blocks()
+                .last()
+                .unwrap()
+                .grid_anchors
+                .prompt_start
+                .unwrap()
+                .line;
+            model.feed(control);
+            model.feed(b"\x1b]133;A\x1b\\");
+            let new = model
+                .blocks()
+                .blocks()
+                .last()
+                .unwrap()
+                .grid_anchors
+                .prompt_start
+                .unwrap()
+                .line;
+            assert!(new > old, "{control:?}: new={new}, old={old}");
+        }
+    }
+
+    #[test]
+    fn clear_all_epoch_anchor_projects_in_the_current_viewport() {
+        let mut model = Model::new(20, 3);
+        model.feed(b"\x1b]133;A\x1b\\\x1b[2J\x1b]133;A\x1b\\");
+        let viewport = crate::renderer::BlockViewport {
+            evicted_rows: model.block_row_base(),
+            history_size: model.history_size(),
+            display_offset: model.display_offset(),
+            first_visible_line: Some(model.visible_top_line()),
+            screen_lines: 3,
+            alternate_screen: false,
+        };
+        let projected = crate::renderer::project_block_decorations(model.blocks(), viewport);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected[0].block_id,
+            model.blocks().blocks().last().unwrap().id
+        );
+        assert_eq!(projected[0].separator_row, Some(0));
+    }
+
+    #[test]
+    fn wide_wrap_prediction_matches_terminal_for_odd_and_even_widths() {
+        for cols in [4, 5] {
+            let mut model = Model::with_scrollback_limit(cols, 2, 0);
+            model.feed(b"top\r\nbot");
+            model.feed(format!("\x1b[2;{cols}H日").as_bytes());
+            assert_eq!(
+                model.evicted_rows, 0,
+                "a wide glyph shifted left fits; columns={cols}"
+            );
+
+            let mut pending = Model::with_scrollback_limit(cols, 2, 0);
+            pending.feed(b"top\r\nbot");
+            let fill = if cols == 4 {
+                b"X".as_slice()
+            } else {
+                b"XY".as_slice()
+            };
+            pending.feed(fill);
+            assert!(
+                pending.term.grid().cursor.input_needs_wrap,
+                "columns={cols}"
+            );
+            pending.feed("日".as_bytes());
+            assert_eq!(pending.evicted_rows, 1, "columns={cols}");
+        }
+    }
+
+    #[test]
+    fn block_selection_and_copy_ranges_exclude_the_prompt_and_preserve_wrapped_text() {
+        let mut model = Model::new(12, 3);
+        model.feed(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo hi\r\n\x1b]133;C\x1b\\a\r\nb\x1b]133;D;0\x1b\\");
+        let block = model.blocks().blocks().last().unwrap();
+        assert_eq!(
+            model.block_range_text(block, true).as_deref(),
+            Some("echo hi")
+        );
+        assert_eq!(
+            model.block_range_text(block, false).as_deref(),
+            Some("a\nb")
+        );
+        assert!(model.select_block_at_viewport());
+        assert_eq!(model.selected_block_output_text().as_deref(), Some("a\nb"));
+        assert!(model.cell_selected(0, 1));
+    }
+
+    #[test]
+    fn block_copy_refuses_when_its_output_start_was_evicted_or_is_alternate() {
+        let mut model = Model::with_scrollback_limit(12, 2, 1);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\old\r\nline\r\nnew\r\nlast\x1b]133;D;0\x1b\\");
+        let block = model.blocks().blocks().last().unwrap();
+        assert_eq!(block.grid_anchors.output_start, None);
+        assert_eq!(model.block_range_text(block, false), None);
+
+        let mut alternate = Model::new(12, 2);
+        alternate.feed(b"\x1b[?1049h\x1b]133;A\x1b\\\x1b]133;C\x1b\\output\x1b]133;D;0\x1b\\");
+        let block = alternate.blocks().blocks().last().unwrap();
+        assert_eq!(alternate.block_range_text(block, false), None);
+    }
+
+    #[test]
+    fn navigation_aligns_a_recent_prompt_to_the_top_of_the_viewport() {
+        let mut model = Model::new(20, 3);
+        model.feed(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\echo one\r\n\x1b]133;C\x1b\\one\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ ");
+        let second_prompt = model
+            .blocks()
+            .blocks()
+            .last()
+            .unwrap()
+            .grid_anchors
+            .prompt_start
+            .unwrap()
+            .line;
+        model.navigate_block(crate::block_navigation::NavigationDirection::Next);
+        assert_eq!(model.block_viewport_top(), second_prompt);
+        assert!(text(&model).lines().next().unwrap().starts_with("$ "));
+    }
+
+    #[test]
     fn terminal_reset_invalidates_primary_block_anchors() {
         let mut model = Model::with_scrollback_limit(20, 2, 2);
         model.feed(b"\x1b]133;A\x1b\\");
@@ -1017,14 +1362,14 @@ mod tests {
     }
 
     #[test]
-    fn wide_wrap_at_the_last_column_counts_eviction_before_the_row_moves() {
+    fn wide_glyph_shifted_left_at_the_last_column_does_not_fake_an_eviction() {
         let mut model = Model::with_scrollback_limit(20, 2, 1);
         model.feed(b"one\r\ntwo\r\nthree\r\n");
         assert_eq!(model.term.grid().history_size(), 1);
         assert_eq!(model.evicted_rows, 1);
         model.feed(b"\x1b[2;20H\xe6\x97\xa5");
         assert_eq!(model.term.grid().history_size(), 1);
-        assert_eq!(model.evicted_rows, 2);
+        assert_eq!(model.evicted_rows, 1);
     }
 
     #[test]

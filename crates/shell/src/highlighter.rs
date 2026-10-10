@@ -10,6 +10,14 @@ pub(crate) struct ShellHighlighter {
     state: CompletionState,
 }
 
+pub(crate) struct PlainHighlighter;
+
+impl Highlighter for PlainHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        plain_text(line)
+    }
+}
+
 impl ShellHighlighter {
     pub(crate) fn new(state: CompletionState) -> Self {
         Self { state }

@@ -2406,3 +2406,65 @@ fn history_hint_is_visible_and_right_arrow_accepts_it() {
     submit(&mut session, "exit");
     exited(&mut session, 0);
 }
+
+#[test]
+fn highlighting_opt_out_keeps_typed_input_unstyled() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session_with_term(&[], None, "xterm-256color");
+
+    session.exp_string("$ ").unwrap();
+    session.exp_string("\x1b[?25h").unwrap();
+    session.send("echo t8b-unstyled-input").unwrap();
+    session.flush().unwrap();
+    let input_render = session.exp_string("\x1b[?25h").unwrap();
+    assert!(
+        input_render.contains("echo t8b-unstyled-input"),
+        "typed input was not rendered: {input_render:?}"
+    );
+    let input_start = input_render.find("echo t8b-unstyled-input").unwrap();
+    assert!(
+        last_sgr_before(&input_render, input_start) == Some("\x1b[0m"),
+        "typed input is preceded by a non-reset SGR style: {input_render:?}"
+    );
+    let input_end = input_start + "echo t8b-unstyled-input".len();
+    assert!(
+        first_sgr_after(&input_render, input_end).is_none(),
+        "typed input is followed by an SGR style reset: {input_render:?}"
+    );
+
+    session.send_control('c').unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+fn last_sgr_before(text: &str, offset: usize) -> Option<&str> {
+    let prefix = &text[..offset];
+    let start = prefix.rfind("\x1b[")?;
+    let end = start + prefix[start..].find('m')? + 1;
+    let sequence = &prefix[start..end];
+    sequence[2..sequence.len() - 1]
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == ';')
+        .then_some(sequence)
+}
+
+fn first_sgr_after(text: &str, offset: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    for start in offset..bytes.len().saturating_sub(1) {
+        if bytes.get(start..start + 2) != Some(b"\x1b[") {
+            continue;
+        }
+        let mut end = start + 2;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
+            end += 1;
+        }
+        if end > start + 2 && bytes.get(end) == Some(&b'm') {
+            return Some(&text[start..=end]);
+        }
+    }
+    None
+}

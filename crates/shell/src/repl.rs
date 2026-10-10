@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::completion::{CompletionState, ShellCompleter};
-use crate::highlighter::ShellHighlighter;
+use crate::highlighter::{PlainHighlighter, ShellHighlighter};
 use crate::history_hint::HistoryHinter;
 use epsh::eval::Shell;
 use epsh::parser::Parser;
@@ -209,6 +209,8 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         editor = editor
             .with_highlighter(Box::new(ShellHighlighter::new(completion_state.clone())))
             .with_hinter(Box::new(HistoryHinter::default()));
+    } else {
+        editor = editor.with_highlighter(Box::new(PlainHighlighter));
     }
     if shell_integration_enabled {
         editor = editor.with_semantic_markers(Some(Box::new(ShellSemanticMarkers(Arc::clone(

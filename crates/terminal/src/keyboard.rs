@@ -34,9 +34,7 @@ pub struct ImePreeditGate {
 }
 impl ImePreeditGate {
     pub fn preedit(&mut self, text: &str) {
-        if !text.is_empty() {
-            self.composing = true;
-        }
+        self.composing = !text.is_empty();
     }
     pub fn commit(&mut self) {
         self.composing = false;
@@ -44,8 +42,8 @@ impl ImePreeditGate {
     pub fn disable(&mut self) {
         self.composing = false;
     }
-    pub fn suppresses_keyboard_text(&self) -> bool {
-        self.composing
+    pub fn suppresses_key(&self, key: Key<'_>, control: bool) -> bool {
+        self.composing && !control && matches!(key, Key::Text(_))
     }
 }
 
@@ -352,14 +350,30 @@ mod tests {
         );
     }
 
+    fn composing_gate() -> ImePreeditGate {
+        ImePreeditGate { composing: true }
+    }
     #[test]
-    fn preedit_empty_update_keeps_text_suppressed_until_commit() {
-        let mut state = ImePreeditGate::default();
-        state.preedit("compose");
+    fn cancelled_composition_reenables_keyboard_text() {
+        let mut state = composing_gate();
         state.preedit("");
-        assert!(state.suppresses_keyboard_text());
-        state.commit();
-        assert!(!state.suppresses_keyboard_text());
+        assert!(!state.suppresses_key(Key::Text("x"), false));
+    }
+
+    #[test]
+    fn non_text_keys_pass_during_composition() {
+        use Key::*;
+        let state = composing_gate();
+        for key in [Enter, Tab, Backspace, Escape, Up, Home, Function(1)] {
+            assert!(!state.suppresses_key(key, false));
+        }
+        assert!(!state.suppresses_key(Text("c"), true));
+    }
+
+    #[test]
+    fn text_keys_stay_suppressed_during_active_preedit() {
+        let state = composing_gate();
+        assert!(state.suppresses_key(Key::Text("x"), false));
     }
 
     #[test]

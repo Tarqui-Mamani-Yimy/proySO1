@@ -648,8 +648,8 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         .filter(|text| !text.is_empty())
                         .map(|text| TerminalKey::Text(text.as_str())),
                 };
-                if !self.ime_gate.suppresses_keyboard_text()
-                    && let (Some(key), Some(model)) = (terminal_key, self.model.as_mut())
+                if let (Some(key), Some(model)) = (terminal_key, self.model.as_mut())
+                    && !self.ime_gate.suppresses_key(key, mods.control)
                 {
                     let app_cursor = model.application_cursor_keys();
                     if let Some(bytes) = encode_key(key, mods, app_cursor)

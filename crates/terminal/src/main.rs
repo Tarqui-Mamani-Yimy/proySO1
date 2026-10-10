@@ -145,6 +145,13 @@ fn block_shortcut(key: &Key, mods: KeyModifiers, macos: bool) -> Option<BlockSho
     }
 }
 
+fn route_block_shortcut(
+    shortcut: Option<BlockShortcut>,
+    alternate_screen_active: bool,
+) -> Option<BlockShortcut> {
+    (!alternate_screen_active).then_some(shortcut).flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_overlay_rect(
     vertices: &mut Vec<RectVertex>,
@@ -902,9 +909,14 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     control: self.modifiers.contains(ModifiersState::CONTROL),
                     super_key: self.modifiers.contains(ModifiersState::SUPER),
                 };
-                if let Some(action) =
-                    block_shortcut(&event.logical_key, mods, cfg!(target_os = "macos"))
-                {
+                let action = block_shortcut(&event.logical_key, mods, cfg!(target_os = "macos"));
+                let action = route_block_shortcut(
+                    action,
+                    self.model
+                        .as_ref()
+                        .is_some_and(Model::alternate_screen_active),
+                );
+                if let Some(action) = action {
                     self.handle_block_shortcut(action);
                     return;
                 }
@@ -1109,7 +1121,7 @@ fn main() {
 mod tests {
     use super::{
         BlockShortcut, GlyphKey, block_marker_bounds, block_shortcut, glyph_key_requires_reshape,
-        invalidate_glyph_cache, overlay_vertex_range,
+        invalidate_glyph_cache, overlay_vertex_range, route_block_shortcut,
     };
     use so1_terminal::keyboard::Modifiers;
     use winit::keyboard::{Key, NamedKey};
@@ -1174,6 +1186,19 @@ mod tests {
             block_shortcut(&Key::Character("o".into()), command_shift, true),
             None
         );
+    }
+
+    #[test]
+    fn block_shortcuts_are_routed_to_the_application_in_alternate_screen() {
+        assert_eq!(
+            route_block_shortcut(Some(BlockShortcut::Previous), true),
+            None
+        );
+        assert_eq!(
+            route_block_shortcut(Some(BlockShortcut::Previous), false),
+            Some(BlockShortcut::Previous)
+        );
+        assert_eq!(route_block_shortcut(None, true), None);
     }
 
     #[test]

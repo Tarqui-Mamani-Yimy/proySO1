@@ -292,6 +292,16 @@ existing Ctrl+Shift+C/V copy/paste bindings. Block copying refuses blocks whose
 required start/end anchors were evicted or whose marks belong to the alternate
 screen; no partial text is silently presented as a complete block.
 
+Block navigation is a temporary viewport pin: any key input, a new primary
+prompt mark, or scrolling back to the live bottom resumes live-follow. ED 2
+clears anchors for erased rows but does not change the shell block's semantic
+state; a running block remains Running until its D mark, and cleared rows are
+not re-anchored. While the alternate screen is active, block navigation/copy
+shortcuts pass through to the application and block decorations are hidden.
+Alacritty/vte 0.26 recognizes DECSET 1049 but not the common 47/1047 aliases;
+so1term normalizes those aliases to 1049 screen switching so TUI output remains
+on the alternate grid.
+
 ### Embedder Builtins
 
 Applications can register shell-local builtins on a `Shell` instance with

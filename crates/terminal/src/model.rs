@@ -13,7 +13,7 @@ use alacritty_terminal::{
         cell::{Cell, Flags},
     },
 };
-use vte::ansi::{Processor, Rgb};
+use vte::ansi::{NamedPrivateMode, PrivateMode, Processor, Rgb};
 
 macro_rules! delegate_handler {
     ($($method:ident($($name:ident: $ty:ty),*);)*) => {
@@ -233,6 +233,29 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
         }
     }
 
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        // vte/alacritty 0.26 recognizes 1049 but leaves the common 47/1047
+        // alternate-screen aliases as Unknown. Normalize them to the same
+        // save/restore behavior so TUI output still uses the alternate grid.
+        let mode = match mode {
+            PrivateMode::Unknown(47 | 1047) => {
+                NamedPrivateMode::SwapScreenAndSetRestoreCursor.into()
+            }
+            mode => mode,
+        };
+        self.term.set_private_mode(mode);
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        let mode = match mode {
+            PrivateMode::Unknown(47 | 1047) => {
+                NamedPrivateMode::SwapScreenAndSetRestoreCursor.into()
+            }
+            mode => mode,
+        };
+        self.term.unset_private_mode(mode);
+    }
+
     delegate_handler! {
         set_title(arg0: Option<String>);
         set_cursor_style(arg0: Option<vte::ansi::CursorStyle>);
@@ -271,8 +294,6 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
         set_mode(_mode: vte::ansi::Mode);
         unset_mode(_mode: vte::ansi::Mode);
         report_mode(_mode: vte::ansi::Mode);
-        set_private_mode(_mode: vte::ansi::PrivateMode);
-        unset_private_mode(_mode: vte::ansi::PrivateMode);
         report_private_mode(_mode: vte::ansi::PrivateMode);
         set_keypad_application_mode();
         unset_keypad_application_mode();
@@ -363,6 +384,7 @@ impl Model {
         let stream_start = self.stream_bytes_seen;
         let mut consumed = 0usize;
         let mut offscreen_mutation = false;
+        let mut new_primary_prompt = false;
         for event in &events {
             let end = event
                 .end_offset
@@ -377,6 +399,11 @@ impl Model {
 
             let anchor = matches!(&event.event, crate::osc::Event::SemanticMark(_))
                 .then(|| self.grid_anchor());
+            new_primary_prompt |= matches!(
+                &event.event,
+                crate::osc::Event::SemanticMark(crate::osc::SemanticMark::PromptStart)
+            ) && anchor
+                .is_some_and(|anchor| anchor.screen == crate::blocks::GridScreen::Primary);
             self.blocks.consume_event(event, anchor);
         }
         let (intersects, full, mutation) = self.advance_segment(&bytes[consumed..]);
@@ -384,7 +411,7 @@ impl Model {
         full_damage |= full;
         offscreen_mutation |= mutation;
         self.stream_bytes_seen = self.stream_bytes_seen.saturating_add(bytes.len() as u64);
-        if self.stable_row_base != previous_epoch {
+        if new_primary_prompt || self.stable_row_base != previous_epoch {
             self.viewport_top_line = None;
         } else if let Some(top) = self.viewport_top_line.as_mut() {
             let earliest = self.stable_row_base.saturating_add(self.evicted_rows) as i64;
@@ -566,6 +593,9 @@ impl Model {
     }
 
     pub fn navigate_block(&mut self, direction: crate::block_navigation::NavigationDirection) {
+        if self.alternate_screen_active() {
+            return;
+        }
         let Some(target) = crate::block_navigation::navigation_target(
             &self.blocks,
             self.block_viewport_top(),
@@ -580,6 +610,9 @@ impl Model {
     }
 
     pub fn select_block_at_viewport(&mut self) -> bool {
+        if self.alternate_screen_active() {
+            return false;
+        }
         let Some(block) =
             crate::block_navigation::block_at_or_under(&self.blocks, self.block_viewport_top())
         else {
@@ -786,14 +819,13 @@ impl Model {
     }
     pub fn scroll_down(&mut self, lines: usize) {
         if let Some(top) = self.viewport_top_line {
-            let max = self.block_row_base() as i64
-                + self.term.grid().history_size() as i64
-                + self.term.screen_lines() as i64
-                - 1;
-            self.viewport_top_line = Some(
-                top.saturating_add(lines.min(i64::MAX as usize) as i64)
-                    .min(max),
-            );
+            let live_top = self.block_row_base() as i64 + self.term.grid().history_size() as i64;
+            let next = top.saturating_add(lines.min(i64::MAX as usize) as i64);
+            if next >= live_top {
+                self.scroll_to_bottom();
+            } else {
+                self.viewport_top_line = Some(next);
+            }
         } else {
             self.term
                 .scroll_display(Scroll::Delta(-(lines.min(i32::MAX as usize) as i32)));
@@ -1596,6 +1628,178 @@ mod tests {
             "OLD-LINE",
             "scrolled snapshot should show the known older line"
         );
+    }
+
+    #[test]
+    fn block_navigation_view_returns_to_live_follow_on_scroll_prompt_and_input() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\one\r\ntwo\r\nthree\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ ");
+        model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
+        assert!(model.viewport_top_line.is_some());
+
+        model.scroll_down(usize::MAX);
+        assert_eq!(
+            model.viewport_top_line, None,
+            "scrolling to the live bottom resumes follow mode"
+        );
+
+        model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
+        model.feed(b"\x1b]133;A\x1b\\$ ");
+        assert_eq!(
+            model.viewport_top_line, None,
+            "a new prompt resumes live follow"
+        );
+
+        model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
+        model.scroll_to_bottom();
+        assert_eq!(model.viewport_top_line, None);
+    }
+
+    #[test]
+    fn a_new_primary_prompt_releases_a_block_navigation_pin() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\one\r\ntwo\r\nthree\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ ");
+        model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
+        assert!(model.viewport_top_line.is_some());
+
+        model.feed(b"\x1b]133;A\x1b\\$ ");
+        assert_eq!(model.viewport_top_line, None);
+    }
+
+    #[test]
+    fn ed2_invalidates_cleared_anchors_without_cancelling_running_block() {
+        for (marks, state) in [
+            (
+                b"\x1b]133;A\x1b\\".as_slice(),
+                crate::blocks::BlockState::Prompt,
+            ),
+            (
+                b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\".as_slice(),
+                crate::blocks::BlockState::Input,
+            ),
+        ] {
+            let mut waiting = Model::new(20, 3);
+            waiting.feed(marks);
+            waiting.feed(b"\x1b[2J");
+            assert_eq!(waiting.blocks().blocks()[0].state, state);
+            assert_eq!(
+                waiting.blocks().blocks()[0].grid_anchors,
+                crate::blocks::GridAnchors::default()
+            );
+        }
+
+        let mut model = Model::new(20, 3);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\before clear");
+        model.feed(b"\x1b[2J");
+        let running = &model.blocks().blocks()[0];
+        assert_eq!(running.state, crate::blocks::BlockState::Running);
+        assert_eq!(running.grid_anchors, crate::blocks::GridAnchors::default());
+
+        model.feed(b"\x1b]133;D;7\x1b\\");
+        let finished = &model.blocks().blocks()[0];
+        assert_eq!(finished.state, crate::blocks::BlockState::Finished);
+        assert_eq!(finished.exit_status, Some(7));
+        assert_eq!(finished.grid_anchors, crate::blocks::GridAnchors::default());
+    }
+
+    #[test]
+    fn alternate_screen_modes_preserve_primary_block_and_refuse_alt_anchors() {
+        for (enter, leave) in [
+            (b"\x1b[?1049h".as_slice(), b"\x1b[?1049l".as_slice()),
+            (b"\x1b[?47h".as_slice(), b"\x1b[?47l".as_slice()),
+            (b"\x1b[?1047h".as_slice(), b"\x1b[?1047l".as_slice()),
+        ] {
+            let mut model = Model::new(20, 3);
+            model.feed(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\cmd\x1b]133;C\x1b\\");
+            let primary = model.blocks().blocks()[0].grid_anchors;
+            model.feed(enter);
+            assert!(model.alternate_screen_active(), "enter sequence {enter:?}");
+            assert_eq!(
+                model.blocks().blocks()[0].state,
+                crate::blocks::BlockState::Running
+            );
+            let viewport = crate::renderer::BlockViewport {
+                evicted_rows: model.block_row_base(),
+                history_size: model.history_size(),
+                display_offset: model.display_offset(),
+                first_visible_line: Some(model.visible_top_line()),
+                screen_lines: 3,
+                alternate_screen: true,
+            };
+            assert!(
+                crate::renderer::project_block_decorations(model.blocks(), viewport).is_empty()
+            );
+            model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
+            assert!(
+                model.viewport_top_line.is_none(),
+                "navigation is disabled on the alternate grid"
+            );
+            assert!(!model.select_block_at_viewport());
+            assert_eq!(
+                model.block_range_text(&model.blocks().blocks()[0], false),
+                None
+            );
+            model.feed(b"tui redraw");
+            assert_eq!(
+                model.grid_anchor().screen,
+                crate::blocks::GridScreen::Alternate,
+                "TUI redraw anchors must not target primary rows"
+            );
+            model.feed(b"vim redraw");
+            model.feed(leave);
+            assert!(!model.alternate_screen_active());
+            assert_eq!(model.blocks().blocks()[0].grid_anchors, primary);
+            assert_eq!(
+                model.blocks().blocks()[0].state,
+                crate::blocks::BlockState::Running
+            );
+            model.feed(b"\x1b]133;D;0\x1b\\");
+            assert_eq!(
+                model.blocks().blocks()[0].state,
+                crate::blocks::BlockState::Finished
+            );
+            assert_eq!(model.blocks().blocks()[0].exit_status, Some(0));
+            assert_eq!(
+                model.blocks().blocks()[0].grid_anchors.end.unwrap().screen,
+                crate::blocks::GridScreen::Primary
+            );
+            let viewport = crate::renderer::BlockViewport {
+                evicted_rows: model.block_row_base(),
+                history_size: model.history_size(),
+                display_offset: model.display_offset(),
+                first_visible_line: Some(model.visible_top_line()),
+                screen_lines: 3,
+                alternate_screen: false,
+            };
+            assert!(
+                !crate::renderer::project_block_decorations(model.blocks(), viewport).is_empty()
+            );
+
+            let mut marked_alt = Model::new(20, 3);
+            marked_alt.feed(enter);
+            marked_alt.feed(
+                b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\alt output\x1b]133;D;0\x1b\\",
+            );
+            let alt_block = marked_alt.blocks().blocks().last().unwrap().clone();
+            assert_eq!(
+                alt_block.grid_anchors.prompt_start.unwrap().screen,
+                crate::blocks::GridScreen::Alternate
+            );
+            marked_alt.feed(leave);
+            assert_eq!(marked_alt.block_range_text(&alt_block, false), None);
+            assert!(
+                !marked_alt.select_block_at_viewport(),
+                "block select refuses alternate-screen anchors after exit"
+            );
+        }
+    }
+
+    #[test]
+    fn block_navigation_cursor_is_offscreen_sentinel_when_view_is_pinned_above_it() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\one\r\ntwo\r\nthree\r\nfour\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ ");
+        model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
+        assert_eq!(model.cursor().row, usize::MAX);
     }
     #[cfg(unix)]
     #[test]

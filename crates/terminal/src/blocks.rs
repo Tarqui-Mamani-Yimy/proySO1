@@ -146,13 +146,17 @@ impl BlockList {
                         BlockState::Prompt | BlockState::Input => {
                             block.state = BlockState::Cancelled;
                             block.boundaries.cancelled = Some(observed.end_offset);
-                            block.grid_anchors.end = anchor;
+                            if block.grid_anchors.has_anchor() {
+                                block.grid_anchors.end = anchor;
+                            }
                         }
                         BlockState::Running => {
                             block.state = BlockState::Finished;
                             block.boundaries.finished = Some(observed.end_offset);
                             block.exit_status = None;
-                            block.grid_anchors.end = anchor;
+                            if block.grid_anchors.has_anchor() {
+                                block.grid_anchors.end = anchor;
+                            }
                         }
                         BlockState::Finished | BlockState::Cancelled => {}
                     }
@@ -175,7 +179,9 @@ impl BlockList {
                         let block = self.blocks.last_mut().expect("running block exists");
                         block.state = BlockState::Finished;
                         block.boundaries.finished = Some(observed.end_offset);
-                        block.grid_anchors.end = anchor;
+                        if block.grid_anchors.has_anchor() {
+                            block.grid_anchors.end = anchor;
+                        }
                     }
                     let mut block = self.new_block();
                     block.boundaries.input_start = Some(observed.end_offset);
@@ -209,7 +215,9 @@ impl BlockList {
                     block.boundaries.finished = Some(observed.end_offset);
                     block.exit_status = *exit_status;
                     block.state = BlockState::Finished;
-                    block.grid_anchors.end = anchor;
+                    if block.grid_anchors.has_anchor() {
+                        block.grid_anchors.end = anchor;
+                    }
                 }
             }
         }
@@ -225,12 +233,6 @@ impl BlockList {
     pub(crate) fn invalidate_primary_anchors(&mut self) {
         for block in &mut self.blocks {
             block.grid_anchors.clear_primary();
-            if matches!(
-                block.state,
-                BlockState::Prompt | BlockState::Input | BlockState::Running
-            ) {
-                block.state = BlockState::Cancelled;
-            }
         }
     }
 

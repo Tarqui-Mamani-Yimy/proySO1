@@ -1,3 +1,5 @@
+pub mod osc;
+
 /// Default interactive-shell command candidates, in preference order.
 pub fn default_shell_candidates() -> &'static [&'static str] {
     #[cfg(unix)]

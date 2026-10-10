@@ -36,15 +36,24 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 - Strategy: `ask-on-risk`. Forecast: large (new crate); chain strategy still
   to be decided by the user together with Phases 0–2.
 
-## Tasks (T1+ preliminary; refined after T0)
-- [ ] **T0 — Exploration and stack decision** (read-only Claude explorer)
-- [ ] **T1 — `crates/terminal` skeleton: open an empty window**
-- [ ] **T2 — Text rendering: font, cell grid, colors**
-- [ ] **T3 — PTY: spawn `so1sh` with `portable-pty`**
-- [ ] **T4 — VT emulation wired to the PTY output**
-- [ ] **T5 — Keyboard input to the PTY (incl. Ctrl-C/Ctrl-Z)**
-- [ ] **T6 — Cursor, scrollback and resize**
-- [ ] **T7 — Mouse selection, copy and paste**
+## Stack decision (T0, Codex exploration; key claim spot-checked by orchestrator)
+- VT/grid: `alacritty_terminal` 0.26.0 (Apache-2.0, vte 0.15) — feed bytes with `vte::ansi::Processor::advance(&mut term, bytes)`; `Term::grid()`, `Term::resize()`.
+- Alacritty exposes NO hook for OSC 133/OSC 7 (orchestrator confirmed: no match in `alacritty_terminal/src/event.rs`); Rio's `rio-vt` has `set_semantic_prompt`/`set_current_directory` (`rio-vt/src/performer/handler.rs:1181-1185`) but is a path/workspace crate, not a clean dependency. Decision: alacritty_terminal + our own incremental OSC observer over the raw PTY bytes.
+- PTY: `portable-pty` 0.9.0 (MIT) — independent of the UI/VT choice; resize, reader/writer, try_wait/kill.
+- Window/text: winit 0.30.13, wgpu 30.0.1, glyphon 0.12.0 + cosmic-text 0.19.0 (MIT/Apache). CPU fallback contingency: softbuffer 0.4.8 (needs own glyph rasterization).
+- Clipboard: copypasta 0.10.2 (used by Alacritty) or arboard 3.6.1.
+- Verified: a scratch crate with all of the above compiles on nightly-2026-09-15 (25 s). NOT verified: GPU init / window creation at runtime.
+- Architecture: UI thread owns `Term`; PTY reader thread sends byte chunks over a channel and wakes the UI; each chunk feeds both the VT processor and the OSC observer; modules window, pty, model, osc, renderer, keyboard, selection, clipboard.
+
+## Tasks (refined after T0)
+- [x] **T0 — Exploration and stack decision** (Codex, read-only)
+- [ ] **T1 — Crate skeleton + stack spike**: `crates/terminal`, open a window, clear it with wgpu; type-check Term; GPU init failure reported clearly.
+- [ ] **T2 — OSC observer**: pure incremental parser for OSC 133 A/B/C/D and OSC 7, split at every byte boundary, malformed input (Phase 4 seam).
+- [ ] **T3 — PTY lifecycle**: spawn `so1sh`, stream output, write input, resize, child exit, cleanup.
+- [ ] **T4 — VT model adapter**: PTY chunks -> alacritty_terminal; tests for grid contents, cursor, scrollback without a window.
+- [ ] **T5 — Renderer**: draw the visible grid (glyphon), colors, cursor; GPU smoke optional so headless CI stays useful.
+- [ ] **T6 — Input and resize**: key-event -> bytes encoder (tested), mouse wheel scrollback, window resize -> PTY + Term.
+- [ ] **T7 — Selection and clipboard**: selection model tests, copy/paste, manual GUI smoke.
 - [ ] **T8 — Phase verification**
 
 ## Carry-over from Phase 2
@@ -55,4 +64,4 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 _(filled per task)_
 
 ## Progress / Next step
-- T0 running.
+- T0 done. Open product question for the user: target platforms for the MVP. Then T1 on `codex-impl`.

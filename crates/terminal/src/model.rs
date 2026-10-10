@@ -85,6 +85,7 @@ pub struct Model {
 /// only operations which can push primary rows out of its bounded history.
 struct EvictionTracker<'a> {
     term: &'a mut Term<Listener>,
+    blocks: &'a mut crate::blocks::BlockList,
     evicted_rows: &'a mut u64,
     history_limit: usize,
     region: std::ops::Range<usize>,
@@ -127,22 +128,19 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
         let pending_wrap = cursor.input_needs_wrap;
         let at_last_column = cursor.point.column.0 + 1 == self.term.columns();
         let bottom_row = cursor.point.line.0 + 1 == self.region.end as i32;
+        let character_width = crate::renderer::unicode_cell_width(character);
         let can_wrap = self.is_full_primary_region()
             && bottom_row
             && self
                 .term
                 .mode()
                 .contains(alacritty_terminal::term::TermMode::LINE_WRAP);
-        let candidate_line = cursor.point.line;
-        let candidate_column = cursor.point.column;
+        let causes_scroll = can_wrap
+            && character_width > 0
+            && (pending_wrap || (at_last_column && character_width == 2));
         let history_before = self.term.grid().history_size();
         self.term.input(character);
-        let wide_char_wrapped = can_wrap
-            && at_last_column
-            && self.term.grid()[candidate_line][candidate_column]
-                .flags
-                .contains(Flags::LEADING_WIDE_CHAR_SPACER);
-        if can_wrap && (pending_wrap || wide_char_wrapped) {
+        if causes_scroll {
             self.record_eviction_from(history_before, 1);
         }
     }
@@ -185,7 +183,37 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
 
     fn reset_state(&mut self) {
         self.term.reset_state();
+        self.blocks.invalidate_anchors();
+        *self.evicted_rows = 0;
         self.region = 0..self.term.screen_lines();
+    }
+
+    fn clear_screen(&mut self, mode: vte::ansi::ClearMode) {
+        let primary = !self
+            .term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+        let saved = matches!(&mode, vte::ansi::ClearMode::Saved);
+        let all = matches!(&mode, vte::ansi::ClearMode::All);
+        let history_before = self.term.grid().history_size();
+        self.term.clear_screen(mode);
+
+        if !primary {
+            return;
+        }
+        if saved {
+            let removed = history_before.saturating_sub(self.term.grid().history_size());
+            *self.evicted_rows = self.evicted_rows.saturating_add(removed as u64);
+            if removed > 0 {
+                self.blocks
+                    .expire_primary_anchors_before(*self.evicted_rows);
+            }
+        } else if all {
+            // ED 2 destroys the visible primary rows. Start a fresh row-coordinate
+            // epoch after invalidating their anchors; old semantic records remain.
+            self.blocks.invalidate_primary_anchors();
+            *self.evicted_rows = 0;
+        }
     }
 
     delegate_handler! {
@@ -219,7 +247,6 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
         save_cursor_position();
         restore_cursor_position();
         clear_line(_mode: vte::ansi::LineClearMode);
-        clear_screen(_mode: vte::ansi::ClearMode);
         clear_tabs(_mode: vte::ansi::TabulationClearMode);
         set_tabs(_interval: u16);
         reverse_index();
@@ -370,6 +397,7 @@ impl Model {
         let evicted_before = self.evicted_rows;
         let mut tracker = EvictionTracker {
             term: &mut self.term,
+            blocks: &mut self.blocks,
             evicted_rows: &mut self.evicted_rows,
             history_limit: self.scrollback_limit,
             region: self.scroll_region.clone(),
@@ -444,6 +472,20 @@ impl Model {
 
     pub fn blocks(&self) -> &crate::blocks::BlockList {
         &self.blocks
+    }
+
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    pub fn evicted_rows(&self) -> u64 {
+        self.evicted_rows
+    }
+
+    pub fn alternate_screen_active(&self) -> bool {
+        self.term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -910,6 +952,79 @@ mod tests {
         model.feed("本".as_bytes());
         assert_eq!(model.term.grid().history_size(), 1);
         assert_eq!(model.evicted_rows, 1);
+    }
+
+    #[test]
+    fn saved_history_clear_advances_eviction_boundary_and_expires_old_rows() {
+        let mut model = Model::with_scrollback_limit(20, 2, 2);
+        model.feed(b"\x1b]133;A\x1b\\");
+        model.feed(b"one\r\ntwo\r\nthree\r\n");
+        assert_eq!(model.term.grid().history_size(), 2);
+        let before = model.evicted_rows;
+        model.feed(b"\x1b[3J");
+        assert_eq!(model.term.grid().history_size(), 0);
+        assert_eq!(model.evicted_rows, before + 2);
+        assert_eq!(model.blocks().blocks()[0].grid_anchors.prompt_start, None);
+    }
+
+    #[test]
+    fn clear_all_and_terminal_reset_invalidate_primary_anchors() {
+        for control in [b"\x1b[2J".as_slice(), b"\x1bc".as_slice()] {
+            let mut model = Model::with_scrollback_limit(20, 2, 2);
+            model.feed(b"\x1b]133;A\x1b\\");
+            model.feed(control);
+            assert_eq!(
+                model.blocks().blocks()[0].grid_anchors.prompt_start,
+                None,
+                "control sequence {control:?} clears the grid anchor"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_reset_invalidates_primary_block_anchors() {
+        let mut model = Model::with_scrollback_limit(20, 2, 2);
+        model.feed(b"\x1b]133;A\x1b\\");
+        assert!(
+            model.blocks().blocks()[0]
+                .grid_anchors
+                .prompt_start
+                .is_some()
+        );
+        model.feed(b"\x1bc");
+        assert_eq!(model.blocks().blocks()[0].grid_anchors.prompt_start, None);
+    }
+
+    #[test]
+    fn eviction_after_resize_keeps_blocks_whose_anchors_were_invalidated() {
+        let mut model = Model::with_scrollback_limit(20, 2, 1);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+        model.resize(20, 3);
+        assert_eq!(model.blocks().blocks()[0].grid_anchors.prompt_start, None);
+        model.feed(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        assert_eq!(model.evicted_rows, 1);
+        assert_eq!(model.blocks().blocks().len(), 1);
+        assert_eq!(
+            model.blocks().blocks()[0].state,
+            crate::blocks::BlockState::Finished
+        );
+        assert!(
+            model.blocks().blocks()[0]
+                .grid_anchors
+                .prompt_start
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wide_wrap_at_the_last_column_counts_eviction_before_the_row_moves() {
+        let mut model = Model::with_scrollback_limit(20, 2, 1);
+        model.feed(b"one\r\ntwo\r\nthree\r\n");
+        assert_eq!(model.term.grid().history_size(), 1);
+        assert_eq!(model.evicted_rows, 1);
+        model.feed(b"\x1b[2;20H\xe6\x97\xa5");
+        assert_eq!(model.term.grid().history_size(), 1);
+        assert_eq!(model.evicted_rows, 2);
     }
 
     #[test]

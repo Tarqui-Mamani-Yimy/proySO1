@@ -13,9 +13,10 @@ use so1_terminal::{
     },
     model::{Model, ModelEvent},
     renderer::{
-        ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, SurfaceRetryBackoff,
-        WakeupGate, WheelAccumulator, apply_selection_highlight, collect_glyph_positions,
-        grid_size, project_terminal_metrics, unicode_cell_width,
+        BlockDecorationColor, BlockViewport, ExitPollBackoff, ExitPollDecision, FrameRecovery,
+        SurfaceFailure, SurfaceRetryBackoff, WakeupGate, WheelAccumulator,
+        apply_selection_highlight, collect_glyph_positions, grid_size, project_block_decorations,
+        project_terminal_metrics, unicode_cell_width,
     },
     selection::{PointerAction, PointerButton, PointerState, SelectionGesture, SelectionRouter},
 };
@@ -86,6 +87,66 @@ struct RectVertex {
 }
 
 type GlyphKey = (char, [u8; 3], bool, usize);
+
+fn overlay_vertex_range(
+    background_vertices: usize,
+    total_vertices: usize,
+) -> Option<std::ops::Range<u32>> {
+    (total_vertices > background_vertices)
+        .then_some(background_vertices as u32..total_vertices as u32)
+}
+
+fn block_marker_bounds(cell_width: f32, cell_height: f32) -> [f32; 4] {
+    let marker_width = cell_width.clamp(0.0, 2.5);
+    let top = cell_height.clamp(0.0, 2.0);
+    [
+        cell_width - marker_width,
+        top,
+        cell_width,
+        (cell_height - 2.0).max(top),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_overlay_rect(
+    vertices: &mut Vec<RectVertex>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    color: [u8; 3],
+) {
+    if viewport_width <= 0.0 || viewport_height <= 0.0 || x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let points = [
+        [
+            x0 / viewport_width * 2.0 - 1.0,
+            1.0 - y0 / viewport_height * 2.0,
+        ],
+        [
+            x1 / viewport_width * 2.0 - 1.0,
+            1.0 - y0 / viewport_height * 2.0,
+        ],
+        [
+            x1 / viewport_width * 2.0 - 1.0,
+            1.0 - y1 / viewport_height * 2.0,
+        ],
+        [
+            x0 / viewport_width * 2.0 - 1.0,
+            1.0 - y1 / viewport_height * 2.0,
+        ],
+    ];
+    let color = color.map(so1_terminal::renderer::srgb_to_linear);
+    for point in [0, 1, 2, 0, 2, 3] {
+        vertices.push(RectVertex {
+            position: points[point],
+            color,
+        });
+    }
+}
 
 fn glyph_key_requires_reshape(cached: Option<GlyphKey>, next: Option<GlyphKey>) -> bool {
     cached != next
@@ -462,6 +523,51 @@ impl TerminalWindow {
                 }
             }
         }
+        let background_vertex_count = gpu.vertices.len();
+
+        // Block marks are overlays inside the existing first cell; they do not
+        // reserve columns or alter the PTY grid dimensions.
+        let viewport = BlockViewport {
+            evicted_rows: model.evicted_rows(),
+            history_size: model.history_size(),
+            display_offset: model.display_offset(),
+            screen_lines: rows.len(),
+            alternate_screen: model.alternate_screen_active(),
+        };
+        for decoration in project_block_decorations(model.blocks(), viewport) {
+            let color = match decoration.color {
+                BlockDecorationColor::Accent => [105, 165, 220],
+                BlockDecorationColor::Success => [80, 200, 120],
+                BlockDecorationColor::Failure => [230, 75, 75],
+                BlockDecorationColor::Muted => [110, 115, 125],
+            };
+            if let Some(row) = decoration.separator_row {
+                let y = row as f32 * gpu.cell_height;
+                push_overlay_rect(
+                    &mut gpu.vertices,
+                    0.0,
+                    y,
+                    width,
+                    (y + 1.5).min(height),
+                    width,
+                    height,
+                    color,
+                );
+            }
+            let row_top = decoration.marker_row as f32 * gpu.cell_height;
+            let [marker_x0, marker_y0, marker_x1, marker_y1] =
+                block_marker_bounds(gpu.cell_width, gpu.cell_height);
+            push_overlay_rect(
+                &mut gpu.vertices,
+                marker_x0,
+                row_top + marker_y0,
+                marker_x1,
+                (row_top + marker_y1).min(height),
+                width,
+                height,
+                color,
+            );
+        }
 
         collect_glyph_positions(&cells, &mut gpu.glyph_positions);
         gpu.glyph_keys.resize(gpu.glyph_positions.len(), None);
@@ -589,14 +695,19 @@ impl TerminalWindow {
                 })],
                 ..Default::default()
             });
-            if required > 0 {
+            if background_vertex_count > 0 {
                 pass.set_pipeline(&gpu.rect_pipeline);
                 pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
-                pass.draw(0..gpu.vertices.len() as u32, 0..1);
+                pass.draw(0..background_vertex_count as u32, 0..1);
             }
             gpu.text_renderer
                 .render(&gpu.atlas, &gpu.viewport, &mut pass)
                 .map_err(|e| format!("could not render terminal text: {e}"))?;
+            if let Some(range) = overlay_vertex_range(background_vertex_count, gpu.vertices.len()) {
+                pass.set_pipeline(&gpu.rect_pipeline);
+                pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+                pass.draw(range, 0..1);
+            }
         }
         gpu.queue.submit([encoder.finish()]);
         gpu.queue.present(frame);
@@ -909,7 +1020,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{GlyphKey, glyph_key_requires_reshape, invalidate_glyph_cache};
+    use super::{
+        GlyphKey, block_marker_bounds, glyph_key_requires_reshape, invalidate_glyph_cache,
+        overlay_vertex_range,
+    };
+
+    #[test]
+    fn decoration_vertices_are_separate_for_compositing_after_text() {
+        assert_eq!(overlay_vertex_range(12, 24), Some(12..24));
+        assert_eq!(overlay_vertex_range(12, 12), None);
+    }
+
+    #[test]
+    fn block_marker_uses_the_first_cell_trailing_padding() {
+        assert_eq!(block_marker_bounds(8.0, 20.0), [5.5, 2.0, 8.0, 18.0]);
+    }
 
     #[test]
     fn glyph_cache_reshapes_only_when_a_visible_glyph_changes() {

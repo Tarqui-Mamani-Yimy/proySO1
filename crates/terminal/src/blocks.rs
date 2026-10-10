@@ -44,7 +44,21 @@ pub struct GridAnchors {
 }
 
 impl GridAnchors {
-    fn expire_primary_before(&mut self, boundary: u64) {
+    fn clear_primary(&mut self) {
+        for anchor in [
+            &mut self.prompt_start,
+            &mut self.input_start,
+            &mut self.output_start,
+            &mut self.end,
+        ] {
+            if anchor.is_some_and(|anchor| anchor.screen == GridScreen::Primary) {
+                *anchor = None;
+            }
+        }
+    }
+
+    fn expire_primary_before(&mut self, boundary: u64) -> bool {
+        let mut expired_any = false;
         for anchor in [
             &mut self.prompt_start,
             &mut self.input_start,
@@ -55,8 +69,10 @@ impl GridAnchors {
                 anchor.screen == GridScreen::Primary && anchor.line < boundary as i64
             }) {
                 *anchor = None;
+                expired_any = true;
             }
         }
+        expired_any
     }
 
     fn clear(&mut self) {
@@ -206,17 +222,19 @@ impl BlockList {
         }
     }
 
+    pub(crate) fn invalidate_primary_anchors(&mut self) {
+        for block in &mut self.blocks {
+            block.grid_anchors.clear_primary();
+        }
+    }
+
     /// Expire primary anchors below the exact evicted-row boundary and discard
     /// completed blocks that no longer have any surviving grid anchors.
     pub(crate) fn expire_primary_anchors_before(&mut self, boundary: u64) {
-        for block in &mut self.blocks {
-            block.grid_anchors.expire_primary_before(boundary);
-        }
-        self.blocks.retain(|block| {
-            matches!(
-                block.state,
-                BlockState::Prompt | BlockState::Input | BlockState::Running
-            ) || block.grid_anchors.has_anchor()
+        self.blocks.retain_mut(|block| {
+            let expired = block.grid_anchors.expire_primary_before(boundary);
+            let completed = matches!(block.state, BlockState::Finished | BlockState::Cancelled);
+            !(expired && completed && !block.grid_anchors.has_anchor())
         });
     }
 

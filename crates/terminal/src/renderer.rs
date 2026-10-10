@@ -1,5 +1,8 @@
 //! Renderer-independent grid layout and terminal color conversion.
-use crate::model::{CellColor, VisibleCell};
+use crate::{
+    blocks::{BlockList, BlockState, GridAnchor, GridScreen},
+    model::{CellColor, VisibleCell},
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -10,6 +13,87 @@ pub struct RenderCell {
     pub background: [u8; 3],
     pub bold: bool,
     pub cursor: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockViewport {
+    pub evicted_rows: u64,
+    pub history_size: usize,
+    pub display_offset: usize,
+    pub screen_lines: usize,
+    pub alternate_screen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockDecorationColor {
+    Accent,
+    Success,
+    Failure,
+    Muted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockDecoration {
+    pub block_id: u64,
+    pub marker_row: usize,
+    pub separator_row: Option<usize>,
+    pub color: BlockDecorationColor,
+}
+
+/// Purely projects block anchors into viewport-relative overlay decorations.
+/// The VT grid remains authoritative and is never modified.
+pub fn project_block_decorations(
+    blocks: &BlockList,
+    viewport: BlockViewport,
+) -> Vec<BlockDecoration> {
+    if viewport.alternate_screen || viewport.screen_lines == 0 {
+        return Vec::new();
+    }
+
+    let first_line = viewport.evicted_rows.saturating_add(
+        viewport
+            .history_size
+            .saturating_sub(viewport.display_offset) as u64,
+    );
+    let end_line = first_line.saturating_add(viewport.screen_lines as u64);
+    blocks
+        .blocks()
+        .iter()
+        .filter_map(|block| {
+            let anchors = block.grid_anchors;
+            let visible_row = |anchor: Option<GridAnchor>| {
+                anchor
+                    .filter(|anchor| anchor.screen == GridScreen::Primary && anchor.line >= 0)
+                    .map(|anchor| anchor.line as u64)
+                    .filter(|line| *line >= first_line && *line < end_line)
+                    .map(|line| (line - first_line) as usize)
+            };
+            let prompt_row = visible_row(anchors.prompt_start);
+            let marker_row = prompt_row
+                .or_else(|| visible_row(anchors.input_start))
+                .or_else(|| visible_row(anchors.output_start))
+                .or_else(|| visible_row(anchors.end))?;
+            let color = match block.state {
+                BlockState::Prompt | BlockState::Input | BlockState::Running => {
+                    BlockDecorationColor::Accent
+                }
+                BlockState::Finished if block.exit_status == Some(0) => {
+                    BlockDecorationColor::Success
+                }
+                BlockState::Finished if block.exit_status.is_some_and(|status| status != 0) => {
+                    BlockDecorationColor::Failure
+                }
+                BlockState::Finished => BlockDecorationColor::Accent,
+                BlockState::Cancelled => BlockDecorationColor::Muted,
+            };
+            Some(BlockDecoration {
+                block_id: block.id,
+                marker_row,
+                separator_row: prompt_row,
+                color,
+            })
+        })
+        .collect()
 }
 
 pub fn apply_selection_highlight(cell: &mut RenderCell) {
@@ -332,6 +416,107 @@ pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mark(list: &mut BlockList, mark: crate::osc::SemanticMark, line: i64) {
+        let boundary = list.blocks().len() as u64 + 1;
+        let observed = crate::osc::ObservedEvent {
+            end_offset: boundary,
+            event: crate::osc::Event::SemanticMark(mark),
+        };
+        list.consume_event(
+            &observed,
+            Some(GridAnchor {
+                line,
+                column: 0,
+                screen: GridScreen::Primary,
+            }),
+        );
+    }
+
+    fn finished_block(status: Option<i32>, prompt: i64, output: i64) -> BlockList {
+        let mut blocks = BlockList::default();
+        mark(&mut blocks, crate::osc::SemanticMark::PromptStart, prompt);
+        mark(&mut blocks, crate::osc::SemanticMark::InputStart, prompt);
+        mark(&mut blocks, crate::osc::SemanticMark::OutputStart, output);
+        mark(
+            &mut blocks,
+            crate::osc::SemanticMark::CommandFinished {
+                exit_status: status,
+            },
+            output,
+        );
+        blocks
+    }
+
+    fn viewport(start: u64, screen_lines: usize, display_offset: usize) -> BlockViewport {
+        BlockViewport {
+            evicted_rows: 0,
+            history_size: start as usize + display_offset,
+            display_offset,
+            screen_lines,
+            alternate_screen: false,
+        }
+    }
+
+    #[test]
+    fn block_decorations_project_visible_partial_scrolled_and_offscreen_anchors() {
+        let visible = finished_block(Some(0), 10, 11);
+        let decorations = project_block_decorations(&visible, viewport(10, 4, 0));
+        assert_eq!(decorations.len(), 1);
+        assert_eq!(decorations[0].marker_row, 0);
+        assert_eq!(decorations[0].separator_row, Some(0));
+
+        let partial = finished_block(Some(0), 2, 10);
+        let decorations = project_block_decorations(&partial, viewport(8, 4, 0));
+        assert_eq!(decorations.len(), 1);
+        assert_eq!(decorations[0].marker_row, 2);
+        assert_eq!(decorations[0].separator_row, None);
+
+        let scrolled = finished_block(Some(0), 5, 5);
+        let decorations = project_block_decorations(&scrolled, viewport(4, 4, 4));
+        assert_eq!(decorations[0].marker_row, 1);
+
+        let offscreen = finished_block(Some(0), 2, 3);
+        assert!(project_block_decorations(&offscreen, viewport(8, 4, 0)).is_empty());
+        assert!(
+            project_block_decorations(
+                &visible,
+                BlockViewport {
+                    alternate_screen: true,
+                    ..viewport(10, 4, 0)
+                }
+            )
+            .is_empty()
+        );
+        assert!(project_block_decorations(&BlockList::default(), viewport(0, 4, 0)).is_empty());
+    }
+
+    #[test]
+    fn block_decorations_use_distinct_state_colors() {
+        assert_eq!(
+            project_block_decorations(&finished_block(Some(0), 0, 0), viewport(0, 2, 0))[0].color,
+            BlockDecorationColor::Success
+        );
+        assert_eq!(
+            project_block_decorations(&finished_block(Some(7), 0, 0), viewport(0, 2, 0))[0].color,
+            BlockDecorationColor::Failure
+        );
+        let mut cancelled = BlockList::default();
+        mark(&mut cancelled, crate::osc::SemanticMark::PromptStart, 0);
+        mark(&mut cancelled, crate::osc::SemanticMark::InputStart, 0);
+        mark(&mut cancelled, crate::osc::SemanticMark::PromptStart, 0);
+        assert_eq!(
+            project_block_decorations(&cancelled, viewport(0, 2, 0))[0].color,
+            BlockDecorationColor::Muted
+        );
+        let mut running = BlockList::default();
+        mark(&mut running, crate::osc::SemanticMark::PromptStart, 0);
+        mark(&mut running, crate::osc::SemanticMark::OutputStart, 0);
+        assert_eq!(
+            project_block_decorations(&running, viewport(0, 2, 0))[0].color,
+            BlockDecorationColor::Accent
+        );
+    }
 
     #[test]
     fn waitpid_not_ready_schedules_bounded_retry_until_exit_is_observed() {

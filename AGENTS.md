@@ -48,11 +48,12 @@ crates/shell/
 crates/terminal/
   src/main.rs     so1term window/event loop, PTY wiring, and GPU renderer
   src/lib.rs      Public module declarations, shell selection, and surface helpers
+  src/blocks.rs   OSC 133 command-block state and grid anchors
   src/keyboard.rs Xterm key encoding, paste helpers, and IME preedit gate
   src/model.rs    alacritty_terminal adapter, snapshots, selections, and write-back events
   src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
-  src/renderer.rs Renderer-independent grid, colors, glyph placement, and redraw helpers
+  src/renderer.rs Grid/color helpers and pure block-overlay projection
   src/selection.rs Click tracking and pure mouse-selection routing
 crates/epsh/src/
   lib.rs          Public API, module declarations

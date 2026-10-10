@@ -168,7 +168,8 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 
 ## Phase 2 result
 - All implementation and verification tasks done on `feat/phase-2-modern-shell` (stacked on Phase 1). Last commit `9067920`.
-- Native review: everything up to `a848e3f` reviewed and acknowledged. Pending unreviewed slice `a848e3f..9067920` (T2e test isolation, rustfmt, T6c, T8b) is under the slice budget, so the native assessment did not require review yet.
+- Native review: the whole phase is reviewed and acknowledged; the final slice `a848e3f..9067920` (under budget) was reviewed on the user's request: approved (lineage review-7bd7edf461e9d450).
+- Carry-over to Phase 3 backlog: argument-position file completion now drops broken symlinks because it follows links with `fs::metadata` (`completion.rs:229-232`) — show them as plain entries; suggestions: observable test for integration write failures, fragile plain-highlight assertion, write-then-exec ETXTBSY risk in a PTY test.
 - Not pushed or merged: delivery (merges to `main`, PR/chain strategy) is the user's decision.
 
 ## Progress / Next step

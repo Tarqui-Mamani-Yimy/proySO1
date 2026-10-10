@@ -56,6 +56,11 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 - [x] **T2 — OSC observer**: pure incremental parser for OSC 133 A/B/C/D and OSC 7, split at every byte boundary, malformed input (Phase 4 seam).
 - [x] **T3 — PTY lifecycle**: spawn `so1sh`, stream output, write input, resize, child exit, cleanup.
 - [x] **T4 — VT model adapter**: PTY chunks -> alacritty_terminal; tests for grid contents, cursor, scrollback without a window.
+- [ ] **T4b — PTY/OSC robustness from the T2-T4 review** (codex-impl, after T5)
+  - R3-pty-drop-join-hang: `Drop` kills/reaps only the direct child and joins the reader thread without a bound; on Unix the reader's cloned master fd only sees EOF/EIO when every process holding the slave tty has closed it, so a background job (e.g. `sleep 100 &`) can hang the terminal on close (`pty.rs:220-232`). Bound the join / close the reader's fd / kill the session's process group.
+  - R3-pty-spawn-error-leaks-child: the child is spawned before reader/writer setup; an early `?` return drops the Child without kill/wait (`pty.rs:121-127`).
+  - R3-osc-esc-termination-divergence: the observer appends ESC+byte to the payload where VTE ends the OSC (ESC followed by non-`\`) and ignores CAN/SUB aborts, so it can report marks the emulator discarded (`osc.rs:82-111`). Match VTE's termination rules; add tests.
+  - R3-model-test-target-dir: the so1sh prompt test hardcodes `target/debug` and runs a nested cargo build ignoring CARGO_TARGET_DIR/profile (`model.rs:263-278`).
 - [ ] **T5 — Renderer**: draw the visible grid (glyphon), colors, cursor; GPU smoke optional so headless CI stays useful. Also fix (T1 review): when a frame cannot be acquired (Lost/Outdated/Timeout/Occluded) `draw()` never requests another redraw (`crates/terminal/src/main.rs:82-88`).
 - [ ] **T6 — Input and resize**: key-event -> bytes encoder (tested), mouse wheel scrollback, window resize -> PTY + Term.
 - [ ] **T7 — Selection and clipboard**: selection model tests, copy/paste, manual GUI smoke.
@@ -70,4 +75,5 @@ _(filled per task)_
 
 ## Progress / Next step
 - T2 done (`a9226d5`): `crates/terminal/src/osc.rs`, absolute end offsets, every-split test (orchestrator checked the expected offsets are derived from sequence lengths, not copied from output). T3 done (`fe39648`): `crates/terminal/src/pty.rs`; 3/3 runs green; tests cover I/O, resize (`stty size`), exit status, drop reaps the child (/proc). Gap closed in T4.
-- T4 done (`f0d652a`): `crates/terminal/src/model.rs` (Term + VTE processor + OSC observer on the same bytes, snapshots, scrollback, events incl. DSR write-back); pure shell selection with tests. 17 terminal tests, 2/2 runs green. Next: T5 (renderer). Pending user decision: install rustup targets for Windows/macOS compile checks.
+- T4 done (`f0d652a`): `crates/terminal/src/model.rs` (Term + VTE processor + OSC observer on the same bytes, snapshots, scrollback, events incl. DSR write-back); pure shell selection with tests. 17 terminal tests, 2/2 runs green. Next: T5 (renderer, running).
+- Native review T2..T4 (`35f0b83..c601466`): medium, user granted, approved (review-348ac442dcb7b106); 4 WARNINGs -> T4b. Pending user decision: install rustup targets for Windows/macOS compile checks.

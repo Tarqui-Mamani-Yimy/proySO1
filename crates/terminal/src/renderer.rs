@@ -111,6 +111,18 @@ impl ExitPollBackoff {
     }
 }
 
+pub fn scaled_cell_metrics(cell_width: f32, cell_height: f32, scale_factor: f64) -> (f32, f32) {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor as f32
+    } else {
+        1.0
+    };
+    (
+        (cell_width * scale).max(1.0),
+        (cell_height * scale).max(1.0),
+    )
+}
+
 pub fn grid_size(width: u32, height: u32, cell_width: f32, cell_height: f32) -> (usize, usize) {
     let cols = (width as f32 / cell_width.max(1.0)).floor() as usize;
     let rows = (height as f32 / cell_height.max(1.0)).floor() as usize;
@@ -328,6 +340,15 @@ mod tests {
         assert_eq!(next_vertex_capacity(1024, 700), 1024);
         assert_eq!(next_vertex_capacity(1024, 1025), 2048);
         assert_eq!(next_vertex_capacity(0, 1), 1);
+    }
+
+    #[test]
+    fn tiny_grid_and_hidpi_metrics_keep_at_least_one_cell() {
+        assert_eq!(grid_size(1, 1, 8.0, 16.0), (1, 1));
+        assert_eq!(scaled_cell_metrics(8.0, 16.0, 2.0), (16.0, 32.0));
+        let (cw, ch) = scaled_cell_metrics(8.0, 16.0, 1.5);
+        assert_eq!(grid_size(1200, 900, cw, ch), (100, 37));
+        assert_eq!(scaled_cell_metrics(8.0, 16.0, f64::NAN), (8.0, 16.0));
     }
 
     #[test]

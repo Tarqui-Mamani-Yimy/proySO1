@@ -105,6 +105,26 @@ impl Model {
             rows: rows.max(1),
         });
     }
+    pub fn application_cursor_keys(&self) -> bool {
+        self.term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::APP_CURSOR)
+    }
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+    pub fn mouse_or_alternate_screen_active(&self) -> bool {
+        let mode = self.term.mode();
+        mode.intersects(
+            alacritty_terminal::term::TermMode::MOUSE_MODE
+                | alacritty_terminal::term::TermMode::ALT_SCREEN,
+        )
+    }
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_down(usize::MAX);
+    }
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
     }
@@ -229,6 +249,21 @@ mod tests {
         assert!(m.display_offset() >= offset);
         m.scroll_down(100);
         assert_eq!(m.display_offset(), 0);
+    }
+    #[test]
+    fn terminal_input_modes_follow_application_escape_sequences() {
+        let mut m = Model::new(10, 2);
+        assert!(!m.application_cursor_keys());
+        assert!(!m.bracketed_paste_enabled());
+        assert!(!m.mouse_or_alternate_screen_active());
+        m.feed(b"\x1b[?1h\x1b[?2004h\x1b[?1000h");
+        assert!(m.application_cursor_keys());
+        assert!(m.bracketed_paste_enabled());
+        assert!(m.mouse_or_alternate_screen_active());
+        m.feed(b"\x1b[?1l\x1b[?2004l\x1b[?1000l");
+        assert!(!m.application_cursor_keys());
+        assert!(!m.bracketed_paste_enabled());
+        assert!(!m.mouse_or_alternate_screen_active());
     }
     #[test]
     fn cursor_shape_osc_and_dsr_writeback_are_exposed() {

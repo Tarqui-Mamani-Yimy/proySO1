@@ -89,3 +89,4 @@ mod tests {
         assert_eq!(default_shell_candidates_for(true), &["pwsh", "cmd"]);
     }
 }
+pub mod keyboard;

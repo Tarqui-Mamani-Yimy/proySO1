@@ -5,17 +5,19 @@ use glyphon::{
 };
 use so1_terminal::{
     clamp_surface_size,
+    keyboard::{Key as TerminalKey, Modifiers as KeyModifiers, encode_ime_commit, encode_key},
     model::{Model, ModelEvent},
     renderer::{
         ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, WakeupGate, grid_size,
+        scaled_cell_metrics,
     },
 };
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowAttributes, WindowId},
 };
 
@@ -29,7 +31,8 @@ struct TerminalWindow {
     model: Option<Model>,
     pty: Option<so1_terminal::pty::Pty>,
     failed: bool,
-    input: String,
+    modifiers: winit::keyboard::ModifiersState,
+    ime_preedit_active: bool,
     proxy: EventLoopProxy<UserEvent>,
     pty_wakeup: Arc<WakeupGate>,
     exit_poll: ExitPollBackoff,
@@ -50,6 +53,8 @@ struct GpuState {
     viewport: Viewport,
     cell_width: f32,
     cell_height: f32,
+    logical_cell_width: f32,
+    logical_cell_height: f32,
     rect_pipeline: wgpu::RenderPipeline,
     line_buffers: Vec<Buffer>,
     vertices: Vec<RectVertex>,
@@ -71,7 +76,8 @@ impl TerminalWindow {
             model: None,
             pty: None,
             failed: false,
-            input: String::new(),
+            modifiers: winit::keyboard::ModifiersState::empty(),
+            ime_preedit_active: false,
             proxy,
             pty_wakeup: Arc::new(WakeupGate::default()),
             exit_poll: ExitPollBackoff::new(now),
@@ -87,6 +93,7 @@ impl TerminalWindow {
                 .create_window(WindowAttributes::default().with_title("so1term"))
                 .map_err(|e| format!("could not create so1term window: {e}"))?,
         );
+        window.set_ime_allowed(true);
         let size = window.inner_size();
         let (width, height) = clamp_surface_size(size.width, size.height);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -188,7 +195,9 @@ impl TerminalWindow {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (cols, rows) = grid_size(width, height, cell_width, cell_height);
+        let (physical_cell_width, physical_cell_height) =
+            scaled_cell_metrics(cell_width, cell_height, window.scale_factor());
+        let (cols, rows) = grid_size(width, height, physical_cell_width, physical_cell_height);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let proxy = self.proxy.clone();
         let pty_wakeup = Arc::clone(&self.pty_wakeup);
@@ -205,7 +214,7 @@ impl TerminalWindow {
         .map_err(|e| format!("could not start shell PTY: {e}"))?;
         self.model = Some(Model::new(cols, rows));
         self.pty = Some(pty);
-        self.window = Some(window);
+        self.window = Some(Arc::clone(&window));
         self.gpu = Some(GpuState {
             surface,
             device,
@@ -216,8 +225,10 @@ impl TerminalWindow {
             atlas,
             text_renderer,
             viewport,
-            cell_width,
-            cell_height,
+            cell_width: physical_cell_width,
+            cell_height: physical_cell_height,
+            logical_cell_width: cell_width,
+            logical_cell_height: cell_height,
             rect_pipeline,
             line_buffers: Vec::new(),
             vertices: Vec::new(),
@@ -560,30 +571,108 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     }
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Ime(winit::event::Ime::Preedit(preedit, _)) => {
+                self.ime_preedit_active = !preedit.is_empty();
+            }
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if let Some(model) = self.model.as_mut() {
+                    let bytes = encode_ime_commit(&text, model.bracketed_paste_enabled());
+                    if let Some(pty) = self.pty.as_mut() {
+                        let _ = pty.write(&bytes);
+                    }
+                    model.scroll_to_bottom();
+                }
+                self.request_redraw();
+                self.ime_preedit_active = false;
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                match event.logical_key {
-                    Key::Named(NamedKey::Enter) => {
-                        if let Some(p) = self.pty.as_mut() {
-                            let _ = p.write(b"\r");
-                        }
-                        self.input.clear()
+                let mods = KeyModifiers {
+                    shift: self.modifiers.contains(ModifiersState::SHIFT),
+                    alt: self.modifiers.contains(ModifiersState::ALT),
+                    control: self.modifiers.contains(ModifiersState::CONTROL),
+                    super_key: self.modifiers.contains(ModifiersState::SUPER),
+                };
+                let terminal_key = match &event.logical_key {
+                    Key::Named(NamedKey::Enter) => Some(TerminalKey::Enter),
+                    Key::Named(NamedKey::Tab) => Some(TerminalKey::Tab),
+                    Key::Named(NamedKey::Backspace) => Some(TerminalKey::Backspace),
+                    Key::Named(NamedKey::Escape) => Some(TerminalKey::Escape),
+                    Key::Named(NamedKey::ArrowUp) => Some(TerminalKey::Up),
+                    Key::Named(NamedKey::ArrowDown) => Some(TerminalKey::Down),
+                    Key::Named(NamedKey::ArrowLeft) => Some(TerminalKey::Left),
+                    Key::Named(NamedKey::ArrowRight) => Some(TerminalKey::Right),
+                    Key::Named(NamedKey::Home) => Some(TerminalKey::Home),
+                    Key::Named(NamedKey::End) => Some(TerminalKey::End),
+                    Key::Named(NamedKey::PageUp) => Some(TerminalKey::PageUp),
+                    Key::Named(NamedKey::PageDown) => Some(TerminalKey::PageDown),
+                    Key::Named(NamedKey::Insert) => Some(TerminalKey::Insert),
+                    Key::Named(NamedKey::Delete) => Some(TerminalKey::Delete),
+                    Key::Named(NamedKey::F1) => Some(TerminalKey::Function(1)),
+                    Key::Named(NamedKey::F2) => Some(TerminalKey::Function(2)),
+                    Key::Named(NamedKey::F3) => Some(TerminalKey::Function(3)),
+                    Key::Named(NamedKey::F4) => Some(TerminalKey::Function(4)),
+                    Key::Named(NamedKey::F5) => Some(TerminalKey::Function(5)),
+                    Key::Named(NamedKey::F6) => Some(TerminalKey::Function(6)),
+                    Key::Named(NamedKey::F7) => Some(TerminalKey::Function(7)),
+                    Key::Named(NamedKey::F8) => Some(TerminalKey::Function(8)),
+                    Key::Named(NamedKey::F9) => Some(TerminalKey::Function(9)),
+                    Key::Named(NamedKey::F10) => Some(TerminalKey::Function(10)),
+                    Key::Named(NamedKey::F11) => Some(TerminalKey::Function(11)),
+                    Key::Named(NamedKey::F12) => Some(TerminalKey::Function(12)),
+                    _ => event
+                        .text
+                        .as_ref()
+                        .filter(|text| !text.is_empty())
+                        .map(|text| TerminalKey::Text(text.as_str())),
+                };
+                if !self.ime_preedit_active
+                    && let (Some(key), Some(model)) = (terminal_key, self.model.as_mut())
+                {
+                    let app_cursor = model.application_cursor_keys();
+                    if let Some(bytes) = encode_key(key, mods, app_cursor)
+                        && let Some(pty) = self.pty.as_mut()
+                    {
+                        let _ = pty.write(&bytes);
                     }
-                    Key::Named(NamedKey::Backspace) => {
-                        if !self.input.is_empty() {
-                            self.input.pop();
-                            if let Some(p) = self.pty.as_mut() {
-                                let _ = p.write(b"\x7f");
-                            }
-                        }
+                    model.scroll_to_bottom();
+                }
+                self.request_redraw();
+            }
+            WindowEvent::Ime(winit::event::Ime::Enabled) => {}
+            WindowEvent::Ime(winit::event::Ime::Disabled) => self.ime_preedit_active = false,
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(model) = self.model.as_mut()
+                    && !model.mouse_or_alternate_screen_active()
+                {
+                    let amount = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y.abs().ceil() as usize,
+                        MouseScrollDelta::PixelDelta(pos) => (pos.y.abs() / 16.0).ceil() as usize,
                     }
-                    Key::Character(s) => {
-                        let bytes = s.as_bytes();
-                        if let Some(p) = self.pty.as_mut() {
-                            let _ = p.write(bytes);
-                        }
-                        self.input.push_str(&s)
+                    .max(1);
+                    if match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
+                    } {
+                        model.scroll_up(amount);
+                    } else {
+                        model.scroll_down(amount);
                     }
-                    _ => {}
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    (gpu.cell_width, gpu.cell_height) = scaled_cell_metrics(
+                        gpu.logical_cell_width,
+                        gpu.logical_cell_height,
+                        scale_factor,
+                    );
+                }
+                if let Some(window) = self.window.as_ref() {
+                    let size = window.inner_size();
+                    self.resize(size.width, size.height);
+                    self.request_redraw();
                 }
             }
             _ => {}

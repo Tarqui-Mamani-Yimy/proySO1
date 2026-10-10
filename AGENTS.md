@@ -51,7 +51,7 @@ crates/terminal/
   src/layout.rs   Pure pane split tree, pixel/cell geometry, focus, and tab state
   src/blocks.rs   OSC 133 command-block state and grid anchors
   src/block_navigation.rs Pure block navigation targets and retained-grid text extraction
-  src/keyboard.rs Xterm key encoding, paste helpers, and IME preedit gate
+  src/keyboard.rs Xterm and kitty CSI-u key encoding, paste helpers, and IME preedit gate
   src/model.rs    alacritty_terminal adapter, snapshots, selections, and write-back events
   src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
@@ -283,6 +283,16 @@ starts a fresh block. Multiline PS2 input remains within one block. Metadata is
 written to the terminal, not through shell output or command redirections.
 Sequences use the 7-bit ST terminator (`ESC \\`). Set
 `SO1SH_SHELL_INTEGRATION=0` to disable all shell-integration sequences.
+
+so1term enables alacritty_terminal's kitty keyboard parser and exposes the
+active per-screen flags to its key encoder. With no flags, key bytes remain on
+the existing xterm path. Kitty mode supports disambiguation, key event types,
+alternate key codes, all-keys CSI-u reporting, and associated text. winit 0.30
+provides cross-platform Shift/Alt/Ctrl/Super state plus tracked CapsLock and
+NumLock; it does not expose Hyper or Meta state portably, so those modifier
+bits are currently always clear in GUI-originated events. Lock state starts
+unknown and is tracked from key events while the window is open. This implements the
+terminal side only; shell-side protocol consumption is Phase 5 T2.
 
 In `so1term`, Ctrl+Shift+Up/Down (Cmd+Up/Down on macOS) navigates to the
 previous/next anchored block prompt. Ctrl+Shift+A (Cmd+Shift+A on macOS)

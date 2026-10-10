@@ -8,8 +8,9 @@ use glyphon::{
 use so1_terminal::{
     clamp_surface_size,
     keyboard::{
-        ImePreeditGate, Key as TerminalKey, Modifiers as KeyModifiers, encode_ime_commit,
-        encode_key, encode_paste,
+        ImePreeditGate, Key as TerminalKey, KeyEventKind, KeyInput, KeyboardFlags,
+        Modifiers as KeyModifiers, encode_ime_commit_with_flags, encode_key_with_flags,
+        encode_paste,
     },
     layout::{CellSize, Direction, FocusDirection, PaneId, PaneLayout, Rect, Tab, TabSet},
     model::{Model, ModelEvent},
@@ -43,6 +44,8 @@ struct TerminalWindow {
     selection_origin: Option<PaneId>,
     failed: bool,
     modifiers: winit::keyboard::ModifiersState,
+    caps_lock: bool,
+    num_lock: bool,
     ime_gate: ImePreeditGate,
     surface_retry: SurfaceRetryBackoff,
     proxy: EventLoopProxy<UserEvent>,
@@ -316,6 +319,227 @@ fn pane_action(key: &Key, mods: KeyModifiers, macos: bool) -> Option<PaneAction>
     }
 }
 
+fn key_modifiers(state: ModifiersState, caps_lock: bool, num_lock: bool) -> KeyModifiers {
+    KeyModifiers {
+        shift: state.contains(ModifiersState::SHIFT),
+        alt: state.contains(ModifiersState::ALT),
+        control: state.contains(ModifiersState::CONTROL),
+        super_key: state.contains(ModifiersState::SUPER),
+        caps_lock,
+        num_lock,
+        // winit 0.30 exposes no cross-platform hyper/meta modifier state.
+        hyper: false,
+        meta: false,
+    }
+}
+
+fn modifier_event_state(
+    mut modifiers: KeyModifiers,
+    key: TerminalKey<'_>,
+    kind: KeyEventKind,
+) -> KeyModifiers {
+    let active = kind != KeyEventKind::Release;
+    if let TerminalKey::Modifier(modifier) = key {
+        match modifier {
+            so1_terminal::keyboard::ModifierKey::LeftShift
+            | so1_terminal::keyboard::ModifierKey::RightShift => modifiers.shift = active,
+            so1_terminal::keyboard::ModifierKey::LeftControl
+            | so1_terminal::keyboard::ModifierKey::RightControl => modifiers.control = active,
+            so1_terminal::keyboard::ModifierKey::LeftAlt
+            | so1_terminal::keyboard::ModifierKey::RightAlt => modifiers.alt = active,
+            so1_terminal::keyboard::ModifierKey::LeftSuper
+            | so1_terminal::keyboard::ModifierKey::RightSuper => modifiers.super_key = active,
+            so1_terminal::keyboard::ModifierKey::CapsLock => {}
+            so1_terminal::keyboard::ModifierKey::NumLock => {}
+        }
+    }
+    modifiers
+}
+
+fn key_from_winit<'a>(
+    key: &'a Key,
+    text: Option<&'a str>,
+    physical: winit::keyboard::PhysicalKey,
+    kitty_active: bool,
+) -> Option<KeyInput<'a>> {
+    use so1_terminal::keyboard::ModifierKey;
+    use winit::keyboard::KeyCode;
+
+    let physical_numpad = match physical {
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad0) => Some(0),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad1) => Some(1),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad2) => Some(2),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad3) => Some(3),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad4) => Some(4),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad5) => Some(5),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad6) => Some(6),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad7) => Some(7),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad8) => Some(8),
+        winit::keyboard::PhysicalKey::Code(KeyCode::Numpad9) => Some(9),
+        _ => None,
+    };
+    if kitty_active && !matches!(key, Key::Character(_)) {
+        if let Some(number) = physical_numpad {
+            return Some(KeyInput::new(TerminalKey::Numpad(number)));
+        }
+        if physical == winit::keyboard::PhysicalKey::Code(KeyCode::NumpadEnter) {
+            return Some(KeyInput::new(TerminalKey::NumpadEnter));
+        }
+        let keypad = match physical {
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadDecimal) => {
+                Some(so1_terminal::keyboard::KeypadKey::Decimal)
+            }
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadDivide) => {
+                Some(so1_terminal::keyboard::KeypadKey::Divide)
+            }
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadMultiply) => {
+                Some(so1_terminal::keyboard::KeypadKey::Multiply)
+            }
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadSubtract) => {
+                Some(so1_terminal::keyboard::KeypadKey::Subtract)
+            }
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadAdd) => {
+                Some(so1_terminal::keyboard::KeypadKey::Add)
+            }
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadEqual) => {
+                Some(so1_terminal::keyboard::KeypadKey::Equal)
+            }
+            winit::keyboard::PhysicalKey::Code(KeyCode::NumpadComma) => {
+                Some(so1_terminal::keyboard::KeypadKey::Separator)
+            }
+            _ => None,
+        };
+        if let Some(keypad) = keypad {
+            return Some(KeyInput::new(TerminalKey::NumpadKey(keypad)));
+        }
+    }
+
+    let terminal_key = match key {
+        Key::Named(NamedKey::Enter) => TerminalKey::Enter,
+        Key::Named(NamedKey::Tab) => TerminalKey::Tab,
+        Key::Named(NamedKey::Backspace) => TerminalKey::Backspace,
+        Key::Named(NamedKey::Escape) => TerminalKey::Escape,
+        Key::Named(NamedKey::ArrowUp) => TerminalKey::Up,
+        Key::Named(NamedKey::ArrowDown) => TerminalKey::Down,
+        Key::Named(NamedKey::ArrowLeft) => TerminalKey::Left,
+        Key::Named(NamedKey::ArrowRight) => TerminalKey::Right,
+        Key::Named(NamedKey::Home) => TerminalKey::Home,
+        Key::Named(NamedKey::End) => TerminalKey::End,
+        Key::Named(NamedKey::PageUp) => TerminalKey::PageUp,
+        Key::Named(NamedKey::PageDown) => TerminalKey::PageDown,
+        Key::Named(NamedKey::Insert) => TerminalKey::Insert,
+        Key::Named(NamedKey::Delete) => TerminalKey::Delete,
+        Key::Named(NamedKey::F1) => TerminalKey::Function(1),
+        Key::Named(NamedKey::F2) => TerminalKey::Function(2),
+        Key::Named(NamedKey::F3) => TerminalKey::Function(3),
+        Key::Named(NamedKey::F4) => TerminalKey::Function(4),
+        Key::Named(NamedKey::F5) => TerminalKey::Function(5),
+        Key::Named(NamedKey::F6) => TerminalKey::Function(6),
+        Key::Named(NamedKey::F7) => TerminalKey::Function(7),
+        Key::Named(NamedKey::F8) => TerminalKey::Function(8),
+        Key::Named(NamedKey::F9) => TerminalKey::Function(9),
+        Key::Named(NamedKey::F10) => TerminalKey::Function(10),
+        Key::Named(NamedKey::F11) => TerminalKey::Function(11),
+        Key::Named(NamedKey::F12) => TerminalKey::Function(12),
+        Key::Named(NamedKey::Shift) => TerminalKey::Modifier(match physical {
+            winit::keyboard::PhysicalKey::Code(KeyCode::ShiftRight) => ModifierKey::RightShift,
+            _ => ModifierKey::LeftShift,
+        }),
+        Key::Named(NamedKey::Control) => TerminalKey::Modifier(match physical {
+            winit::keyboard::PhysicalKey::Code(KeyCode::ControlRight) => ModifierKey::RightControl,
+            _ => ModifierKey::LeftControl,
+        }),
+        Key::Named(NamedKey::Alt) => TerminalKey::Modifier(match physical {
+            winit::keyboard::PhysicalKey::Code(KeyCode::AltRight) => ModifierKey::RightAlt,
+            _ => ModifierKey::LeftAlt,
+        }),
+        Key::Named(NamedKey::Super) => TerminalKey::Modifier(match physical {
+            winit::keyboard::PhysicalKey::Code(KeyCode::SuperRight) => ModifierKey::RightSuper,
+            _ => ModifierKey::LeftSuper,
+        }),
+        Key::Named(NamedKey::CapsLock) => TerminalKey::Modifier(ModifierKey::CapsLock),
+        Key::Named(NamedKey::NumLock) => TerminalKey::Modifier(ModifierKey::NumLock),
+        Key::Character(character) => TerminalKey::Text(
+            text.filter(|value| !value.is_empty())
+                .unwrap_or(character.as_str()),
+        ),
+        _ => return None,
+    };
+    let mut input = KeyInput::new(terminal_key);
+    input.associated_text = text;
+    if matches!(terminal_key, TerminalKey::Text(_)) {
+        input.shifted_key_code = text.and_then(|value| value.chars().next()).map(u32::from);
+        let base = physical_ascii_key(physical);
+        input.base_layout_key_code = base;
+        input.key_code = match terminal_key {
+            TerminalKey::Text(value) => value.chars().next().map(|character| {
+                if character.is_alphabetic() {
+                    character.to_lowercase().next().unwrap_or(character) as u32
+                } else {
+                    base.unwrap_or(character as u32)
+                }
+            }),
+            _ => None,
+        };
+    }
+    Some(input)
+}
+
+fn physical_ascii_key(physical: winit::keyboard::PhysicalKey) -> Option<u32> {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    let value = match physical {
+        PhysicalKey::Code(KeyCode::KeyA) => 'a',
+        PhysicalKey::Code(KeyCode::KeyB) => 'b',
+        PhysicalKey::Code(KeyCode::KeyC) => 'c',
+        PhysicalKey::Code(KeyCode::KeyD) => 'd',
+        PhysicalKey::Code(KeyCode::KeyE) => 'e',
+        PhysicalKey::Code(KeyCode::KeyF) => 'f',
+        PhysicalKey::Code(KeyCode::KeyG) => 'g',
+        PhysicalKey::Code(KeyCode::KeyH) => 'h',
+        PhysicalKey::Code(KeyCode::KeyI) => 'i',
+        PhysicalKey::Code(KeyCode::KeyJ) => 'j',
+        PhysicalKey::Code(KeyCode::KeyK) => 'k',
+        PhysicalKey::Code(KeyCode::KeyL) => 'l',
+        PhysicalKey::Code(KeyCode::KeyM) => 'm',
+        PhysicalKey::Code(KeyCode::KeyN) => 'n',
+        PhysicalKey::Code(KeyCode::KeyO) => 'o',
+        PhysicalKey::Code(KeyCode::KeyP) => 'p',
+        PhysicalKey::Code(KeyCode::KeyQ) => 'q',
+        PhysicalKey::Code(KeyCode::KeyR) => 'r',
+        PhysicalKey::Code(KeyCode::KeyS) => 's',
+        PhysicalKey::Code(KeyCode::KeyT) => 't',
+        PhysicalKey::Code(KeyCode::KeyU) => 'u',
+        PhysicalKey::Code(KeyCode::KeyV) => 'v',
+        PhysicalKey::Code(KeyCode::KeyW) => 'w',
+        PhysicalKey::Code(KeyCode::KeyX) => 'x',
+        PhysicalKey::Code(KeyCode::KeyY) => 'y',
+        PhysicalKey::Code(KeyCode::KeyZ) => 'z',
+        PhysicalKey::Code(KeyCode::Digit0) => '0',
+        PhysicalKey::Code(KeyCode::Digit1) => '1',
+        PhysicalKey::Code(KeyCode::Digit2) => '2',
+        PhysicalKey::Code(KeyCode::Digit3) => '3',
+        PhysicalKey::Code(KeyCode::Digit4) => '4',
+        PhysicalKey::Code(KeyCode::Digit5) => '5',
+        PhysicalKey::Code(KeyCode::Digit6) => '6',
+        PhysicalKey::Code(KeyCode::Digit7) => '7',
+        PhysicalKey::Code(KeyCode::Digit8) => '8',
+        PhysicalKey::Code(KeyCode::Digit9) => '9',
+        PhysicalKey::Code(KeyCode::Equal) => '=',
+        PhysicalKey::Code(KeyCode::Minus) => '-',
+        PhysicalKey::Code(KeyCode::BracketLeft) => '[',
+        PhysicalKey::Code(KeyCode::BracketRight) => ']',
+        PhysicalKey::Code(KeyCode::Backslash) => '\\',
+        PhysicalKey::Code(KeyCode::Semicolon) => ';',
+        PhysicalKey::Code(KeyCode::Quote) => '\'',
+        PhysicalKey::Code(KeyCode::Comma) => ',',
+        PhysicalKey::Code(KeyCode::Period) => '.',
+        PhysicalKey::Code(KeyCode::Slash) => '/',
+        PhysicalKey::Code(KeyCode::Backquote) => '`',
+        _ => return None,
+    };
+    Some(value as u32)
+}
+
 fn block_shortcut(key: &Key, mods: KeyModifiers, macos: bool) -> Option<BlockShortcut> {
     let control_shift = mods.control && mods.shift;
     match key {
@@ -470,6 +694,8 @@ impl TerminalWindow {
             selection_origin: None,
             failed: false,
             modifiers: winit::keyboard::ModifiersState::empty(),
+            caps_lock: false,
+            num_lock: false,
             ime_gate: ImePreeditGate::default(),
             surface_retry: SurfaceRetryBackoff::default(),
             proxy,
@@ -1710,20 +1936,53 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if let Some(pane) = self.focused_pane_mut() {
-                    let bytes = encode_ime_commit(&text, pane.model.bracketed_paste_enabled());
+                    let bytes = encode_ime_commit_with_flags(&text, pane.model.keyboard_flags());
                     let _ = pane.pty.write(&bytes);
                     pane.model.scroll_to_bottom();
                 }
                 self.request_redraw();
                 self.ime_gate.commit();
             }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                let flags = self
+                    .focused_pane()
+                    .map_or(KeyboardFlags::empty(), |pane| pane.model.keyboard_flags());
+                if !flags.contains(KeyboardFlags::REPORT_EVENT_TYPES) {
+                    return;
+                }
+                let key = key_from_winit(
+                    &event.logical_key,
+                    event.text.as_deref(),
+                    event.physical_key,
+                    !flags.is_empty(),
+                );
+                let modifiers = key_modifiers(self.modifiers, self.caps_lock, self.num_lock);
+                if let Some(mut input) = key
+                    && let Some(pane) = self.focused_pane_mut()
+                {
+                    input.associated_text = event.text.as_deref();
+                    let modifiers =
+                        modifier_event_state(modifiers, input.key, KeyEventKind::Release);
+                    if let Some(bytes) = encode_key_with_flags(
+                        input,
+                        modifiers,
+                        pane.model.application_cursor_keys(),
+                        flags,
+                        KeyEventKind::Release,
+                    ) {
+                        let _ = pane.pty.write(&bytes);
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let mods = KeyModifiers {
-                    shift: self.modifiers.contains(ModifiersState::SHIFT),
-                    alt: self.modifiers.contains(ModifiersState::ALT),
-                    control: self.modifiers.contains(ModifiersState::CONTROL),
-                    super_key: self.modifiers.contains(ModifiersState::SUPER),
-                };
+                if !event.repeat {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::CapsLock) => self.caps_lock = !self.caps_lock,
+                        Key::Named(NamedKey::NumLock) => self.num_lock = !self.num_lock,
+                        _ => {}
+                    }
+                }
+                let mods = key_modifiers(self.modifiers, self.caps_lock, self.num_lock);
                 let tab_count = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
                 let active_tab_index = self
                     .tabs
@@ -1773,39 +2032,21 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     }
                     None => {}
                 }
-                let terminal_key = match &event.logical_key {
-                    Key::Named(NamedKey::Enter) => Some(TerminalKey::Enter),
-                    Key::Named(NamedKey::Tab) => Some(TerminalKey::Tab),
-                    Key::Named(NamedKey::Backspace) => Some(TerminalKey::Backspace),
-                    Key::Named(NamedKey::Escape) => Some(TerminalKey::Escape),
-                    Key::Named(NamedKey::ArrowUp) => Some(TerminalKey::Up),
-                    Key::Named(NamedKey::ArrowDown) => Some(TerminalKey::Down),
-                    Key::Named(NamedKey::ArrowLeft) => Some(TerminalKey::Left),
-                    Key::Named(NamedKey::ArrowRight) => Some(TerminalKey::Right),
-                    Key::Named(NamedKey::Home) => Some(TerminalKey::Home),
-                    Key::Named(NamedKey::End) => Some(TerminalKey::End),
-                    Key::Named(NamedKey::PageUp) => Some(TerminalKey::PageUp),
-                    Key::Named(NamedKey::PageDown) => Some(TerminalKey::PageDown),
-                    Key::Named(NamedKey::Insert) => Some(TerminalKey::Insert),
-                    Key::Named(NamedKey::Delete) => Some(TerminalKey::Delete),
-                    Key::Named(NamedKey::F1) => Some(TerminalKey::Function(1)),
-                    Key::Named(NamedKey::F2) => Some(TerminalKey::Function(2)),
-                    Key::Named(NamedKey::F3) => Some(TerminalKey::Function(3)),
-                    Key::Named(NamedKey::F4) => Some(TerminalKey::Function(4)),
-                    Key::Named(NamedKey::F5) => Some(TerminalKey::Function(5)),
-                    Key::Named(NamedKey::F6) => Some(TerminalKey::Function(6)),
-                    Key::Named(NamedKey::F7) => Some(TerminalKey::Function(7)),
-                    Key::Named(NamedKey::F8) => Some(TerminalKey::Function(8)),
-                    Key::Named(NamedKey::F9) => Some(TerminalKey::Function(9)),
-                    Key::Named(NamedKey::F10) => Some(TerminalKey::Function(10)),
-                    Key::Named(NamedKey::F11) => Some(TerminalKey::Function(11)),
-                    Key::Named(NamedKey::F12) => Some(TerminalKey::Function(12)),
-                    _ => event
-                        .text
-                        .as_ref()
-                        .filter(|text| !text.is_empty())
-                        .map(|text| TerminalKey::Text(text.as_str())),
-                };
+                let kitty_flags = self
+                    .focused_pane()
+                    .map_or(KeyboardFlags::empty(), |pane| pane.model.keyboard_flags());
+                let kitty_active = kitty_flags.intersects(
+                    KeyboardFlags::DISAMBIGUATE
+                        | KeyboardFlags::REPORT_EVENT_TYPES
+                        | KeyboardFlags::REPORT_ALL,
+                );
+                let terminal_input = key_from_winit(
+                    &event.logical_key,
+                    event.text.as_deref(),
+                    event.physical_key,
+                    kitty_active,
+                );
+                let terminal_key = terminal_input.map(|input| input.key);
                 if let Some(TerminalKey::Text(text)) = terminal_key {
                     let clipboard_shortcut = (mods.control && mods.shift)
                         || (cfg!(target_os = "macos") && mods.super_key);
@@ -1824,7 +2065,21 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     && !suppress_key
                 {
                     let app_cursor = pane.model.application_cursor_keys();
-                    if let Some(bytes) = encode_key(key, mods, app_cursor) {
+                    let mut input = terminal_input.unwrap_or_else(|| KeyInput::new(key));
+                    input.associated_text = event.text.as_deref();
+                    let kind = if event.repeat {
+                        KeyEventKind::Repeat
+                    } else {
+                        KeyEventKind::Press
+                    };
+                    let protocol_modifiers = modifier_event_state(mods, key, kind);
+                    if let Some(bytes) = encode_key_with_flags(
+                        input,
+                        protocol_modifiers,
+                        app_cursor,
+                        pane.model.keyboard_flags(),
+                        kind,
+                    ) {
                         let _ = pane.pty.write(&bytes);
                     }
                     pane.model.scroll_to_bottom();
@@ -2065,12 +2320,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockShortcut, GlyphKey, PaneAction, TabAction, apply_title_event, block_marker_bounds,
-        block_shortcut, close_pane_lifecycle, create_tab_with, cwd_basename_title,
-        glyph_key_requires_reshape, invalidate_glyph_cache, overlay_vertex_range, pane_action,
-        pane_cell_at, pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title,
-        route_block_shortcut, selection_target, tab_action_changes_geometry, tab_bar_height,
-        tab_content_rect, tab_index_at, tab_shortcut, tab_style,
+        BlockShortcut, GlyphKey, KeyEventKind, PaneAction, TabAction, TerminalKey,
+        apply_title_event, block_marker_bounds, block_shortcut, close_pane_lifecycle,
+        create_tab_with, cwd_basename_title, glyph_key_requires_reshape, invalidate_glyph_cache,
+        key_from_winit, modifier_event_state, overlay_vertex_range, pane_action, pane_cell_at,
+        pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title, route_block_shortcut,
+        selection_target, tab_action_changes_geometry, tab_bar_height, tab_content_rect,
+        tab_index_at, tab_shortcut, tab_style,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
@@ -2155,6 +2411,72 @@ mod tests {
             ),
             Some(TabAction::Select(1))
         );
+    }
+
+    #[test]
+    fn winit_key_input_keeps_unshifted_and_physical_alternate_codes() {
+        let logical = Key::Character("A".into());
+        let input = key_from_winit(
+            &logical,
+            Some("A"),
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA),
+            true,
+        )
+        .unwrap();
+        assert_eq!(input.key_code, Some(u32::from('a')));
+        assert_eq!(input.shifted_key_code, Some(u32::from('A')));
+        assert_eq!(input.base_layout_key_code, Some(u32::from('a')));
+
+        let logical = Key::Character("Ф".into());
+        let input = key_from_winit(
+            &logical,
+            Some("Ф"),
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA),
+            true,
+        )
+        .unwrap();
+        assert_eq!(input.key_code, Some(u32::from('ф')));
+        assert_eq!(input.base_layout_key_code, Some(u32::from('a')));
+    }
+
+    #[test]
+    fn keypad_special_codes_are_only_used_for_non_text_kitty_events() {
+        let logical = Key::Character("4".into());
+        let legacy = key_from_winit(
+            &logical,
+            Some("4"),
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Numpad4),
+            false,
+        )
+        .unwrap();
+        assert_eq!(legacy.key, TerminalKey::Text("4"));
+
+        let navigation = Key::Named(NamedKey::Home);
+        let kitty = key_from_winit(
+            &navigation,
+            None,
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Numpad7),
+            true,
+        )
+        .unwrap();
+        assert_eq!(kitty.key, TerminalKey::Numpad(7));
+    }
+
+    #[test]
+    fn modifier_key_event_state_includes_press_and_release_effect() {
+        let modifiers = Modifiers::default();
+        let pressed = modifier_event_state(
+            modifiers,
+            TerminalKey::Modifier(so1_terminal::keyboard::ModifierKey::LeftControl),
+            KeyEventKind::Press,
+        );
+        assert!(pressed.control);
+        let released = modifier_event_state(
+            pressed,
+            TerminalKey::Modifier(so1_terminal::keyboard::ModifierKey::LeftControl),
+            KeyEventKind::Release,
+        );
+        assert!(!released.control);
     }
 
     #[test]

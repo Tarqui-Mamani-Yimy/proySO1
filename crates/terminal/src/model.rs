@@ -90,6 +90,7 @@ pub struct Model {
 /// only operations which can push primary rows out of its bounded history.
 struct EvictionTracker<'a> {
     term: &'a mut Term<Listener>,
+    listener: &'a Listener,
     blocks: &'a mut crate::blocks::BlockList,
     evicted_rows: &'a mut u64,
     stable_row_base: &'a mut u64,
@@ -142,6 +143,12 @@ impl EvictionTracker<'_> {
 }
 
 impl vte::ansi::Handler for EvictionTracker<'_> {
+    fn report_keyboard_mode(&mut self) {
+        let flags = keyboard_flags_for_mode(self.term.mode()).bits();
+        self.listener
+            .send_event(TermEvent::PtyWrite(format!("\x1b[?{flags}u")));
+    }
+
     fn input(&mut self, character: char) {
         let cursor = &self.term.grid().cursor;
         let pending_wrap = cursor.input_needs_wrap;
@@ -311,7 +318,6 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
         text_area_size_chars();
         set_hyperlink(arg0: Option<vte::ansi::Hyperlink>);
         set_mouse_cursor_icon(arg0: winit::window::CursorIcon);
-        report_keyboard_mode();
         push_keyboard_mode(_mode: vte::ansi::KeyboardModes);
         pop_keyboard_modes(_to_pop: u16);
         set_keyboard_mode(_mode: vte::ansi::KeyboardModes, _behavior: vte::ansi::KeyboardModesApplyBehavior);
@@ -347,6 +353,7 @@ impl Model {
         let listener = Listener::default();
         let config = Config {
             scrolling_history: scrollback_limit,
+            kitty_keyboard: true,
             ..Config::default()
         };
         let term = Term::new(
@@ -449,8 +456,10 @@ impl Model {
             .as_ref()
             .and_then(|selection| selection.to_range(&self.term));
         let evicted_before = self.evicted_rows;
+        let listener = self.listener.clone();
         let mut tracker = EvictionTracker {
             term: &mut self.term,
+            listener: &listener,
             blocks: &mut self.blocks,
             evicted_rows: &mut self.evicted_rows,
             stable_row_base: &mut self.stable_row_base,
@@ -574,6 +583,11 @@ impl Model {
         self.term
             .mode()
             .contains(alacritty_terminal::term::TermMode::APP_CURSOR)
+    }
+
+    /// Current kitty keyboard enhancement flags, including the active screen's stack.
+    pub fn keyboard_flags(&self) -> crate::keyboard::KeyboardFlags {
+        keyboard_flags_for_mode(self.term.mode())
     }
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.term
@@ -964,6 +978,40 @@ fn color(value: vte::ansi::Color) -> CellColor {
     }
 }
 
+fn keyboard_flags_for_mode(
+    mode: &alacritty_terminal::term::TermMode,
+) -> crate::keyboard::KeyboardFlags {
+    use alacritty_terminal::term::TermMode;
+    let mut flags = crate::keyboard::KeyboardFlags::empty();
+    for (term_flag, keyboard_flag) in [
+        (
+            TermMode::DISAMBIGUATE_ESC_CODES,
+            crate::keyboard::KeyboardFlags::DISAMBIGUATE,
+        ),
+        (
+            TermMode::REPORT_EVENT_TYPES,
+            crate::keyboard::KeyboardFlags::REPORT_EVENT_TYPES,
+        ),
+        (
+            TermMode::REPORT_ALTERNATE_KEYS,
+            crate::keyboard::KeyboardFlags::REPORT_ALTERNATE,
+        ),
+        (
+            TermMode::REPORT_ALL_KEYS_AS_ESC,
+            crate::keyboard::KeyboardFlags::REPORT_ALL,
+        ),
+        (
+            TermMode::REPORT_ASSOCIATED_TEXT,
+            crate::keyboard::KeyboardFlags::REPORT_ASSOCIATED_TEXT,
+        ),
+    ] {
+        if mode.contains(term_flag) {
+            flags = flags | keyboard_flag;
+        }
+    }
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1020,40 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn kitty_keyboard_modes_are_reported_and_stacked_per_screen() {
+        let mut model = Model::new(20, 4);
+        model.feed(b"\x1b[=1;1u");
+        assert_eq!(model.keyboard_flags().bits(), 1);
+        model.feed(b"\x1b[?u");
+        let events = model.take_events();
+        assert!(
+            events.contains(&ModelEvent::PtyWrite(b"\x1b[?1u".to_vec())),
+            "{events:?}"
+        );
+
+        model.feed(b"\x1b[=2;2u");
+        assert_eq!(model.keyboard_flags().bits(), 3);
+        model.feed(b"\x1b[=1;3u");
+        assert_eq!(model.keyboard_flags().bits(), 2);
+        model.feed(b"\x1b[=1;1u\x1b[>1u");
+
+        model.feed(b"\x1b[?1049h\x1b[=8;1u");
+        assert_eq!(model.keyboard_flags().bits(), 8);
+        model.feed(b"\x1b[<1u");
+        assert_eq!(model.keyboard_flags().bits(), 0);
+        model.feed(b"\x1b[>8u");
+        model.feed(b"\x1b[?1049l");
+        assert_eq!(model.keyboard_flags().bits(), 1);
+        model.feed(b"\x1b[>2u");
+        model.feed(b"\x1b[?u");
+        assert!(
+            model
+                .take_events()
+                .contains(&ModelEvent::PtyWrite(b"\x1b[?2u".to_vec()))
+        );
+    }
     fn text(model: &Model) -> String {
         model
             .visible_cells()

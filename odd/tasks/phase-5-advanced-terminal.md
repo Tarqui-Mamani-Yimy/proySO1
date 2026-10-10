@@ -55,7 +55,7 @@ need that control channel).
 
 ## Tasks
 - [x] **T0 — Design spike** (codex-impl, read-only) — decision above.
-- [ ] **T1 — Terminal kitty keyboard mode**: enable Term option, expose flags, CSI u encoding per flags, legacy unchanged; tests for push/pop/set/query, flag combos, alt screen.
+- [x] **T1 — Terminal kitty keyboard mode** — `09668ed` (codex-impl, ~1150 changed lines mostly tables/tests): kitty_keyboard enabled; flags 1/2/4/8/16 encoded as CSI u; press/repeat/release from winit; legacy path unchanged when flags are 0; per-screen flag stacks tested. Mode query answered from the active TermMode in the Handler wrapper (alacritty reported the stack top, not the effective mode after CSI =; orchestrator checked the override does not delegate, so one reply). 140+22 tests 2/2 (orchestrator). Gaps: Hyper/Meta bits unavailable from winit; Caps/NumLock initial state unknown; partial keypad mapping. Original: enable Term option, expose flags, CSI u encoding per flags, legacy unchanged; tests for push/pop/set/query, flag combos, alt screen.
 - [ ] **T2 — so1sh consumes the keyboard protocol**: reedline enhancement, PTY tests for Ctrl-C/D, Escape, modifiers, restore after errors; Windows limitation documented.
 - [ ] **T3 — Incremental APC parser**: pure, bounded, split chunks, abort/resync, malformed/oversized tests.
 - [ ] **T4 — Graphics data ingestion**: direct RGB/RGBA/PNG, ids, chunking, responses/quiet, quotas, off-thread decode, overflow/bomb tests.
@@ -72,4 +72,4 @@ need that control channel).
 _(filled per task)_
 
 ## Progress / Next step
-- Branch created from `main` (`60f2615`). T0 done. Next: T1 on codex-impl.
+- Branch created from `main` (`60f2615`). T0-T1 done. Next: T2 so1sh keyboard consumption.

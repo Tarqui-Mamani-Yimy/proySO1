@@ -101,13 +101,19 @@ impl Observer {
                 },
                 ParseState::DiscardOsc => match byte {
                     b'\x07' => self.reset(),
+                    b'\x18' | b'\x1a' => self.reset(),
                     b'\x1b' => self.state = ParseState::DiscardOscEscape,
                     _ => {}
                 },
                 ParseState::DiscardOscEscape => match byte {
                     b'\\' | b'\x07' => self.reset(),
-                    b'\x1b' => self.state = ParseState::DiscardOscEscape,
-                    _ => self.state = ParseState::DiscardOsc,
+                    b'\x18' | b'\x1a' => self.reset(),
+                    b']' => {
+                        self.payload.clear();
+                        self.state = ParseState::Osc;
+                    }
+                    b'\x1b' => self.state = ParseState::Escape,
+                    _ => self.state = ParseState::Ground,
                 },
             }
         }
@@ -432,16 +438,69 @@ mod tests {
         assert!(observer.payload.is_empty());
         assert_eq!(observer.state, super::ParseState::DiscardOsc);
 
-        // The nested-looking B mark remains part of the oversized payload;
-        // the BEL terminator ends that discarded sequence and parsing resumes.
-        assert!(observer.feed(b"\x1b]133;B\x07").is_empty());
+        // BEL ends the discarded sequence and parsing resumes.
+        assert!(observer.feed(b"discarded\x07").is_empty());
         let valid = sequence(b"133;C", b"\x1b\\");
         assert_eq!(
             observer.feed(&valid),
             vec![expected(
-                oversized.len() + 1 + b"\x1b]133;B\x07".len() + valid.len(),
+                oversized.len() + 1 + b"discarded\x07".len() + valid.len(),
                 Event::SemanticMark(SemanticMark::OutputStart),
             )]
+        );
+    }
+
+    #[test]
+    fn discarded_osc_can_sub_and_non_st_escape_abort_and_resynchronize() {
+        for &cancel in b"\x18\x1a" {
+            let mut observer = Observer::new();
+            let mut oversized = b"\x1b]133;A;".to_vec();
+            oversized.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES));
+            assert!(observer.feed(&oversized).is_empty());
+            assert!(observer.feed(&[cancel]).is_empty());
+            let fresh = sequence(b"133;B", b"\x07");
+            assert_eq!(
+                observer
+                    .feed(&fresh)
+                    .last()
+                    .map(|event| event.event.clone()),
+                Some(Event::SemanticMark(SemanticMark::InputStart))
+            );
+
+            let mut observer = Observer::new();
+            assert!(observer.feed(&oversized).is_empty());
+            assert!(observer.feed(b"\x1b").is_empty());
+            assert!(observer.feed(&[cancel]).is_empty());
+            assert_eq!(
+                observer
+                    .feed(&fresh)
+                    .last()
+                    .map(|event| event.event.clone()),
+                Some(Event::SemanticMark(SemanticMark::InputStart))
+            );
+        }
+
+        let mut observer = Observer::new();
+        let mut oversized = b"\x1b]133;A;".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', MAX_OSC_PAYLOAD_BYTES));
+        assert!(observer.feed(&oversized).is_empty());
+        assert!(observer.feed(b"\x1bX").is_empty());
+        let fresh = sequence(b"133;C", b"\x1b\\");
+        assert_eq!(
+            observer
+                .feed(&fresh)
+                .last()
+                .map(|event| event.event.clone()),
+            Some(Event::SemanticMark(SemanticMark::OutputStart))
+        );
+
+        let mut observer = Observer::new();
+        assert!(observer.feed(&oversized).is_empty());
+        assert!(observer.feed(b"\x1b").is_empty());
+        let input: &[u8] = b"]133;A\x07";
+        assert_eq!(
+            observer.feed(input).last().map(|event| event.event.clone()),
+            Some(Event::SemanticMark(SemanticMark::PromptStart))
         );
     }
 }

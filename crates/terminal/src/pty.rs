@@ -108,7 +108,8 @@ mod tests {
         command.arg("100");
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
-        let error = setup_spawned_child(child, || {
+        let session_id = pty_session_id(child.as_ref());
+        let error = setup_spawned_child(child, session_id, || {
             Err::<(), _>(io::Error::other("injected post-spawn setup failure"))
         })
         .expect_err("injected setup error is returned");
@@ -204,6 +205,110 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_sweeps_background_job_after_shell_was_reaped() {
+        let executable =
+            test_so1sh_executable().expect("so1sh binary is required for teardown regression");
+        let unique = format!("so1term-reaped-{}", std::process::id());
+        let rc_path = std::env::temp_dir().join(format!("{unique}.rc"));
+        let pid_path = std::env::temp_dir().join(format!("{unique}.pid"));
+        std::fs::write(
+            &rc_path,
+            format!(
+                "sh -c 'echo $$ > {}; exec sleep 100' &\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        let command = format!(
+            "SO1SH_RC='{}' exec '{}'",
+            rc_path.display(),
+            executable.display()
+        );
+        let mut pty =
+            Pty::spawn_with_args("/bin/sh", ["-c", command.as_str()], "/", 80, 24).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let child_pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&pid_path)
+                && let Ok(pid) = value.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background job did not publish its pid"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        pty.write(b"exit\n").unwrap();
+        while pty.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "so1sh did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            Path::new(&format!("/proc/{child_pid}")).exists(),
+            "background process exited before teardown"
+        );
+        let command_line = std::fs::read(format!("/proc/{child_pid}/cmdline")).unwrap();
+        let arguments: Vec<_> = command_line.split(|byte| *byte == 0).collect();
+        assert!(
+            arguments.iter().any(|argument| *argument == b"sleep")
+                && arguments.iter().any(|argument| *argument == b"100"),
+            "pid file did not identify the expected sleep process: {command_line:?}"
+        );
+        let started = Instant::now();
+        drop(pty);
+        let _ = std::fs::remove_file(rc_path);
+        let _ = std::fs::remove_file(pid_path);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            !Path::new(&format!("/proc/{child_pid}")).exists(),
+            "reaped shell's background process {child_pid} survived teardown"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn teardown_preserves_unrelated_session_process_group() {
+        let mut unrelated = std::process::Command::new("setsid")
+            .args(["/bin/sleep", "100"])
+            .spawn()
+            .expect("setsid is available on Linux");
+        let pid = unrelated.id();
+        let pty = Pty::spawn_with_args("/bin/sh", ["-c", "sleep 100 & wait"], "/", 80, 24).unwrap();
+        drop(pty);
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "unrelated session process {pid} was killed"
+        );
+        unrelated.kill().unwrap();
+        let _ = unrelated.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_group_signal_rejects_a_group_from_another_session() {
+        let mut unrelated = std::process::Command::new("setsid")
+            .args(["/bin/sleep", "100"])
+            .spawn()
+            .expect("setsid is available on Linux");
+        let unrelated_pid = unrelated.id() as libc::pid_t;
+        let unrelated_session = unsafe { libc::getsid(unrelated_pid) };
+        let own = Pty::spawn_with_args("/bin/sleep", ["100"], "/", 80, 24).unwrap();
+        let own_session = own.session_id.expect("PTY session captured at spawn");
+        assert_ne!(own_session, unrelated_session);
+
+        signal_session_group(own_session, unrelated_pid, libc::SIGKILL);
+        assert!(
+            Path::new(&format!("/proc/{unrelated_pid}")).exists(),
+            "foreign process group was signalled"
+        );
+        unrelated.kill().unwrap();
+        let _ = unrelated.wait();
+        drop(own);
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_dropped_sleep_is_gone() {
         let mut pty = Pty::spawn_with_args(
             "/bin/sh",
@@ -250,15 +355,25 @@ pub(crate) fn test_so1sh_executable() -> Option<PathBuf> {
             let executable = std::env::current_exe().ok()?;
             executable
                 .ancestors()
-                .find(|ancestor| ancestor.join("deps").is_dir())
-                .map(|profile| profile.join("so1sh"))
-                .filter(|path| path.is_file())
+                .filter_map(|ancestor| {
+                    let profile = if ancestor.file_name().is_some_and(|name| name == "build") {
+                        ancestor.parent()?
+                    } else if ancestor.join("deps").is_dir() {
+                        ancestor
+                    } else {
+                        return None;
+                    };
+                    let candidate = profile.join("so1sh");
+                    candidate.is_file().then_some(candidate)
+                })
+                .next()
         })
 }
 
 /// A headless child process attached to a portable pseudo-terminal.
 pub struct Pty {
     child: Box<dyn Child + Send + Sync>,
+    session_id: Option<i32>,
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     output: Receiver<Vec<u8>>,
@@ -302,7 +417,8 @@ impl Pty {
         command.cwd(cwd.as_ref().as_os_str());
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).map_err(other_io)?;
-        let (child, (writer, output, reader)) = setup_spawned_child(child, || {
+        let session_id = pty_session_id(child.as_ref());
+        let (child, (writer, output, reader)) = setup_spawned_child(child, session_id, || {
             let reader = pair.master.try_clone_reader().map_err(other_io)?;
             let writer = pair.master.take_writer().map_err(other_io)?;
             let (sender, output) = mpsc::channel();
@@ -313,6 +429,7 @@ impl Pty {
         })?;
         Ok(Self {
             child,
+            session_id,
             master: Some(pair.master),
             writer: Some(writer),
             output,
@@ -413,7 +530,8 @@ impl Pty {
         command.cwd(cwd.as_ref().as_os_str());
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).map_err(other_io)?;
-        let (child, (writer, output, reader)) = setup_spawned_child(child, || {
+        let session_id = pty_session_id(child.as_ref());
+        let (child, (writer, output, reader)) = setup_spawned_child(child, session_id, || {
             let reader = pair.master.try_clone_reader().map_err(other_io)?;
             let writer = pair.master.take_writer().map_err(other_io)?;
             let (sender, output) = mpsc::channel();
@@ -424,6 +542,7 @@ impl Pty {
         })?;
         Ok(Self {
             child,
+            session_id,
             master: Some(pair.master),
             writer: Some(writer),
             output,
@@ -489,7 +608,7 @@ impl Drop for Pty {
             .as_ref()
             .and_then(|master| master.process_group_leader())
             .map(|pgid| pgid as u32);
-        terminate_child_groups(self.child.as_mut(), foreground_group);
+        terminate_child_session(self.child.as_mut(), self.session_id, foreground_group);
         self.writer.take();
         self.master.take();
         if let Some(reader) = self.reader.take() {
@@ -499,6 +618,11 @@ impl Drop for Pty {
             }
             if reader.is_finished() {
                 let _ = reader.join();
+            } else {
+                // A reader blocked in the PTY driver must not hold UI shutdown hostage.
+                eprintln!(
+                    "PTY output reader did not stop within 100ms; detaching it during teardown"
+                );
             }
         }
     }
@@ -506,82 +630,121 @@ impl Drop for Pty {
 
 fn setup_spawned_child<T>(
     child: Box<dyn Child + Send + Sync>,
+    session_id: Option<i32>,
     setup: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<(Box<dyn Child + Send + Sync>, T)> {
-    let mut guard = SpawnedChild(Some(child));
+    let mut guard = SpawnedChild {
+        child: Some(child),
+        session_id,
+    };
     let resources = setup()?;
     Ok((
-        guard.0.take().expect("spawn guard contains child"),
+        guard.child.take().expect("spawn guard contains child"),
         resources,
     ))
 }
 
-struct SpawnedChild(Option<Box<dyn Child + Send + Sync>>);
+struct SpawnedChild {
+    child: Option<Box<dyn Child + Send + Sync>>,
+    session_id: Option<i32>,
+}
 
 impl Drop for SpawnedChild {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            terminate_child(child.as_mut());
+        if let Some(child) = self.child.as_mut() {
+            terminate_child_session(child.as_mut(), self.session_id, None);
         }
     }
 }
 
-fn terminate_child(child: &mut dyn Child) {
-    terminate_child_groups(child, std::iter::empty());
-}
-
-fn terminate_child_groups(child: &mut dyn Child, extra_groups: impl IntoIterator<Item = u32>) {
-    let exited = child.try_wait().ok().flatten().is_some();
-    #[cfg(unix)]
-    if let Some(pid) = child.process_id() {
-        let mut groups = vec![pid];
-        groups.extend(extra_groups);
-        #[cfg(target_os = "linux")]
-        let session = unsafe { libc::getsid(pid as libc::pid_t) };
-        #[cfg(target_os = "linux")]
-        if session > 0 {
-            groups.extend(
-                session_process_groups(session)
-                    .into_iter()
-                    .map(|group| group as u32),
-            );
+fn terminate_child_session(
+    child: &mut dyn Child,
+    session_id: Option<i32>,
+    extra_group: Option<u32>,
+) {
+    #[cfg(target_os = "linux")]
+    if let Some(session) = session_id {
+        let mut groups = session_process_groups(session);
+        if let Some(group) = extra_group.map(|group| group as libc::pid_t) {
+            groups.push(group);
         }
         groups.sort_unstable();
         groups.dedup();
         for group in &groups {
-            unsafe {
-                libc::kill(-(*group as libc::pid_t), libc::SIGHUP);
-            }
+            signal_session_group(session, *group, libc::SIGHUP);
         }
+
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
         while std::time::Instant::now() < deadline {
-            let _ = child.try_wait();
+            if session_process_groups(session).is_empty() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        #[cfg(target_os = "linux")]
-        if session > 0 {
-            groups.extend(
-                session_process_groups(session)
-                    .into_iter()
-                    .map(|group| group as u32),
-            );
-            groups.sort_unstable();
-            groups.dedup();
-        }
+        groups.extend(session_process_groups(session));
+        groups.sort_unstable();
+        groups.dedup();
         for group in groups {
-            unsafe {
-                libc::kill(-(group as libc::pid_t), libc::SIGKILL);
+            signal_session_group(session, group, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (session_id, extra_group);
+
+    match child.try_wait() {
+        Ok(Some(_)) | Err(_) => {
+            // A reaped child may have had its PID reused; an unknown wait state
+            // is not authorization to signal that PID either.
+        }
+        Ok(None) => {
+            #[cfg(unix)]
+            {
+                let pid = child.process_id().map(|pid| pid as libc::pid_t);
+                let same_session = pid
+                    .zip(session_id)
+                    .is_some_and(|(pid, session)| unsafe { libc::getsid(pid) == session });
+                if same_session {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+                let _ = child.wait();
             }
         }
     }
-    if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+}
+
+fn pty_session_id(child: &dyn Child) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        let pid = child.process_id()? as libc::pid_t;
+        let session = unsafe { libc::getsid(pid) };
+        (session > 0).then_some(session)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        None
     }
 }
 
 #[cfg(target_os = "linux")]
-fn session_process_groups(session: libc::pid_t) -> Vec<libc::pid_t> {
+fn signal_session_group(session: libc::pid_t, group: libc::pid_t, signal: libc::c_int) {
+    let valid_member = session_process_members(session)
+        .into_iter()
+        .any(|(pid, pgid)| pgid == group && unsafe { libc::getsid(pid) } == session);
+    if valid_member {
+        unsafe {
+            libc::kill(-group, signal);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn session_process_members(session: libc::pid_t) -> Vec<(libc::pid_t, libc::pid_t)> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -598,10 +761,21 @@ fn session_process_groups(session: libc::pid_t) -> Vec<libc::pid_t> {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let after_command = stat.rsplit_once(") ")?.1;
             let fields: Vec<_> = after_command.split_whitespace().collect();
+            if matches!(fields.first().copied(), Some("Z" | "X")) {
+                return None;
+            }
             let process_group = fields.get(2)?.parse::<libc::pid_t>().ok()?;
             let process_session = fields.get(3)?.parse::<libc::pid_t>().ok()?;
-            (process_session == session).then_some(process_group)
+            (process_session == session).then_some((pid, process_group))
         })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn session_process_groups(session: libc::pid_t) -> Vec<libc::pid_t> {
+    session_process_members(session)
+        .into_iter()
+        .map(|(_, group)| group)
         .collect()
 }
 

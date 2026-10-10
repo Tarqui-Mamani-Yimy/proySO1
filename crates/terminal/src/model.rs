@@ -260,12 +260,9 @@ mod tests {
     #[test]
     fn renders_prompt_bytes_from_built_so1sh_pty() {
         let executable = crate::pty::test_so1sh_executable();
-        let Some(executable) = executable else {
-            eprintln!(
-                "skipping real-so1sh PTY prompt test: Cargo did not provide or build the so1sh binary"
-            );
-            return;
-        };
+        let executable = executable.expect(
+            "so1sh binary required for real PTY prompt test; run `cargo build -p so1sh` first",
+        );
         let mut pty = crate::pty::Pty::spawn(&executable, "/", 80, 24).expect("spawn built so1sh");
         let mut model = Model::new(80, 24);
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -48,6 +48,7 @@ crates/shell/
 crates/terminal/
   src/main.rs     so1term window/event loop, PTY wiring, and GPU renderer
   src/lib.rs      Public module declarations, shell selection, and surface helpers
+  src/layout.rs   Pure pane split tree, pixel/cell geometry, focus, and tab state
   src/blocks.rs   OSC 133 command-block state and grid anchors
   src/block_navigation.rs Pure block navigation targets and retained-grid text extraction
   src/keyboard.rs Xterm key encoding, paste helpers, and IME preedit gate
@@ -301,6 +302,18 @@ shortcuts pass through to the application and block decorations are hidden.
 Alacritty/vte 0.26 recognizes DECSET 1049 but not the common 47/1047 aliases;
 so1term normalizes those aliases to 1049 screen switching so TUI output remains
 on the alternate grid.
+
+Pane layout uses `Horizontal` for left/right splits and `Vertical` for top/bottom
+splits. Ratios are the first child's share. Visible pane dimensions are floored
+to whole cells; divider pixels belong to neither pane and are not hit-tested.
+Splits are refused unless both children can meet the configured minimum. On a
+shrink, the focused branch is kept visible if it meets minimum size, otherwise
+the first fitting branch is shown; panes that cannot fit are marked hidden, and
+if the whole window is below minimum all panes are hidden. Arrow focus chooses
+the smallest edge gap, then greatest perpendicular overlap, nearest
+perpendicular center, top/left position, and PaneId. Pane IDs increase within a
+tree. Tab navigation wraps; closing the active tab selects the tab now occupying
+its index, or the previous final tab when the removed tab was last.
 
 ### Embedder Builtins
 

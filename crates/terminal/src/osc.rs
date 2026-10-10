@@ -81,6 +81,7 @@ impl Observer {
                 },
                 ParseState::Osc => match byte {
                     b'\x07' => self.finish_osc(&mut events),
+                    b'\x18' | b'\x1a' => self.reset(),
                     b'\x1b' => self.state = ParseState::OscEscape,
                     _ => {
                         self.append_payload(byte);
@@ -88,26 +89,15 @@ impl Observer {
                 },
                 ParseState::OscEscape => match byte {
                     b'\\' => self.finish_osc(&mut events),
-                    b'\x07' => {
-                        if self.append_payload(b'\x1b') {
-                            self.finish_osc(&mut events);
-                        } else {
-                            self.reset();
-                        }
+                    b'\x18' | b'\x1a' => self.reset(),
+                    // A non-ST ESC aborts this OSC, but remains the introducer
+                    // for whichever escape sequence follows it.
+                    b']' => {
+                        self.payload.clear();
+                        self.state = ParseState::Osc;
                     }
-                    b'\x1b' => {
-                        if self.append_payload(b'\x1b') {
-                            self.state = ParseState::OscEscape;
-                        } else {
-                            // The current ESC may begin the discard terminator.
-                            self.state = ParseState::DiscardOscEscape;
-                        }
-                    }
-                    _ => {
-                        if self.append_payload(b'\x1b') && self.append_payload(byte) {
-                            self.state = ParseState::Osc;
-                        }
-                    }
+                    b'\x1b' => self.state = ParseState::Escape,
+                    _ => self.state = ParseState::Ground,
                 },
                 ParseState::DiscardOsc => match byte {
                     b'\x07' => self.reset(),
@@ -405,6 +395,25 @@ mod tests {
             observer.feed(&input),
             vec![expected(
                 input.len(),
+                Event::SemanticMark(SemanticMark::PromptStart),
+            )]
+        );
+    }
+
+    #[test]
+    fn cancelled_or_interrupted_osc_is_discarded_and_escape_resynchronizes() {
+        let mut observer = Observer::new();
+        let interrupted = b"\x1b]133;A\x1bX";
+        let can = b"\x1b]133;B\x18";
+        let sub = b"\x1b]133;C\x1a";
+        assert!(observer.feed(interrupted).is_empty());
+        assert!(observer.feed(can).is_empty());
+        assert!(observer.feed(sub).is_empty());
+        let bytes = b"\x1b]133;D\x1b]133;A\x1b\\";
+        assert_eq!(
+            observer.feed(bytes),
+            vec![expected(
+                interrupted.len() + can.len() + sub.len() + bytes.len(),
                 Event::SemanticMark(SemanticMark::PromptStart),
             )]
         );

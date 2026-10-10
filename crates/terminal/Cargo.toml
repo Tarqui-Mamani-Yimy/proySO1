@@ -15,5 +15,6 @@ glyphon = "0.12"
 cosmic-text = "0.19"
 bytemuck = { version = "1", features = ["derive"] }
 portable-pty = "0.9"
+libc = "0.2"
 alacritty_terminal = "0.26"
 vte = "0.15"

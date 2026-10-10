@@ -2315,6 +2315,7 @@ dependencies = [
  "bytemuck",
  "cosmic-text",
  "glyphon",
+ "libc",
  "pollster",
  "portable-pty",
  "vte 0.15.0",

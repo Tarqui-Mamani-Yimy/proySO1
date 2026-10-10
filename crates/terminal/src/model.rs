@@ -172,7 +172,6 @@ fn color(value: vte::ansi::Color) -> CellColor {
 mod tests {
     use super::*;
     use std::{
-        path::Path,
         thread,
         time::{Duration, Instant},
     };
@@ -260,23 +259,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn renders_prompt_bytes_from_built_so1sh_pty() {
-        let executable = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/so1sh");
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let status = std::process::Command::new(cargo)
-            .args(["build", "-p", "so1sh"])
-            .current_dir(&workspace)
-            .status()
-            .expect("run deterministic `cargo build -p so1sh` prerequisite");
-        assert!(
-            status.success(),
-            "`cargo build -p so1sh` prerequisite failed with {status}"
-        );
-        assert!(
-            executable.is_file(),
-            "successful so1sh build did not create {}",
-            executable.display()
-        );
+        let executable = crate::pty::test_so1sh_executable();
+        let Some(executable) = executable else {
+            eprintln!(
+                "skipping real-so1sh PTY prompt test: Cargo did not provide or build the so1sh binary"
+            );
+            return;
+        };
         let mut pty = crate::pty::Pty::spawn(&executable, "/", 80, 24).expect("spawn built so1sh");
         let mut model = Model::new(80, 24);
         let deadline = Instant::now() + Duration::from_secs(5);

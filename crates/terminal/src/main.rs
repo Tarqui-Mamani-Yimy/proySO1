@@ -357,10 +357,10 @@ impl TerminalWindow {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.09,
-                            b: 0.12,
-                            a: 1.0,
+                            r: so1_terminal::renderer::surface_clear_color()[0],
+                            g: so1_terminal::renderer::surface_clear_color()[1],
+                            b: so1_terminal::renderer::surface_clear_color()[2],
+                            a: so1_terminal::renderer::surface_clear_color()[3],
                         }),
                         store: wgpu::StoreOp::Store,
                     },

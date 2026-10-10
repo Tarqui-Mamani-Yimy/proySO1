@@ -41,6 +41,16 @@ pub fn srgb_to_linear(channel: u8) -> f32 {
     }
 }
 
+pub fn surface_clear_color() -> [f64; 4] {
+    let [r, g, b] = color_rgb(CellColor::Named(257));
+    [
+        f64::from(srgb_to_linear(r)),
+        f64::from(srgb_to_linear(g)),
+        f64::from(srgb_to_linear(b)),
+        1.0,
+    ]
+}
+
 fn indexed_rgb(index: u8) -> [u8; 3] {
     const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
     match index {
@@ -123,6 +133,22 @@ mod tests {
         assert_eq!(color_rgb(CellColor::Indexed(196)), [255, 0, 0]);
         assert_eq!(color_rgb(CellColor::Indexed(244)), [128, 128, 128]);
         assert_eq!(color_rgb(CellColor::Rgb(1, 2, 3)), [1, 2, 3]);
+    }
+
+    #[test]
+    fn surface_clear_matches_default_terminal_cell_background() {
+        let model = crate::model::Model::new(1, 1);
+        let cell = &model.visible_cells()[0][0];
+        let [r, g, b] = color_rgb(cell.background);
+        assert_eq!(
+            surface_clear_color(),
+            [
+                f64::from(srgb_to_linear(r)),
+                f64::from(srgb_to_linear(g)),
+                f64::from(srgb_to_linear(b)),
+                1.0,
+            ]
+        );
     }
 
     #[test]

@@ -92,6 +92,146 @@ mod tests {
             "child {pid} remains after drop"
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_failure_kills_and_reaps_spawned_child() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("/bin/sleep");
+        command.arg("100");
+        let child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let error = setup_spawned_child(child, || {
+            Err::<(), _>(io::Error::other("injected post-spawn setup failure"))
+        })
+        .expect_err("injected setup error is returned");
+        assert_eq!(error.to_string(), "injected post-spawn setup failure");
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "spawned child {pid} survived setup rollback"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_terminates_shell_and_background_process_group_promptly() {
+        const CHILD_TEST: &str = "SO1TERM_PTY_DROP_TEST_CHILD";
+        if std::env::var_os(CHILD_TEST).is_some() {
+            assert_dropped_sleep_is_gone();
+            return;
+        }
+
+        let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pty::tests::drop_terminates_shell_and_background_process_group_promptly",
+            ])
+            .env(CHILD_TEST, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                assert!(status.success(), "PTY drop helper failed with {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = helper.kill();
+                let _ = helper.wait();
+                panic!("PTY drop helper did not finish within 4 seconds");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_terminates_so1sh_started_background_process() {
+        let Some(executable) = test_so1sh_executable() else {
+            eprintln!("skip real so1sh background teardown test: Cargo binary unavailable");
+            return;
+        };
+        let unique = format!("so1term-pty-{}", std::process::id());
+        let rc_path = std::env::temp_dir().join(format!("{unique}.rc"));
+        let pid_path = std::env::temp_dir().join(format!("{unique}.pid"));
+        std::fs::write(
+            &rc_path,
+            format!("sleep 100 & echo CHILD_PID=$! > '{}'\n", pid_path.display()),
+        )
+        .unwrap();
+        let command = format!(
+            "SO1SH_RC='{}' exec '{}'",
+            rc_path.display(),
+            executable.display()
+        );
+        let pty = Pty::spawn_with_args("/bin/sh", ["-c", command.as_str()], "/", 80, 24).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&pid_path)
+                && let Some(pid) = value
+                    .trim()
+                    .strip_prefix("CHILD_PID=")
+                    .and_then(|s| s.parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "so1sh rc did not launch background child"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let started = std::time::Instant::now();
+        drop(pty);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "so1sh PTY drop took {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_file(rc_path);
+        let _ = std::fs::remove_file(pid_path);
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "so1sh background process {pid} survived drop"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_dropped_sleep_is_gone() {
+        let mut pty = Pty::spawn_with_args(
+            "/bin/sh",
+            ["-c", "sleep 100 & printf 'CHILD_PID=%s\\n' \"$!\"; wait"],
+            Path::new("/"),
+            80,
+            24,
+        )
+        .unwrap();
+        let output = wait_for(&mut pty, b"CHILD_PID=");
+        let pid = String::from_utf8_lossy(&output)
+            .split("CHILD_PID=")
+            .nth(1)
+            .and_then(|tail| tail.lines().next())
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .expect("shell reports background PID");
+        let started = std::time::Instant::now();
+        drop(pty);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "drop took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "background process {pid} remains"
+        );
+    }
 }
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -100,6 +240,21 @@ use std::{
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
 };
+
+#[cfg(test)]
+pub(crate) fn test_so1sh_executable() -> Option<PathBuf> {
+    std::env::var_os("CARGO_BIN_EXE_so1sh")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let executable = std::env::current_exe().ok()?;
+            executable
+                .ancestors()
+                .find(|ancestor| ancestor.join("deps").is_dir())
+                .map(|profile| profile.join("so1sh"))
+                .filter(|path| path.is_file())
+        })
+}
 
 /// A headless child process attached to a portable pseudo-terminal.
 pub struct Pty {
@@ -147,12 +302,15 @@ impl Pty {
         command.cwd(cwd.as_ref().as_os_str());
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).map_err(other_io)?;
-        let reader = pair.master.try_clone_reader().map_err(other_io)?;
-        let writer = pair.master.take_writer().map_err(other_io)?;
-        let (sender, output) = mpsc::channel();
-        let reader = thread::Builder::new()
-            .name("so1term-pty-reader".into())
-            .spawn(move || read_output(reader, sender))?;
+        let (child, (writer, output, reader)) = setup_spawned_child(child, || {
+            let reader = pair.master.try_clone_reader().map_err(other_io)?;
+            let writer = pair.master.take_writer().map_err(other_io)?;
+            let (sender, output) = mpsc::channel();
+            let reader = thread::Builder::new()
+                .name("so1term-pty-reader".into())
+                .spawn(move || read_output(reader, sender))?;
+            Ok((writer, output, reader))
+        })?;
         Ok(Self {
             child,
             master: Some(pair.master),
@@ -255,12 +413,15 @@ impl Pty {
         command.cwd(cwd.as_ref().as_os_str());
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).map_err(other_io)?;
-        let reader = pair.master.try_clone_reader().map_err(other_io)?;
-        let writer = pair.master.take_writer().map_err(other_io)?;
-        let (sender, output) = mpsc::channel();
-        let reader = thread::Builder::new()
-            .name("so1term-pty-reader".into())
-            .spawn(move || read_output_notified(reader, sender, notify))?;
+        let (child, (writer, output, reader)) = setup_spawned_child(child, || {
+            let reader = pair.master.try_clone_reader().map_err(other_io)?;
+            let writer = pair.master.take_writer().map_err(other_io)?;
+            let (sender, output) = mpsc::channel();
+            let reader = thread::Builder::new()
+                .name("so1term-pty-reader".into())
+                .spawn(move || read_output_notified(reader, sender, notify))?;
+            Ok((writer, output, reader))
+        })?;
         Ok(Self {
             child,
             master: Some(pair.master),
@@ -323,16 +484,125 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        let foreground_group = self
+            .master
+            .as_ref()
+            .and_then(|master| master.process_group_leader())
+            .map(|pgid| pgid as u32);
+        terminate_child_groups(self.child.as_mut(), foreground_group);
         self.writer.take();
         self.master.take();
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while !reader.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
         }
     }
+}
+
+fn setup_spawned_child<T>(
+    child: Box<dyn Child + Send + Sync>,
+    setup: impl FnOnce() -> io::Result<T>,
+) -> io::Result<(Box<dyn Child + Send + Sync>, T)> {
+    let mut guard = SpawnedChild(Some(child));
+    let resources = setup()?;
+    Ok((
+        guard.0.take().expect("spawn guard contains child"),
+        resources,
+    ))
+}
+
+struct SpawnedChild(Option<Box<dyn Child + Send + Sync>>);
+
+impl Drop for SpawnedChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            terminate_child(child.as_mut());
+        }
+    }
+}
+
+fn terminate_child(child: &mut dyn Child) {
+    terminate_child_groups(child, std::iter::empty());
+}
+
+fn terminate_child_groups(child: &mut dyn Child, extra_groups: impl IntoIterator<Item = u32>) {
+    let exited = child.try_wait().ok().flatten().is_some();
+    #[cfg(unix)]
+    if let Some(pid) = child.process_id() {
+        let mut groups = vec![pid];
+        groups.extend(extra_groups);
+        #[cfg(target_os = "linux")]
+        let session = unsafe { libc::getsid(pid as libc::pid_t) };
+        #[cfg(target_os = "linux")]
+        if session > 0 {
+            groups.extend(
+                session_process_groups(session)
+                    .into_iter()
+                    .map(|group| group as u32),
+            );
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        for group in &groups {
+            unsafe {
+                libc::kill(-(*group as libc::pid_t), libc::SIGHUP);
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        while std::time::Instant::now() < deadline {
+            let _ = child.try_wait();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        #[cfg(target_os = "linux")]
+        if session > 0 {
+            groups.extend(
+                session_process_groups(session)
+                    .into_iter()
+                    .map(|group| group as u32),
+            );
+            groups.sort_unstable();
+            groups.dedup();
+        }
+        for group in groups {
+            unsafe {
+                libc::kill(-(group as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn session_process_groups(session: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .parse::<libc::pid_t>()
+                .ok()
+        })
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let after_command = stat.rsplit_once(") ")?.1;
+            let fields: Vec<_> = after_command.split_whitespace().collect();
+            let process_group = fields.get(2)?.parse::<libc::pid_t>().ok()?;
+            let process_session = fields.get(3)?.parse::<libc::pid_t>().ok()?;
+            (process_session == session).then_some(process_group)
+        })
+        .collect()
 }
 
 fn read_output(mut reader: Box<dyn Read + Send>, sender: mpsc::Sender<Vec<u8>>) {

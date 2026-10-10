@@ -141,17 +141,11 @@ impl Pty {
         }
         #[cfg(unix)]
         {
-            let sibling = std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|p| p.join("so1sh")));
-            if let Some(path) = sibling.filter(|path| path.is_file()) {
-                return Self::spawn(path, cwd, cols, rows);
-            }
-            Self::spawn("so1sh", cwd, cols, rows)
+            Self::spawn(resolve_shell(), cwd, cols, rows)
         }
         #[cfg(windows)]
         {
-            let candidates = ["pwsh", "cmd"];
+            let candidates = crate::default_shell_candidates_for(true);
             let mut last_error = None;
             for candidate in candidates {
                 match Self::spawn(candidate, cwd.as_ref(), cols, rows) {
@@ -261,12 +255,15 @@ pub fn resolve_shell() -> PathBuf {
     if let Some(value) = std::env::var_os("SO1TERM_SHELL") {
         return PathBuf::from(value);
     }
-    if let Some(path) = std::env::current_exe()
+    let sibling = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|p| p.join("so1sh")))
-        .filter(|p| p.is_file())
-    {
-        return path;
+        .and_then(|exe| exe.parent().map(|p| p.join("so1sh")));
+    match crate::resolve_shell_choice(
+        None,
+        sibling.as_ref().is_some_and(|p| p.is_file()),
+        crate::default_shell_candidates_for(false),
+    ) {
+        "sibling-so1sh" => sibling.unwrap_or_else(|| PathBuf::from("so1sh")),
+        selected => PathBuf::from(selected),
     }
-    PathBuf::from("so1sh")
 }

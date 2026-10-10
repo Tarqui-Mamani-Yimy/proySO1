@@ -45,6 +45,11 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 - Verified: a scratch crate with all of the above compiles on nightly-2026-09-15 (25 s). NOT verified: GPU init / window creation at runtime.
 - Architecture: UI thread owns `Term`; PTY reader thread sends byte chunks over a channel and wakes the UI; each chunk feeds both the VT processor and the OSC observer; modules window, pty, model, osc, renderer, keyboard, selection, clipboard.
 
+## Platform decision (user, 2026-10-09)
+- The terminal targets Linux, macOS and Windows. Design portable from the start: no Linux-only API without a per-platform path; shell command configurable.
+- so1sh/epsh are POSIX-only (fork, signals, process groups, termios): default shell is `so1sh` on Linux/macOS; on Windows default to `pwsh` (fallback `cmd`) via ConPTY (portable-pty), or so1sh inside WSL.
+- Verification limit: only Linux is available here. macOS/Windows get compile checks (`cargo check --target x86_64-apple-darwin / x86_64-pc-windows-msvc` once those targets are installed); runtime behavior there needs the user's machines or a hosted CI.
+
 ## Tasks (refined after T0)
 - [x] **T0 — Exploration and stack decision** (Codex, read-only)
 - [ ] **T1 — Crate skeleton + stack spike**: `crates/terminal`, open a window, clear it with wgpu; type-check Term; GPU init failure reported clearly.
@@ -64,4 +69,4 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 _(filled per task)_
 
 ## Progress / Next step
-- T0 done. Open product question for the user: target platforms for the MVP. Then T1 on `codex-impl`.
+- T0 done; platforms decided (Linux/macOS/Windows). Next: T1 on `codex-impl`.

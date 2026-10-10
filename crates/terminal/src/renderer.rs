@@ -1,5 +1,7 @@
 //! Renderer-independent grid layout and terminal color conversion.
 use crate::model::{CellColor, VisibleCell};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderCell {
@@ -8,6 +10,105 @@ pub struct RenderCell {
     pub background: [u8; 3],
     pub bold: bool,
     pub cursor: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceFailure {
+    Lost,
+    Outdated,
+    Timeout,
+    Occluded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameRecovery {
+    ReconfigureAndRedraw,
+    RetryAfter(Duration),
+    WaitForEvent,
+}
+
+pub fn frame_recovery(failure: SurfaceFailure) -> FrameRecovery {
+    match failure {
+        SurfaceFailure::Lost | SurfaceFailure::Outdated => FrameRecovery::ReconfigureAndRedraw,
+        SurfaceFailure::Timeout => FrameRecovery::RetryAfter(Duration::from_millis(50)),
+        SurfaceFailure::Occluded => FrameRecovery::WaitForEvent,
+    }
+}
+
+pub fn next_vertex_capacity(current: usize, required: usize) -> usize {
+    if required <= current {
+        current.max(1)
+    } else {
+        required.max(1).next_power_of_two()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyledRun {
+    pub text: String,
+    pub foreground: [u8; 3],
+    pub bold: bool,
+}
+
+pub fn styled_lines(rows: &[Vec<RenderCell>]) -> Vec<Vec<StyledRun>> {
+    rows.iter()
+        .map(|row| {
+            let mut runs: Vec<StyledRun> = Vec::new();
+            for cell in row {
+                if let Some(last) = runs
+                    .last_mut()
+                    .filter(|run| run.foreground == cell.foreground && run.bold == cell.bold)
+                {
+                    last.text.push(cell.character);
+                } else {
+                    runs.push(StyledRun {
+                        text: cell.character.to_string(),
+                        foreground: cell.foreground,
+                        bold: cell.bold,
+                    });
+                }
+            }
+            runs
+        })
+        .collect()
+}
+
+#[derive(Default)]
+pub struct WakeupGate(AtomicBool);
+impl WakeupGate {
+    /// Returns true only for the first queued wakeup until the UI acknowledges it.
+    pub fn request(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+    pub fn acknowledge(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+pub struct ExitPollBackoff {
+    next_ms: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitPollDecision {
+    Exit,
+    RetryAt(Instant),
+}
+impl ExitPollBackoff {
+    pub fn new(_now: Instant) -> Self {
+        Self { next_ms: 10 }
+    }
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.next_ms;
+        self.next_ms = (self.next_ms * 2).min(500);
+        Duration::from_millis(delay)
+    }
+    pub fn observe_wait_status(&mut self, ready: bool, now: Instant) -> ExitPollDecision {
+        if ready {
+            ExitPollDecision::Exit
+        } else {
+            ExitPollDecision::RetryAt(now + self.next_delay())
+        }
+    }
 }
 
 pub fn grid_size(width: u32, height: u32, cell_width: f32, cell_height: f32) -> (usize, usize) {
@@ -89,29 +190,33 @@ const ANSI: [[u8; 3]; 16] = [
     [255, 255, 255],
 ];
 
-pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<RenderCell> {
+pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<Vec<RenderCell>> {
     rows.iter()
         .enumerate()
-        .flat_map(|(row, cells)| {
-            cells.iter().enumerate().map(move |(col, cell)| {
-                let active = (col, row) == cursor;
-                let inverse = cell.inverse ^ active;
-                RenderCell {
-                    character: cell.character,
-                    foreground: color_rgb(if inverse {
-                        cell.background
-                    } else {
-                        cell.foreground
-                    }),
-                    background: color_rgb(if inverse {
-                        cell.foreground
-                    } else {
-                        cell.background
-                    }),
-                    bold: cell.bold,
-                    cursor: active,
-                }
-            })
+        .map(|(row, cells)| {
+            cells
+                .iter()
+                .enumerate()
+                .map(move |(col, cell)| {
+                    let active = (col, row) == cursor;
+                    let inverse = cell.inverse ^ active;
+                    RenderCell {
+                        character: cell.character,
+                        foreground: color_rgb(if inverse {
+                            cell.background
+                        } else {
+                            cell.foreground
+                        }),
+                        background: color_rgb(if inverse {
+                            cell.foreground
+                        } else {
+                            cell.background
+                        }),
+                        bold: cell.bold,
+                        cursor: active,
+                    }
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -119,6 +224,111 @@ pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waitpid_not_ready_schedules_bounded_retry_until_exit_is_observed() {
+        let start = std::time::Instant::now();
+        let mut poll = ExitPollBackoff::new(start);
+        assert_eq!(
+            poll.observe_wait_status(false, start),
+            ExitPollDecision::RetryAt(start + std::time::Duration::from_millis(10))
+        );
+        let second = start + std::time::Duration::from_millis(10);
+        assert_eq!(
+            poll.observe_wait_status(false, second),
+            ExitPollDecision::RetryAt(second + std::time::Duration::from_millis(20))
+        );
+        let mut now = second;
+        for _ in 0..10 {
+            now += poll.next_delay();
+        }
+        assert_eq!(
+            poll.observe_wait_status(false, now),
+            ExitPollDecision::RetryAt(now + std::time::Duration::from_millis(500))
+        );
+        assert_eq!(poll.observe_wait_status(true, now), ExitPollDecision::Exit);
+    }
+
+    #[test]
+    fn failed_surface_frame_uses_bounded_retry_policy() {
+        assert_eq!(
+            frame_recovery(SurfaceFailure::Lost),
+            FrameRecovery::ReconfigureAndRedraw
+        );
+        assert_eq!(
+            frame_recovery(SurfaceFailure::Outdated),
+            FrameRecovery::ReconfigureAndRedraw
+        );
+        assert_eq!(
+            frame_recovery(SurfaceFailure::Timeout),
+            FrameRecovery::RetryAfter(std::time::Duration::from_millis(50))
+        );
+        assert_eq!(
+            frame_recovery(SurfaceFailure::Occluded),
+            FrameRecovery::WaitForEvent
+        );
+    }
+
+    #[test]
+    fn line_shaping_groups_spans_by_foreground_and_bold_without_losing_spaces() {
+        let cells = vec![
+            RenderCell {
+                character: 'a',
+                foreground: [255, 0, 0],
+                background: [0; 3],
+                bold: false,
+                cursor: false,
+            },
+            RenderCell {
+                character: 'b',
+                foreground: [255, 0, 0],
+                background: [0; 3],
+                bold: false,
+                cursor: false,
+            },
+            RenderCell {
+                character: ' ',
+                foreground: [255, 0, 0],
+                background: [0; 3],
+                bold: false,
+                cursor: false,
+            },
+            RenderCell {
+                character: 'c',
+                foreground: [0, 255, 0],
+                background: [0; 3],
+                bold: true,
+                cursor: false,
+            },
+        ];
+        let lines = styled_lines(&[cells]);
+        assert_eq!(
+            lines[0]
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "ab c"
+        );
+        assert_eq!(lines[0].len(), 2);
+        assert_eq!(lines[0][1].foreground, [0, 255, 0]);
+        assert!(lines[0][1].bold);
+    }
+
+    #[test]
+    fn pty_wakeups_coalesce_until_the_ui_drains_them() {
+        let gate = WakeupGate::default();
+        assert!(gate.request());
+        assert!(!gate.request());
+        gate.acknowledge();
+        assert!(gate.request());
+    }
+
+    #[test]
+    fn vertex_capacity_grows_geometrically_and_is_retained() {
+        assert_eq!(next_vertex_capacity(1024, 700), 1024);
+        assert_eq!(next_vertex_capacity(1024, 1025), 2048);
+        assert_eq!(next_vertex_capacity(0, 1), 1);
+    }
 
     #[test]
     fn grid_layout_clamps_minimized_and_nonintegral_sizes() {
@@ -160,7 +370,7 @@ mod tests {
             bold: true,
             inverse: false,
         }]];
-        let cell = render_cells(&rows, (0, 0))[0];
+        let cell = render_cells(&rows, (0, 0))[0][0];
         assert_eq!(cell.foreground, [4, 5, 6]);
         assert_eq!(cell.background, [1, 2, 3]);
         assert!(cell.cursor && cell.bold);

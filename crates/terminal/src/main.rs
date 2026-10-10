@@ -6,9 +6,11 @@ use glyphon::{
 use so1_terminal::{
     clamp_surface_size,
     model::{Model, ModelEvent},
-    renderer::grid_size,
+    renderer::{
+        ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, WakeupGate, grid_size,
+    },
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -29,6 +31,12 @@ struct TerminalWindow {
     failed: bool,
     input: String,
     proxy: EventLoopProxy<UserEvent>,
+    pty_wakeup: Arc<WakeupGate>,
+    exit_poll: ExitPollBackoff,
+    next_exit_poll: Instant,
+    retry_redraw_at: Option<Instant>,
+    occluded: bool,
+    redraw_pending: bool,
 }
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -43,6 +51,10 @@ struct GpuState {
     cell_width: f32,
     cell_height: f32,
     rect_pipeline: wgpu::RenderPipeline,
+    line_buffers: Vec<Buffer>,
+    vertices: Vec<RectVertex>,
+    vertex_buffer: wgpu::Buffer,
+    vertex_capacity: usize,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -52,6 +64,7 @@ struct RectVertex {
 }
 impl TerminalWindow {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        let now = Instant::now();
         Self {
             window: None,
             gpu: None,
@@ -60,6 +73,12 @@ impl TerminalWindow {
             failed: false,
             input: String::new(),
             proxy,
+            pty_wakeup: Arc::new(WakeupGate::default()),
+            exit_poll: ExitPollBackoff::new(now),
+            next_exit_poll: now,
+            retry_redraw_at: None,
+            occluded: false,
+            redraw_pending: false,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -162,15 +181,25 @@ impl TerminalWindow {
             multiview_mask: None,
             cache: None,
         });
+        let vertex_capacity = 1024;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terminal reusable cell vertex buffer"),
+            size: vertex_capacity as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let (cols, rows) = grid_size(width, height, cell_width, cell_height);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let proxy = self.proxy.clone();
+        let pty_wakeup = Arc::clone(&self.pty_wakeup);
         let pty = so1_terminal::pty::Pty::spawn_shell_notified(
             cwd,
             cols as u16,
             rows as u16,
             move || {
-                let _ = proxy.send_event(UserEvent::PtyOutput);
+                if pty_wakeup.request() {
+                    let _ = proxy.send_event(UserEvent::PtyOutput);
+                }
             },
         )
         .map_err(|e| format!("could not start shell PTY: {e}"))?;
@@ -190,6 +219,10 @@ impl TerminalWindow {
             cell_width,
             cell_height,
             rect_pipeline,
+            line_buffers: Vec::new(),
+            vertices: Vec::new(),
+            vertex_buffer,
+            vertex_capacity,
         });
         Ok(())
     }
@@ -212,63 +245,132 @@ impl TerminalWindow {
             );
         }
     }
-    fn draw(&mut self) -> Result<(), String> {
+    fn request_redraw(&mut self) {
+        if self.redraw_pending || self.occluded {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            self.redraw_pending = true;
+            window.request_redraw();
+        }
+    }
+
+    fn poll_child_exit(&mut self, event_loop: &ActiveEventLoop) {
+        let status = self
+            .pty
+            .as_mut()
+            .and_then(|pty| pty.try_wait().ok().flatten());
+        match self
+            .exit_poll
+            .observe_wait_status(status.is_some(), Instant::now())
+        {
+            ExitPollDecision::Exit => {
+                self.pty.take();
+                event_loop.exit();
+            }
+            ExitPollDecision::RetryAt(deadline) if self.pty.is_some() => {
+                self.next_exit_poll = deadline;
+            }
+            ExitPollDecision::RetryAt(_) => {}
+        }
+    }
+
+    fn draw(&mut self) -> Result<FrameRecovery, String> {
         let (Some(gpu), Some(model)) = (self.gpu.as_mut(), self.model.as_ref()) else {
-            return Ok(());
+            return Ok(FrameRecovery::WaitForEvent);
         };
+        let frame = match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                return Ok(so1_terminal::renderer::frame_recovery(SurfaceFailure::Lost));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                return Ok(so1_terminal::renderer::frame_recovery(
+                    SurfaceFailure::Outdated,
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Ok(so1_terminal::renderer::frame_recovery(
+                    SurfaceFailure::Timeout,
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(so1_terminal::renderer::frame_recovery(
+                    SurfaceFailure::Occluded,
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(
+                    "GPU surface reported a validation error while acquiring a frame".into(),
+                );
+            }
+        };
+
         let rows = model.visible_cells();
         let cursor = model.cursor();
         let cells = so1_terminal::renderer::render_cells(&rows, (cursor.column, cursor.row));
-        let cols = rows.first().map_or(1, Vec::len).max(1);
+        let lines = so1_terminal::renderer::styled_lines(&cells);
         let width = gpu.config.width as f32;
         let height = gpu.config.height as f32;
-        let mut vertices = Vec::with_capacity(cells.len() * 6);
-        let mut text_buffers = Vec::with_capacity(cells.len());
-        for (index, cell) in cells.iter().enumerate() {
-            let col = index % cols;
-            let row = index / cols;
-            let x0 = col as f32 * gpu.cell_width;
-            let y0 = row as f32 * gpu.cell_height;
-            let x1 = x0 + gpu.cell_width;
-            let y1 = y0 + gpu.cell_height;
-            let points = [
-                [x0 / width * 2.0 - 1.0, 1.0 - y0 / height * 2.0],
-                [x1 / width * 2.0 - 1.0, 1.0 - y0 / height * 2.0],
-                [x1 / width * 2.0 - 1.0, 1.0 - y1 / height * 2.0],
-                [x0 / width * 2.0 - 1.0, 1.0 - y1 / height * 2.0],
-            ];
-            let color = cell.background.map(so1_terminal::renderer::srgb_to_linear);
-            for point in [0, 1, 2, 0, 2, 3] {
-                vertices.push(RectVertex {
-                    position: points[point],
-                    color,
-                });
+        gpu.vertices.clear();
+        for (row, cells) in cells.iter().enumerate() {
+            for (col, cell) in cells.iter().enumerate() {
+                let x0 = col as f32 * gpu.cell_width;
+                let y0 = row as f32 * gpu.cell_height;
+                let x1 = x0 + gpu.cell_width;
+                let y1 = y0 + gpu.cell_height;
+                let points = [
+                    [x0 / width * 2.0 - 1.0, 1.0 - y0 / height * 2.0],
+                    [x1 / width * 2.0 - 1.0, 1.0 - y0 / height * 2.0],
+                    [x1 / width * 2.0 - 1.0, 1.0 - y1 / height * 2.0],
+                    [x0 / width * 2.0 - 1.0, 1.0 - y1 / height * 2.0],
+                ];
+                let color = cell.background.map(so1_terminal::renderer::srgb_to_linear);
+                for point in [0, 1, 2, 0, 2, 3] {
+                    gpu.vertices.push(RectVertex {
+                        position: points[point],
+                        color,
+                    });
+                }
             }
-            let mut buffer = Buffer::new(
+        }
+
+        while gpu.line_buffers.len() < lines.len() {
+            gpu.line_buffers.push(Buffer::new(
                 &mut gpu.font_system,
                 Metrics::new(gpu.cell_height / 1.35, gpu.cell_height),
-            );
-            buffer.set_size(Some(gpu.cell_width), Some(gpu.cell_height));
-            let attrs = Attrs::new()
-                .family(Family::Monospace)
-                .color(Color::rgb(
-                    cell.foreground[0],
-                    cell.foreground[1],
-                    cell.foreground[2],
-                ))
-                .weight(if cell.bold {
-                    Weight::BOLD
-                } else {
-                    Weight::NORMAL
-                });
-            buffer.set_text(
-                &cell.character.to_string(),
-                &attrs,
-                cosmic_text::Shaping::Advanced,
-                None,
-            );
+            ));
+        }
+        for (row, runs) in lines.iter().enumerate() {
+            if runs
+                .iter()
+                .all(|run| run.text.chars().all(char::is_whitespace))
+            {
+                continue;
+            }
+            let buffer = &mut gpu.line_buffers[row];
+            buffer.set_size(Some(width), Some(gpu.cell_height));
+            let default_attrs = Attrs::new().family(Family::Monospace);
+            let spans = runs.iter().map(|run| {
+                let attrs = Attrs::new()
+                    .family(Family::Monospace)
+                    .color(Color::rgb(
+                        run.foreground[0],
+                        run.foreground[1],
+                        run.foreground[2],
+                    ))
+                    .weight(if run.bold {
+                        Weight::BOLD
+                    } else {
+                        Weight::NORMAL
+                    });
+                (run.text.as_str(), attrs)
+            });
+            buffer.set_rich_text(spans, &default_attrs, cosmic_text::Shaping::Advanced, None);
             buffer.shape_until_scroll(&mut gpu.font_system, true);
-            text_buffers.push(buffer);
         }
         gpu.viewport.update(
             &gpu.queue,
@@ -277,19 +379,19 @@ impl TerminalWindow {
                 height: gpu.config.height,
             },
         );
-        let areas: Vec<_> = text_buffers
+        let areas: Vec<_> = lines
             .iter()
             .enumerate()
-            .filter_map(|(index, buffer)| {
-                let cell = cells[index];
-                if cell.character == ' ' {
+            .filter_map(|(row, runs)| {
+                if runs
+                    .iter()
+                    .all(|run| run.text.chars().all(char::is_whitespace))
+                {
                     return None;
                 }
-                let col = index % cols;
-                let row = index / cols;
                 Some(TextArea {
-                    buffer,
-                    left: col as f32 * gpu.cell_width,
+                    buffer: &gpu.line_buffers[row],
+                    left: 0.0,
                     top: row as f32 * gpu.cell_height,
                     scale: 1.0,
                     bounds: TextBounds {
@@ -298,11 +400,7 @@ impl TerminalWindow {
                         right: gpu.config.width as i32,
                         bottom: gpu.config.height as i32,
                     },
-                    default_color: Color::rgb(
-                        cell.foreground[0],
-                        cell.foreground[1],
-                        cell.foreground[2],
-                    ),
+                    default_color: Color::rgb(220, 220, 220),
                     custom_glyphs: &[],
                 })
             })
@@ -318,28 +416,23 @@ impl TerminalWindow {
                 &mut gpu.swash_cache,
             )
             .map_err(|e| format!("could not prepare terminal text: {e}"))?;
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(
-                    "GPU surface reported a validation error while acquiring a frame".into(),
-                );
-            }
-        };
+
+        let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
+        let capacity = so1_terminal::renderer::next_vertex_capacity(gpu.vertex_capacity, required);
+        if capacity > gpu.vertex_capacity {
+            gpu.vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("terminal reusable cell vertex buffer"),
+                size: capacity as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.vertex_capacity = capacity;
+        }
+        if required > 0 {
+            gpu.queue
+                .write_buffer(&gpu.vertex_buffer, 0, bytemuck::cast_slice(&gpu.vertices));
+        }
+
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -367,18 +460,10 @@ impl TerminalWindow {
                 })],
                 ..Default::default()
             });
-            if !vertices.is_empty() {
-                let vertex_buffer = wgpu::util::DeviceExt::create_buffer_init(
-                    &gpu.device,
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("terminal cell backgrounds"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    },
-                );
+            if required > 0 {
                 pass.set_pipeline(&gpu.rect_pipeline);
-                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.draw(0..vertices.len() as u32, 0..1);
+                pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+                pass.draw(0..gpu.vertices.len() as u32, 0..1);
             }
             gpu.text_renderer
                 .render(&gpu.atlas, &gpu.viewport, &mut pass)
@@ -386,12 +471,13 @@ impl TerminalWindow {
         }
         gpu.queue.submit([encoder.finish()]);
         gpu.queue.present(frame);
-        Ok(())
+        Ok(FrameRecovery::WaitForEvent)
     }
     fn receive_output(&mut self, event_loop: &ActiveEventLoop) {
-        let mut exited = false;
+        let mut changed = false;
         if let Some(pty) = self.pty.as_mut() {
             for bytes in pty.drain_output() {
+                changed = true;
                 if let Some(model) = self.model.as_mut() {
                     model.feed(&bytes);
                     for ev in model.take_events() {
@@ -415,15 +501,10 @@ impl TerminalWindow {
                     }
                 }
             }
-            if pty.try_wait().ok().flatten().is_some() {
-                exited = true;
-            }
         }
-        if exited {
-            self.pty.take();
-            event_loop.exit();
-        } else if let Some(w) = &self.window {
-            w.request_redraw();
+        self.poll_child_exit(event_loop);
+        if changed {
+            self.request_redraw();
         }
     }
 }
@@ -438,11 +519,10 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             event_loop.exit();
             return;
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
+        self.request_redraw();
     }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: UserEvent) {
+        self.pty_wakeup.acknowledge();
         self.receive_output(event_loop)
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -453,15 +533,31 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             }
             WindowEvent::Resized(s) => {
                 self.resize(s.width, s.height);
-                if let Some(w) = &self.window {
-                    w.request_redraw();
+                self.request_redraw();
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    self.retry_redraw_at = None;
+                    self.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Err(e) = self.draw() {
-                    eprintln!("so1term: {e}");
-                    self.failed = true;
-                    event_loop.exit();
+                self.redraw_pending = false;
+                if self.occluded {
+                    return;
+                }
+                match self.draw() {
+                    Ok(FrameRecovery::ReconfigureAndRedraw) => self.request_redraw(),
+                    Ok(FrameRecovery::RetryAfter(delay)) => {
+                        self.retry_redraw_at = Some(Instant::now() + delay)
+                    }
+                    Ok(FrameRecovery::WaitForEvent) => {}
+                    Err(e) => {
+                        eprintln!("so1term: {e}");
+                        self.failed = true;
+                        event_loop.exit();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -492,6 +588,28 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             }
             _ => {}
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if self.pty.is_some() && now >= self.next_exit_poll {
+            self.poll_child_exit(event_loop);
+        }
+        if self.retry_redraw_at.is_some_and(|deadline| deadline <= now) {
+            self.retry_redraw_at = None;
+            self.request_redraw();
+        }
+        let next_deadline = [
+            self.pty.is_some().then_some(self.next_exit_poll),
+            self.retry_redraw_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        event_loop.set_control_flow(next_deadline.map_or(
+            winit::event_loop::ControlFlow::Wait,
+            winit::event_loop::ControlFlow::WaitUntil,
+        ));
     }
 }
 fn main() {

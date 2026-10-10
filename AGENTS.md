@@ -322,14 +322,18 @@ and `Ctrl+Alt+Arrow` moves focus by geometry. On macOS, use `Cmd+Shift+D/E/W`
 and `Cmd+Option+Arrow`. Tabs use a single-row bar at the top only while more
 than one tab exists; the bar takes one terminal cell row from every tab's PTY
 grid. `Ctrl+Shift+T` creates a tab, `Ctrl+Shift+Q` closes the active tab,
-`Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs, and `Alt+1..9` selects a numbered tab.
-On macOS use `Cmd+Shift+T/Q` and `Cmd+1..9`; Ctrl+Tab cycling remains unchanged.
+`Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs, and `Alt+1..9` selects a numbered tab
+only when it targets a different existing tab; otherwise the key is sent to the
+focused shell. On macOS use `Cmd+Shift+T/Q` and `Cmd+1..9`; Ctrl+Tab cycling
+remains unchanged.
 `Ctrl+Shift+W` still closes only the focused pane, and closes its tab if that was
 the tab's last pane. A tab label is the active pane's OSC 7 cwd basename, or
-`so1sh` until a cwd mark arrives. Hidden tabs continue draining and applying PTY
-output but do not request redraws. The final pane of the final tab exits the
-window. These bindings are reserved by so1term and do not replace block
-navigation (`Ctrl+Shift+Up/Down`).
+`so1sh` until a cwd mark arrives. OSC 0/2 titles override the cwd basename for
+the active pane's tab label and window title; a terminal title reset returns to
+the cwd basename. The active tab uses a stronger accent background and brighter
+text. Hidden tabs continue draining and applying PTY output but do not request
+redraws. The final pane of the final tab exits the window. These bindings are
+reserved by so1term and do not replace block navigation (`Ctrl+Shift+Up/Down`).
 
 ### Embedder Builtins
 

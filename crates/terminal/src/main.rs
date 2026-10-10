@@ -58,6 +58,7 @@ struct Pane {
     pty: so1_terminal::pty::Pty,
     model: Model,
     title: String,
+    explicit_title: Option<String>,
     cwd: PathBuf,
     wakeup: Arc<WakeupGate>,
     wheel: WheelAccumulator,
@@ -174,7 +175,13 @@ fn tab_index_at(x: f64, width: u32, count: usize) -> Option<usize> {
     Some(((x / f64::from(width) * count as f64).floor() as usize).min(count - 1))
 }
 
-fn tab_shortcut(key: &Key, mods: KeyModifiers, macos: bool, tab_count: usize) -> Option<TabAction> {
+fn tab_shortcut(
+    key: &Key,
+    mods: KeyModifiers,
+    macos: bool,
+    tab_count: usize,
+    active_index: usize,
+) -> Option<TabAction> {
     let command = if macos { mods.super_key } else { mods.control };
     match key {
         Key::Character(text) if command && mods.shift && text.eq_ignore_ascii_case("t") => {
@@ -187,9 +194,78 @@ fn tab_shortcut(key: &Key, mods: KeyModifiers, macos: bool, tab_count: usize) ->
         Key::Named(NamedKey::Tab) if mods.control => Some(TabAction::Next),
         Key::Character(text) if if macos { mods.super_key } else { mods.alt } => {
             let index = text.chars().next()?.to_digit(10)?.checked_sub(1)? as usize;
-            (index < tab_count && index < 9).then_some(TabAction::Select(index))
+            (index < tab_count && index < 9 && index != active_index)
+                .then_some(TabAction::Select(index))
         }
         _ => None,
+    }
+}
+
+fn tab_action_changes_geometry(action: TabAction) -> bool {
+    matches!(action, TabAction::New | TabAction::Close)
+}
+
+fn rollback_failed_new_tab(tabs: &mut TabSet) {
+    if tabs.tabs().len() > 1 {
+        let _ = tabs.close_active();
+    }
+}
+
+fn create_tab_with<T>(
+    tabs: &mut TabSet,
+    create_pane: impl FnOnce(PaneId, PaneLayout) -> Result<T, String>,
+) -> Result<(PaneId, T), String> {
+    tabs.add_tab();
+    let result = (|| {
+        let tab = tabs
+            .active()
+            .ok_or_else(|| "new tab was not created".to_owned())?;
+        let pane_id = tab.active_pane();
+        let layout = tab
+            .layout()
+            .into_iter()
+            .find(|layout| layout.pane == pane_id && !layout.hidden)
+            .ok_or_else(|| "new tab has no visible pane".to_owned())?;
+        create_pane(pane_id, layout).map(|pane| (pane_id, pane))
+    })();
+    if result.is_err() {
+        rollback_failed_new_tab(tabs);
+    }
+    result
+}
+
+fn cwd_basename_title(cwd: &std::path::Path) -> String {
+    cwd.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("so1sh")
+        .to_owned()
+}
+
+fn pane_tab_title(cwd: &std::path::Path, explicit_title: Option<&str>) -> String {
+    explicit_title
+        .map(str::to_owned)
+        .unwrap_or_else(|| cwd_basename_title(cwd))
+}
+
+fn apply_title_event(
+    cwd: &std::path::Path,
+    explicit_title: &mut Option<String>,
+    event: &ModelEvent,
+) -> Option<String> {
+    match event {
+        ModelEvent::Title(title) => *explicit_title = Some(title.clone()),
+        ModelEvent::ResetTitle => *explicit_title = None,
+        _ => return None,
+    }
+    Some(pane_tab_title(cwd, explicit_title.as_deref()))
+}
+
+fn tab_style(active: bool) -> ([u8; 3], [u8; 3]) {
+    if active {
+        ([24, 86, 150], [255, 255, 255])
+    } else {
+        ([34, 39, 47], [174, 184, 196])
     }
 }
 
@@ -593,7 +669,8 @@ impl TerminalWindow {
         Ok(Pane {
             pty,
             model: Model::new(cols, rows),
-            title: "so1sh".to_owned(),
+            title: cwd_basename_title(&cwd),
+            explicit_title: None,
             cwd,
             wakeup,
             wheel: WheelAccumulator::default(),
@@ -800,28 +877,21 @@ impl TerminalWindow {
             .focused_pane()
             .map(|pane| pane.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let tabs = self.tabs.as_mut().ok_or("tab set is not initialized")?;
-        tabs.add_tab();
-        let pane_id = tabs.active().expect("new tab exists").active_pane();
-        let layout = tabs
-            .active()
-            .expect("new tab exists")
-            .layout()
-            .into_iter()
-            .find(|layout| layout.pane == pane_id && !layout.hidden)
-            .ok_or_else(|| "new tab has no visible pane".to_owned())?;
-        let pane = Self::create_pane(
-            pane_id,
-            layout.cols as usize,
-            layout.rows as usize,
-            cwd,
-            self.proxy.clone(),
-        )?;
+        let proxy = self.proxy.clone();
+        let result = {
+            let tabs = self.tabs.as_mut().ok_or("tab set is not initialized")?;
+            create_tab_with(tabs, |pane_id, layout| {
+                Self::create_pane(
+                    pane_id,
+                    layout.cols as usize,
+                    layout.rows as usize,
+                    cwd,
+                    proxy,
+                )
+            })
+        };
+        let (pane_id, pane) = result?;
         self.panes.insert(pane_id, pane);
-        self.resize(
-            self.gpu.as_ref().map_or(1, |gpu| gpu.config.width),
-            self.gpu.as_ref().map_or(1, |gpu| gpu.config.height),
-        );
         self.refresh_window_title();
         self.request_redraw();
         Ok(())
@@ -844,14 +914,12 @@ impl TerminalWindow {
         for pane in panes {
             self.panes.remove(&pane);
         }
-        if let Some(gpu) = self.gpu.as_ref() {
-            self.resize(gpu.config.width, gpu.config.height);
-        }
         self.refresh_window_title();
         self.request_redraw();
     }
 
     fn apply_tab_action(&mut self, action: TabAction, event_loop: &ActiveEventLoop) {
+        let geometry_changed = tab_action_changes_geometry(action);
         match action {
             TabAction::New => {
                 if let Err(error) = self.new_tab() {
@@ -875,7 +943,7 @@ impl TerminalWindow {
                 }
             }
         }
-        if let Some(gpu) = self.gpu.as_ref() {
+        if geometry_changed && let Some(gpu) = self.gpu.as_ref() {
             self.resize(gpu.config.width, gpu.config.height);
         }
         self.refresh_window_title();
@@ -1417,6 +1485,7 @@ impl TerminalWindow {
                 } else {
                     (index + 1) as f32 * tab_width
                 };
+                let (background, foreground) = tab_style(index == active_tab_index);
                 push_overlay_rect(
                     &mut gpu.vertices,
                     left,
@@ -1425,11 +1494,7 @@ impl TerminalWindow {
                     tab_bar_height as f32,
                     gpu.config.width as f32,
                     gpu.config.height as f32,
-                    if index == active_tab_index {
-                        [54, 62, 74]
-                    } else {
-                        [34, 39, 47]
-                    },
+                    background,
                 );
                 let mut buffer = Buffer::new(
                     &mut gpu.font_system,
@@ -1439,9 +1504,11 @@ impl TerminalWindow {
                     Some((right - left - 10.0).max(1.0)),
                     Some(tab_bar_height as f32),
                 );
-                let attrs = Attrs::new()
-                    .family(Family::Monospace)
-                    .color(Color::rgb(225, 225, 225));
+                let attrs = Attrs::new().family(Family::Monospace).color(Color::rgb(
+                    foreground[0],
+                    foreground[1],
+                    foreground[2],
+                ));
                 buffer.set_text(label, &attrs, cosmic_text::Shaping::Advanced, None);
                 buffer.shape_until_scroll(&mut gpu.font_system, true);
                 label_buffers.push(buffer);
@@ -1478,7 +1545,10 @@ impl TerminalWindow {
                         right: gpu.config.width as i32,
                         bottom: tab_bar_height as i32,
                     },
-                    default_color: Color::rgb(225, 225, 225),
+                    default_color: {
+                        let foreground = tab_style(index == active_tab_index).1;
+                        Color::rgb(foreground[0], foreground[1], foreground[2])
+                    },
                     custom_glyphs: &[],
                 })
                 .collect();
@@ -1547,21 +1617,20 @@ impl TerminalWindow {
                     {
                         let text = String::from_utf8_lossy(&path).into_owned();
                         pane.cwd = PathBuf::from(text);
-                        pane.title = pane
-                            .cwd
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .filter(|name| !name.is_empty())
-                            .unwrap_or("so1sh")
-                            .to_owned();
+                        pane.title = pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
                     }
                 }
                 for ev in pane.model.take_events() {
+                    if let Some(title) = apply_title_event(&pane.cwd, &mut pane.explicit_title, &ev)
+                    {
+                        pane.title = title;
+                        continue;
+                    }
                     match ev {
                         ModelEvent::PtyWrite(bytes) => {
                             let _ = pane.pty.write(&bytes);
                         }
-                        ModelEvent::Title(_) | ModelEvent::ResetTitle => {}
+                        ModelEvent::Title(_) | ModelEvent::ResetTitle => unreachable!(),
                         ModelEvent::Bell | ModelEvent::Other(_) => {}
                     }
                 }
@@ -1656,11 +1725,17 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     super_key: self.modifiers.contains(ModifiersState::SUPER),
                 };
                 let tab_count = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
+                let active_tab_index = self
+                    .tabs
+                    .as_ref()
+                    .and_then(TabSet::active_index)
+                    .unwrap_or(0);
                 if let Some(action) = tab_shortcut(
                     &event.logical_key,
                     mods,
                     cfg!(target_os = "macos"),
                     tab_count,
+                    active_tab_index,
                 ) {
                     self.apply_tab_action(action, event_loop);
                     return;
@@ -1990,15 +2065,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockShortcut, GlyphKey, PaneAction, TabAction, block_marker_bounds, block_shortcut,
-        close_pane_lifecycle, glyph_key_requires_reshape, invalidate_glyph_cache,
-        overlay_vertex_range, pane_action, pane_cell_at, pane_exit_needs_redraw,
-        pane_is_in_active_tab, route_block_shortcut, selection_target, tab_bar_height,
-        tab_content_rect, tab_index_at, tab_shortcut,
+        BlockShortcut, GlyphKey, PaneAction, TabAction, apply_title_event, block_marker_bounds,
+        block_shortcut, close_pane_lifecycle, create_tab_with, cwd_basename_title,
+        glyph_key_requires_reshape, invalidate_glyph_cache, overlay_vertex_range, pane_action,
+        pane_cell_at, pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title,
+        route_block_shortcut, selection_target, tab_action_changes_geometry, tab_bar_height,
+        tab_content_rect, tab_index_at, tab_shortcut, tab_style,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
-    use so1_terminal::model::Model;
+    use so1_terminal::model::{Model, ModelEvent};
     use so1_terminal::selection::PointerState;
     use winit::keyboard::{Key, NamedKey};
 
@@ -2033,28 +2109,38 @@ mod tests {
             ..Modifiers::default()
         };
         assert_eq!(
-            tab_shortcut(&Key::Character("t".into()), control_shift, false, 2),
+            tab_shortcut(&Key::Character("t".into()), control_shift, false, 2, 0),
             Some(TabAction::New)
         );
         assert_eq!(
-            tab_shortcut(&Key::Character("q".into()), control_shift, false, 2),
+            tab_shortcut(&Key::Character("q".into()), control_shift, false, 2, 0),
             Some(TabAction::Close)
         );
         assert_eq!(
-            tab_shortcut(&Key::Named(NamedKey::Tab), control, false, 2),
+            tab_shortcut(&Key::Named(NamedKey::Tab), control, false, 2, 0),
             Some(TabAction::Next)
         );
         assert_eq!(
-            tab_shortcut(&Key::Named(NamedKey::Tab), control_shift, false, 2),
+            tab_shortcut(&Key::Named(NamedKey::Tab), control_shift, false, 2, 0),
             Some(TabAction::Previous)
         );
         assert_eq!(
-            tab_shortcut(&Key::Character("2".into()), alt, false, 3),
+            tab_shortcut(&Key::Character("2".into()), alt, false, 3, 0),
             Some(TabAction::Select(1))
         );
         assert_eq!(
-            tab_shortcut(&Key::Character("9".into()), alt, false, 2),
+            tab_shortcut(&Key::Character("2".into()), alt, false, 3, 1),
+            None,
+            "Alt+2 must reach the shell when tab 2 is already active"
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Character("9".into()), alt, false, 2, 0),
             None
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Character("1".into()), alt, false, 1, 0),
+            None,
+            "Alt+1 must reach the shell when it would select the current tab"
         );
         assert_eq!(
             tab_shortcut(
@@ -2064,10 +2150,75 @@ mod tests {
                     ..alt
                 },
                 true,
-                3
+                3,
+                0
             ),
             Some(TabAction::Select(1))
         );
+    }
+
+    #[test]
+    fn failed_new_tab_spawn_rolls_back_the_empty_tab() {
+        use so1_terminal::layout::{CellSize, TabSet};
+        let mut tabs = TabSet::new(Rect::new(0, 0, 800, 600), CellSize::new(10, 10), 4, 5, 3);
+        let original = tabs.active().unwrap().id();
+        let mut spawn_attempted = false;
+        let result = create_tab_with(&mut tabs, |_, _| {
+            spawn_attempted = true;
+            Err::<(), _>("injected PTY spawn failure".to_owned())
+        });
+        assert!(spawn_attempted);
+        assert_eq!(result, Err("injected PTY spawn failure".to_owned()));
+        assert_eq!(tabs.tabs().len(), 1);
+        assert_eq!(tabs.active().unwrap().id(), original);
+    }
+
+    #[test]
+    fn tab_switch_actions_do_not_request_pty_or_model_resize() {
+        assert!(!tab_action_changes_geometry(TabAction::Next));
+        assert!(!tab_action_changes_geometry(TabAction::Previous));
+        assert!(!tab_action_changes_geometry(TabAction::Select(1)));
+        assert!(tab_action_changes_geometry(TabAction::New));
+        assert!(tab_action_changes_geometry(TabAction::Close));
+    }
+
+    #[test]
+    fn cwd_title_uses_the_basename_and_explicit_title_takes_precedence() {
+        let cwd = std::path::Path::new("/tmp/project");
+        assert_eq!(cwd_basename_title(cwd), "project");
+        assert_eq!(pane_tab_title(cwd, None), "project");
+        assert_eq!(pane_tab_title(cwd, Some("custom title")), "custom title");
+        assert_eq!(pane_tab_title(cwd, None), "project", "reset returns to cwd");
+        assert_eq!(cwd_basename_title(std::path::Path::new("/")), "so1sh");
+        let mut explicit_title = None;
+        assert_eq!(
+            apply_title_event(
+                cwd,
+                &mut explicit_title,
+                &ModelEvent::Title("hello".to_owned())
+            ),
+            Some("hello".to_owned())
+        );
+        assert_eq!(
+            apply_title_event(cwd, &mut explicit_title, &ModelEvent::ResetTitle),
+            Some("project".to_owned())
+        );
+        let mut model = Model::new(20, 3);
+        model.feed(b"\x1b]2;hello\x07");
+        assert!(
+            model
+                .take_events()
+                .contains(&ModelEvent::Title("hello".into()))
+        );
+    }
+
+    #[test]
+    fn active_tab_style_has_clearer_contrast_than_inactive_style() {
+        let active = tab_style(true);
+        let inactive = tab_style(false);
+        assert_ne!(active.0, inactive.0);
+        assert_eq!(active.1, [255, 255, 255]);
+        assert!(inactive.1[0] < active.1[0]);
     }
 
     #[test]

@@ -80,7 +80,7 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
   - R4/R3: Lost/Outdated reconfigure+redraw has no bound/backoff and can loop (`main.rs:546-551`).
   - R3-reaped-job-test-zombie-race: the sweep test checks /proc right after drop, but a killed process stays a zombie until its new parent reaps it (`pty.rs:260-267`) — check process state (Z) or wait with a deadline.
   - R2: `vertex_capacity` is a byte size named like a count (`main.rs:420-429`).
-- [ ] **T6 — Input and resize** — also fix R3-input-backspace-gating-and-ctrl (`main.rs:467-491`): input is gated by a local shadow buffer instead of sending keys to the shell; Backspace dropped after history/completion; the encoder must send every key to the PTY.: key-event -> bytes encoder (tested), mouse wheel scrollback, window resize -> PTY + Term.
+- [x] **T6 — Input and resize** (codex-impl) — `90ff2be`: new `keyboard.rs` xterm encoder (text, control, navigation, F-keys with modifiers, DECCKM cursor keys, IME preedit suppression, bracketed-paste helpers); every key goes to the PTY (shadow-buffer gating removed); mouse wheel scrollback; HiDPI ScaleFactorChanged recomputes cell metrics and PTY grid. 45 tests 2/2 (orchestrator) + fmt check. GUI smoke `/tmp/so1term-t6-smoke-final.png`: Ctrl-Z/fg/Ctrl-C job control, Tab completion, `stty size` 22 76. Gaps: `less` navigation not conclusively verified; GUI smoke not repeated after the final Ctrl-F1/IME fixes.
 - [ ] **T7 — Selection and clipboard**: selection model tests, copy/paste, manual GUI smoke.
 - [ ] **T8 — Phase verification**
 

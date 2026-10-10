@@ -40,18 +40,26 @@ byte offsets. Phase 4 consumes those marks.
 - `~/proyectos/so1Shell-refs/wezterm` (semantic zones from OSC 133, mux panes/tabs).
 - `~/proyectos/so1Shell-refs/rio` (splits/tabs), `~/proyectos/so1Shell-refs/herdr` (panes, PTY per pane).
 
+## Decision (T0, user-approved 2026-10-10)
+- Blocks are metadata ranges over one `alacritty_terminal::Term` per pane (WezTerm semantic-zone model), not one VT grid per block. Supersedes planing.md's "una grilla VT por bloque": splitting one PTY stream across emulators breaks cursor addressing, redraws and screen switches.
+- OSC byte offsets only order events; grid anchors come from feeding the model in segments that end at each OSC mark and snapshotting cursor + active screen.
+- Alternate screen: primary grid and blocks preserved; TUI redraws are never anchored to primary rows; a block finalizes at the shell's D mark.
+- Panes/tabs: a Pane owns PTY + Model + observer + blocks + view state; a Tab owns a pure split tree and the active pane; one window and one wgpu renderer draw each pane in its rectangle; PTY wake events carry a pane id.
+- Main risk: anchor stability across reflow/scrollback eviction — T2 is a gate before block UI.
+- Evidence (Codex spike): wezterm-cell/src/lib.rs:176-214, term/src/terminalstate/performer.rs:867-906, term/src/terminalstate/mod.rs:152-158,2822-2871, mux/src/tab.rs:17-130; our osc.rs:23-62, model.rs:56-113.
+
 ## Tasks
-- [ ] **T0 — Design spike** (codex-impl, read-only): study WezTerm semantic zones and mux, our `osc.rs`/`model.rs`; decide block storage (one grid per block, as planing.md suggests from Warp, vs. zones over the shared alacritty grid + scrollback), alternate-screen handling, and pane/tab architecture. Output: decision with tradeoffs, file:line evidence, revised task list.
-- [ ] **T1 — Block model**: OSC 133 events -> blocks (prompt/input/output ranges, exit status, cwd); pure tests incl. missing marks, Ctrl-C cancelled prompts, multiline PS2, no-OSC-133 shells.
-- [ ] **T2 — Block rendering**: separators/gutter, error marking by exit status.
-- [ ] **T3 — Block navigation and copy**: jump between blocks, select a block, copy its output/command.
-- [ ] **T4 — Alternate screen coexistence**: TUI programs do not corrupt blocks.
-- [ ] **T5 — Panes**: splits, focus, one PTY per pane, resize.
-- [ ] **T6 — Tabs**.
-- [ ] **T7 — Phase verification**.
+- [x] **T0 — Design spike** (codex-impl, read-only) — decision above.
+- [ ] **T1 — Block state model**: pure OSC 133/OSC 7 state machine -> block records (prompt/input/output, exit status, cwd); missing marks, cancelled input, multiline input, no-OSC fallback; table-driven tests.
+- [ ] **T2 — Grid checkpoints and anchors** (gate): segment feeding at OSC boundaries, cursor + screen snapshot, anchors rebased through scrolling, resize/reflow and eviction; headless tests (multiple marks per chunk, split sequences, wrapping, scrollback, resize, eviction).
+- [ ] **T3 — Block rendering**: separators, regions, cwd, non-zero exit marking as overlays; pure projection tests.
+- [ ] **T4 — Block navigation and copy**: previous/next prompt, select block, copy command/output; pure tests + GUI smoke.
+- [ ] **T5 — Alternate-screen coexistence**: primary anchors survive TUI enter/exit; block finalizes on D.
+- [ ] **T6 — Pane layout and focus model**: pure split tree, geometry, hit-testing, focus, minimum sizes.
+- [ ] **T7 — PTY panes, tabs and phase verification**: one PTY/model per pane, multi-viewport render, tabs, input routing, resize; GUI smoke with two panes and two tabs.
 
 ## Verification evidence
 _(filled per task)_
 
 ## Progress / Next step
-- Branch created from `main` (`1965232`). Next: T0 on codex-impl.
+- Branch created from `main` (`1965232`). T0 done, decision approved by the user. Next: T1 on codex-impl.

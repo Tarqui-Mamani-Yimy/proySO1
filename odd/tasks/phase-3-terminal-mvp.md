@@ -62,7 +62,11 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
   - R3-osc-esc-termination-divergence: the observer appends ESC+byte to the payload where VTE ends the OSC (ESC followed by non-`\`) and ignores CAN/SUB aborts, so it can report marks the emulator discarded (`osc.rs:82-111`). Match VTE's termination rules; add tests.
   - R3-model-test-target-dir: the so1sh prompt test hardcodes `target/debug` and runs a nested cargo build ignoring CARGO_TARGET_DIR/profile (`model.rs:263-278`).
 - [x] **T5 — Renderer**: draw the visible grid (glyphon), colors, cursor; GPU smoke optional so headless CI stays useful. Also fix (T1 review): when a frame cannot be acquired (Lost/Outdated/Timeout/Occluded) `draw()` never requests another redraw (`crates/terminal/src/main.rs:82-88`).
-- [ ] **T6 — Input and resize**: key-event -> bytes encoder (tested), mouse wheel scrollback, window resize -> PTY + Term.
+- [ ] **T5b — Renderer/event-loop fixes from the T5 review** (codex-impl, after T4b)
+  - R3-child-exit-race-no-retry: shell exit is checked with one non-blocking `try_wait` on the reader's EOF event; if the slave closes before waitpid reports, the window never closes (`main.rs:418-420`). Poll until the status is available (bounded) or wait in a thread.
+  - R3-occluded-redraw-spin: on Timeout/Occluded `draw()` immediately requests another redraw, so a minimized window spins at full CPU reshaping every cell (`main.rs:332-334`). Orchestrator's own T1-review instruction caused this: redraw only on Lost/Outdated (after reconfigure) and on Occluded wait for an occlusion/visibility change.
+  - R3-per-frame-full-reshape: every frame shapes a cosmic-text Buffer per cell (incl. blanks) and allocates a new vertex buffer; every PTY chunk triggers a redraw (`main.rs:247-271`). Shape per line or cache, skip blanks, coalesce redraws.
+- [ ] **T6 — Input and resize** — also fix R3-input-backspace-gating-and-ctrl (`main.rs:467-491`): input is gated by a local shadow buffer instead of sending keys to the shell; Backspace dropped after history/completion; the encoder must send every key to the PTY.: key-event -> bytes encoder (tested), mouse wheel scrollback, window resize -> PTY + Term.
 - [ ] **T7 — Selection and clipboard**: selection model tests, copy/paste, manual GUI smoke.
 - [ ] **T8 — Phase verification**
 
@@ -76,5 +80,6 @@ _(filled per task)_
 ## Progress / Next step
 - T2 done (`a9226d5`): `crates/terminal/src/osc.rs`, absolute end offsets, every-split test (orchestrator checked the expected offsets are derived from sequence lengths, not copied from output). T3 done (`fe39648`): `crates/terminal/src/pty.rs`; 3/3 runs green; tests cover I/O, resize (`stty size`), exit status, drop reaps the child (/proc). Gap closed in T4.
 - T4 done (`f0d652a`): `crates/terminal/src/model.rs` (Term + VTE processor + OSC observer on the same bytes, snapshots, scrollback, events incl. DSR write-back); pure shell selection with tests. 17 terminal tests, 2/2 runs green. T5 done (`cf7dcb6`): so1sh runs live in so1term (PTY + model + glyphon renderer, ANSI colors, bold/inverse, block cursor, resize, close/exit wiring, basic text/Enter/Backspace input, redraw on surface errors). Manual Linux check: screenshot `/tmp/so1term-window3.png` shows the green `$` prompt, cursor and red ANSI text (orchestrator inspected it). Runtime resize not verified (no xdotool/wmctrl). UI nit: leftover strip outside the grid painted gray -> T4b.
+- Native review of T5 (`c601466..6a4ff97`): medium, user granted, approved (review-00815f686849f9fe); 4 WARNINGs -> T5b and T6.
 - T4b running on `codex-impl` (herdr clone in ~/proyectos/so1Shell-refs/herdr as teardown reference).
 - Native review T2..T4 (`35f0b83..c601466`): medium, user granted, approved (review-348ac442dcb7b106); 4 WARNINGs -> T4b. Pending user decision: install rustup targets for Windows/macOS compile checks.

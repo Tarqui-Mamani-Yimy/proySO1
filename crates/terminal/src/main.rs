@@ -459,11 +459,12 @@ fn key_from_winit<'a>(
         }),
         Key::Named(NamedKey::CapsLock) => TerminalKey::Modifier(ModifierKey::CapsLock),
         Key::Named(NamedKey::NumLock) => TerminalKey::Modifier(ModifierKey::NumLock),
+        Key::Named(NamedKey::Space) => TerminalKey::Text(text.unwrap_or(" ")),
         Key::Character(character) => TerminalKey::Text(
             text.filter(|value| !value.is_empty())
                 .unwrap_or(character.as_str()),
         ),
-        _ => return None,
+        _ => TerminalKey::Text(text.filter(|value| !value.is_empty())?),
     };
     let mut input = KeyInput::new(terminal_key);
     input.associated_text = text;
@@ -481,6 +482,9 @@ fn key_from_winit<'a>(
             }),
             _ => None,
         };
+        if matches!(key, Key::Named(NamedKey::Space)) {
+            input.key_code = Some(32);
+        }
     }
     Some(input)
 }
@@ -2320,13 +2324,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockShortcut, GlyphKey, KeyEventKind, PaneAction, TabAction, TerminalKey,
+        BlockShortcut, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction, TabAction, TerminalKey,
         apply_title_event, block_marker_bounds, block_shortcut, close_pane_lifecycle,
-        create_tab_with, cwd_basename_title, glyph_key_requires_reshape, invalidate_glyph_cache,
-        key_from_winit, modifier_event_state, overlay_vertex_range, pane_action, pane_cell_at,
-        pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title, route_block_shortcut,
-        selection_target, tab_action_changes_geometry, tab_bar_height, tab_content_rect,
-        tab_index_at, tab_shortcut, tab_style,
+        create_tab_with, cwd_basename_title, encode_key_with_flags, glyph_key_requires_reshape,
+        invalidate_glyph_cache, key_from_winit, modifier_event_state, overlay_vertex_range,
+        pane_action, pane_cell_at, pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title,
+        route_block_shortcut, selection_target, tab_action_changes_geometry, tab_bar_height,
+        tab_content_rect, tab_index_at, tab_shortcut, tab_style,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
@@ -2437,6 +2441,40 @@ mod tests {
         .unwrap();
         assert_eq!(input.key_code, Some(u32::from('ф')));
         assert_eq!(input.base_layout_key_code, Some(u32::from('a')));
+    }
+
+    #[test]
+    fn named_text_keys_keep_legacy_and_kitty_text() {
+        let physical = winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space);
+        let encode = |input, flags| {
+            encode_key_with_flags(
+                input,
+                Modifiers::default(),
+                false,
+                flags,
+                KeyEventKind::Press,
+            )
+            .unwrap()
+        };
+        let space = Key::Named(NamedKey::Space);
+        let legacy = key_from_winit(&space, Some(" "), physical, false).unwrap();
+        assert_eq!(encode(legacy, KeyboardFlags::empty()), b" ");
+
+        let kitty = key_from_winit(&space, Some(" "), physical, true).unwrap();
+        assert_eq!(kitty.key_code, Some(32));
+        assert_eq!(encode(kitty, KeyboardFlags::DISAMBIGUATE), b" ");
+        assert_eq!(encode(kitty, KeyboardFlags::REPORT_ALL), b"\x1b[32u");
+
+        let unmapped = Key::Named(NamedKey::Help);
+        let input = key_from_winit(
+            &unmapped,
+            Some("z"),
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyZ),
+            true,
+        )
+        .unwrap();
+        assert_eq!(input.key, TerminalKey::Text("z"));
+        assert_eq!(encode(input, KeyboardFlags::REPORT_ALL), b"\x1b[122u");
     }
 
     #[test]

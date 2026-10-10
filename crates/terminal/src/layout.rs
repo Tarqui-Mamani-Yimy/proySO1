@@ -1,5 +1,16 @@
 //! Pure pane geometry, split-tree and tab state for the terminal UI.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_id(counter: &AtomicU64) -> u64 {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("terminal pane or tab id space exhausted")
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PaneId(pub u64);
 
@@ -40,11 +51,11 @@ impl Rect {
         }
     }
 
-    fn right(self) -> u32 {
+    pub fn right(self) -> u32 {
         self.x.saturating_add(self.width)
     }
 
-    fn bottom(self) -> u32 {
+    pub fn bottom(self) -> u32 {
         self.y.saturating_add(self.height)
     }
 }
@@ -121,7 +132,6 @@ struct LayoutConfig {
 #[derive(Clone, Debug)]
 pub struct LayoutTree {
     root: Node,
-    next_pane: u64,
     config: LayoutConfig,
 }
 
@@ -134,8 +144,7 @@ impl LayoutTree {
         min_rows: u32,
     ) -> Self {
         Self {
-            root: Node::Leaf(PaneId(1)),
-            next_pane: 2,
+            root: Node::Leaf(PaneId(allocate_id(&NEXT_PANE_ID))),
             config: LayoutConfig {
                 window,
                 cell: CellSize::new(cell.width, cell.height),
@@ -156,8 +165,15 @@ impl LayoutTree {
         panes
     }
 
+    /// Replace the window geometry. Layout is derived on demand, so every
+    /// query immediately revalidates minimums and hidden leaves for the new size.
     pub fn resize_window(&mut self, rect: Rect) {
         self.config.window = rect;
+    }
+
+    /// Update cell metrics after a DPI/font change and recompute future layouts.
+    pub fn resize_cell_size(&mut self, cell: CellSize) {
+        self.config.cell = CellSize::new(cell.width, cell.height);
     }
 
     pub fn split(&mut self, focused: PaneId, direction: Direction) -> Result<PaneId, SplitError> {
@@ -170,11 +186,10 @@ impl LayoutTree {
             return Err(SplitError::MinimumSize);
         }
 
-        let created = PaneId(self.next_pane);
+        let created = PaneId(allocate_id(&NEXT_PANE_ID));
         if !replace_leaf(&mut self.root, focused, direction, created) {
             return Err(SplitError::PaneNotFound);
         }
-        self.next_pane = self.next_pane.saturating_add(1);
         Ok(created)
     }
 
@@ -209,6 +224,60 @@ impl LayoutTree {
         let mut result = Vec::new();
         self.layout_node(&self.root, self.config.window, focused, &mut result);
         result
+    }
+
+    /// Return divider rectangles for visible split nodes only. This avoids
+    /// inferring dividers from pane pairs, which can mistake nested gaps for
+    /// large dividers that cover unrelated panes.
+    pub fn divider_rects(&self, focused: PaneId) -> Vec<Rect> {
+        let mut result = Vec::new();
+        self.collect_dividers(&self.root, self.config.window, focused, &mut result);
+        result
+    }
+
+    fn collect_dividers(&self, node: &Node, rect: Rect, focused: PaneId, result: &mut Vec<Rect>) {
+        if !self.fits(node, rect) {
+            let Node::Split { first, second, .. } = node else {
+                return;
+            };
+            let first_has_focus = contains(first, focused);
+            let second_has_focus = contains(second, focused);
+            let visible = if first_has_focus && self.fits(first, rect) {
+                Some(first.as_ref())
+            } else if second_has_focus && self.fits(second, rect) {
+                Some(second.as_ref())
+            } else if self.fits(first, rect) {
+                Some(first.as_ref())
+            } else if self.fits(second, rect) {
+                Some(second.as_ref())
+            } else {
+                None
+            };
+            if let Some(visible) = visible {
+                self.collect_dividers(visible, rect, focused, result);
+            }
+            return;
+        }
+        let Node::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return;
+        };
+        let (first_rect, second_rect) = self.child_rects(*direction, *ratio, first, second, rect);
+        result.push(match direction {
+            Direction::Horizontal => {
+                Rect::new(first_rect.right(), rect.y, self.config.divider, rect.height)
+            }
+            Direction::Vertical => {
+                Rect::new(rect.x, first_rect.bottom(), rect.width, self.config.divider)
+            }
+        });
+        self.collect_dividers(first, first_rect, focused, result);
+        self.collect_dividers(second, second_rect, focused, result);
     }
 
     fn layout_node(&self, node: &Node, rect: Rect, focused: PaneId, result: &mut Vec<PaneLayout>) {
@@ -700,10 +769,11 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn new(id: TabId, tree: LayoutTree) -> Self {
+    /// Create a tab around an existing layout tree.
+    pub fn from_tree(tree: LayoutTree) -> Self {
         let active_pane = tree.root_pane();
         Self {
-            id,
+            id: TabId(allocate_id(&NEXT_TAB_ID)),
             tree,
             active_pane,
         }
@@ -762,7 +832,6 @@ impl Tab {
 pub struct TabSet {
     tabs: Vec<Tab>,
     active_index: usize,
-    next_tab: u64,
     template: LayoutConfig,
 }
 
@@ -783,9 +852,8 @@ impl TabSet {
         };
         let tree = LayoutTree::new(window, cell, divider_width, min_cols, min_rows);
         Self {
-            tabs: vec![Tab::new(TabId(1), tree)],
+            tabs: vec![Tab::from_tree(tree)],
             active_index: 0,
-            next_tab: 2,
             template,
         }
     }
@@ -811,8 +879,6 @@ impl TabSet {
     }
 
     pub fn add_tab(&mut self) -> TabId {
-        let id = TabId(self.next_tab);
-        self.next_tab = self.next_tab.saturating_add(1);
         let config = self.template;
         let tree = LayoutTree::new(
             config.window,
@@ -821,7 +887,9 @@ impl TabSet {
             config.min_cols,
             config.min_rows,
         );
-        self.tabs.push(Tab::new(id, tree));
+        let tab = Tab::from_tree(tree);
+        let id = tab.id();
+        self.tabs.push(tab);
         self.active_index = self.tabs.len() - 1;
         id
     }
@@ -917,6 +985,39 @@ mod tests {
     }
 
     #[test]
+    fn pane_ids_are_unique_across_independent_trees_and_tabs() {
+        let first_tree =
+            LayoutTree::new(Rect::new(0, 0, 300, 100), CellSize::new(10, 10), 10, 4, 2);
+        let second_tree =
+            LayoutTree::new(Rect::new(0, 0, 300, 100), CellSize::new(10, 10), 10, 4, 2);
+        assert_ne!(first_tree.root_pane(), second_tree.root_pane());
+
+        let mut tabs = TabSet::new(Rect::new(0, 0, 300, 100), CellSize::new(10, 10), 10, 4, 2);
+        let first = tabs.active().unwrap().active_pane();
+        tabs.add_tab();
+        let second = tabs.active().unwrap().active_pane();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn resizing_recomputes_visible_and_hidden_panes_against_minimums() {
+        let mut tree = LayoutTree::new(Rect::new(0, 0, 300, 100), CellSize::new(10, 10), 10, 4, 2);
+        let first = tree.root_pane();
+        let second = tree.split(first, Direction::Horizontal).unwrap();
+
+        tree.resize_window(Rect::new(0, 0, 70, 40));
+        let shrunk = tree.layout(second);
+        assert!(!visible(&shrunk, second).hidden);
+        assert!(visible(&shrunk, first).hidden);
+
+        tree.resize_window(Rect::new(0, 0, 300, 100));
+        let expanded = tree.layout(second);
+        assert!(!visible(&expanded, first).hidden);
+        assert!(!visible(&expanded, second).hidden);
+        assert!(expanded.iter().all(|pane| pane.cols >= 4 && pane.rows >= 2));
+    }
+
+    #[test]
     fn divider_is_not_hit_tested_as_a_pane() {
         let mut tree = LayoutTree::new(Rect::new(0, 0, 300, 100), CellSize::new(10, 10), 10, 4, 2);
         let first = tree.root_pane();
@@ -925,6 +1026,18 @@ mod tests {
         assert_eq!(tree.hit_test(145, 20), None);
         assert_eq!(tree.hit_test(250, 20), Some(second));
         assert_eq!(tree.hit_test(20, 101), None);
+    }
+
+    #[test]
+    fn divider_geometry_comes_only_from_actual_split_nodes() {
+        let mut tree = tree();
+        let first = tree.root_pane();
+        tree.split(first, Direction::Horizontal).unwrap();
+        tree.split(first, Direction::Vertical).unwrap();
+        assert_eq!(
+            tree.divider_rects(first),
+            vec![Rect::new(490, 0, 10, 600), Rect::new(0, 290, 490, 10)]
+        );
     }
 
     #[test]

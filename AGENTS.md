@@ -46,7 +46,7 @@ crates/shell/
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/terminal/
-  src/main.rs     so1term window/event loop, PTY wiring, and GPU renderer
+  src/main.rs     so1term window/event loop, per-pane PTYs/models, input routing, and GPU renderer
   src/lib.rs      Public module declarations, shell selection, and surface helpers
   src/layout.rs   Pure pane split tree, pixel/cell geometry, focus, and tab state
   src/blocks.rs   OSC 133 command-block state and grid anchors
@@ -311,9 +311,16 @@ shrink, the focused branch is kept visible if it meets minimum size, otherwise
 the first fitting branch is shown; panes that cannot fit are marked hidden, and
 if the whole window is below minimum all panes are hidden. Arrow focus chooses
 the smallest edge gap, then greatest perpendicular overlap, nearest
-perpendicular center, top/left position, and PaneId. Pane IDs increase within a
-tree. Tab navigation wraps; closing the active tab selects the tab now occupying
+perpendicular center, top/left position, and PaneId. Pane IDs are globally
+monotonic across trees. Tab navigation wraps; closing the active tab selects the tab now occupying
 its index, or the previous final tab when the removed tab was last.
+
+In the current single-tab window, each pane owns one PTY, VT `Model`, view
+state, wakeup gate, and glyph cache; PTY output notifications carry its globally
+unique `PaneId`. `Ctrl+Shift+D` splits right, `Ctrl+Shift+E` splits down,
+`Ctrl+Shift+W` closes the focused pane, and `Ctrl+Alt+Arrow` moves focus by
+geometry. On macOS, use `Cmd+Shift+D/E/W` and `Cmd+Option+Arrow`. These bindings
+are reserved by so1term and do not replace block navigation (`Ctrl+Shift+Up/Down`).
 
 ### Embedder Builtins
 

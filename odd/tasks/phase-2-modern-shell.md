@@ -107,11 +107,12 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - Commands (builtins, functions, embedder builtins, PATH executables), file paths (quoting spaces), `$VAR` names.
 - [x] **T7 — Hints and syntax highlighting** (codex-impl)
   - History-based ghost-text hints; highlighting via the epsh lexer (commands found/not found, strings, operators).
-- [ ] **T6c — Completion follow-ups from the T5-T7 review** (codex-impl, RUNNING)
+- [x] **T6c — Completion follow-ups from the T5-T7 review** (codex-impl) — `354ff74` symlinked/slash-path executables, `0a2c4ba` integration write failures no longer end the REPL (committed by the user).
   - R3-path-symlink-executables-dropped: `executable_names` uses `DirEntry::metadata`, which does not follow symlinks, so symlinked executables in PATH (python3, alternatives, Homebrew/Nix/asdf shims) never complete and — through the shared cache — are highlighted as unknown (`completion.rs:165-168`).
   - R3-path-prefixed-command-completion-empty: a command-position prefix containing `/` (`./scr<Tab>`, `/usr/bin/py<Tab>`) offers nothing; it must fall back to executable file completion (`completion.rs:132-136`).
   - Suggestions: highlighter byte/char offset unit test (`highlighter.rs:32-37`); a terminal write failure of integration marks should not end the REPL (`repl.rs:230-231`); per-prompt PATH scan cost (`repl.rs:225`).
-- [ ] **T8 — Phase verification** (fresh Claude verifier subagent)
+- [x] **T8 — Phase verification** — user stopped the Claude verifier and assigned it to Codex (note: not independent, Codex wrote the phase). Workspace 621 tests green twice; make ci only regression-37; PTY smoke a,b,c,d,f,h PASS. (e) OSC 7 `localhost`: false alarm, this machine's hostname is `localhost` (orchestrator checked hostname/uname -n/gethostname). (g) real defect -> T8b.
+- [ ] **T8b — `SO1SH_HIGHLIGHT=0` still emits SGR** (codex-impl, RUNNING): reedline falls back to its default highlighter (`\x1b[37m`) when ours is skipped (`repl.rs:207-212`); install a plain no-style highlighter.
 
 ## Verification evidence
 - T0 (`09567a4` runtime errors omit unknown `0:0` positions; `fb0693b` clear REPL failure marker on handled errors, remove dead WIFSTOPPED checks; `9b082b2` PTY test: slash-less `SO1SH_RC` resolves in cwd — Codex refuted the T5 review claim of PATH search with evidence `builtins.rs:418`). Workspace 557 green (orchestrator spot-check).

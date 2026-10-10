@@ -50,7 +50,7 @@ byte offsets. Phase 4 consumes those marks.
 
 ## Tasks
 - [x] **T0 — Design spike** (codex-impl, read-only) — decision above.
-- [ ] **T1 — Block state model**: pure OSC 133/OSC 7 state machine -> block records (prompt/input/output, exit status, cwd); missing marks, cancelled input, multiline input, no-OSC fallback; table-driven tests.
+- [x] **T1 — Block state model** — `9417532` (codex-impl, delegated): `blocks.rs` BlockList consumes observer events in Model::feed; states Prompt/Input/Running/Finished/Cancelled; cancel on A after A/B; tolerant of missing/duplicate/malformed marks; no blocks without OSC 133; GridAnchors slots for T2. RED observed (7 failures, no-op consumer); 83+2 tests 2/2 (orchestrator), fmt/clippy clean. Known follow-up: block list unbounded (eviction in T2). Scope: pure OSC 133/OSC 7 state machine -> block records (prompt/input/output, exit status, cwd); missing marks, cancelled input, multiline input, no-OSC fallback; table-driven tests.
 - [ ] **T2 — Grid checkpoints and anchors** (gate): segment feeding at OSC boundaries, cursor + screen snapshot, anchors rebased through scrolling, resize/reflow and eviction; headless tests (multiple marks per chunk, split sequences, wrapping, scrollback, resize, eviction).
 - [ ] **T3 — Block rendering**: separators, regions, cwd, non-zero exit marking as overlays; pure projection tests.
 - [ ] **T4 — Block navigation and copy**: previous/next prompt, select block, copy command/output; pure tests + GUI smoke.
@@ -62,4 +62,4 @@ byte offsets. Phase 4 consumes those marks.
 _(filled per task)_
 
 ## Progress / Next step
-- Branch created from `main` (`1965232`). T0 done, decision approved by the user. Next: T1 on codex-impl.
+- Branch created from `main` (`1965232`). T0 done, decision approved by the user. T1 done. Next: T2 (anchor gate).

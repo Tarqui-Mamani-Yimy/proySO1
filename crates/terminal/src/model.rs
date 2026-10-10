@@ -59,6 +59,7 @@ pub struct Model {
     listener: Listener,
     osc: crate::osc::Observer,
     selection_anchor: Option<Point>,
+    selection_anchor_is_start: bool,
     selection_kind: Option<SelectionType>,
     selection_snapshot: Option<String>,
 }
@@ -97,11 +98,17 @@ impl Model {
             listener,
             osc: crate::osc::Observer::new(),
             selection_anchor: None,
+            selection_anchor_is_start: true,
             selection_kind: None,
             selection_snapshot: None,
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<crate::osc::ObservedEvent> {
+        let previous_range = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
         let events = self.osc.feed(bytes);
         self.processor.advance(&mut self.term, bytes);
         if !bytes.is_empty() && self.term.selection.is_some() {
@@ -121,8 +128,28 @@ impl Model {
                     })
                 }
             };
+            if let (Some(previous), Some(current), Some(anchor)) =
+                (previous_range, range, self.selection_anchor.as_mut())
+            {
+                let previous_anchor_line = if self.selection_anchor_is_start {
+                    previous.start.line
+                } else {
+                    previous.end.line
+                };
+                let current_anchor_line = if self.selection_anchor_is_start {
+                    current.start.line
+                } else {
+                    current.end.line
+                };
+                anchor.line += current_anchor_line - previous_anchor_line;
+            }
+            let partially_offscreen = range.is_some_and(|range| {
+                selection_outside_viewport(range, offset, self.term.grid().screen_lines())
+            });
             self.term.reset_damage();
-            if intersects_selection && self.term.selection_to_string() != self.selection_snapshot {
+            if (intersects_selection || partially_offscreen)
+                && self.term.selection_to_string() != self.selection_snapshot
+            {
                 self.clear_selection();
             }
         }
@@ -166,6 +193,7 @@ impl Model {
     pub fn begin_selection(&mut self, column: usize, row: usize, kind: SelectionType) {
         let point = self.selection_point(column, row);
         self.selection_anchor = Some(point);
+        self.selection_anchor_is_start = true;
         self.selection_kind = Some(kind);
         self.term.selection = Some(Selection::new(kind, point, Side::Left));
         self.term.reset_damage();
@@ -174,6 +202,7 @@ impl Model {
     pub fn extend_selection(&mut self, column: usize, row: usize) {
         let point = self.selection_point(column, row);
         if let (Some(anchor), Some(kind)) = (self.selection_anchor, self.selection_kind) {
+            self.selection_anchor_is_start = anchor <= point;
             let (anchor_side, point_side) = if point < anchor {
                 (Side::Right, Side::Left)
             } else {
@@ -188,6 +217,7 @@ impl Model {
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
         self.selection_anchor = None;
+        self.selection_anchor_is_start = true;
         self.selection_kind = None;
         self.selection_snapshot = None;
     }
@@ -286,6 +316,16 @@ fn damage_intersects_selection(
         usize::MAX
     };
     damage.left <= right && damage.right >= left
+}
+
+fn selection_outside_viewport(
+    selection: SelectionRange,
+    display_offset: usize,
+    screen_lines: usize,
+) -> bool {
+    let first_visible_line = Line(-(display_offset as i32));
+    let last_visible_line = Line(screen_lines as i32 - 1 - display_offset as i32);
+    selection.start.line < first_visible_line || selection.end.line > last_visible_line
 }
 
 fn visible(cell: &Cell) -> VisibleCell {
@@ -416,7 +456,7 @@ mod tests {
         model.extend_selection(4, 0);
         assert_eq!(model.selection_text().as_deref(), Some("alpha"));
         model.feed(b"\x1b[1;1H!\x1b[K");
-        assert_eq!(model.selection_text(), None);
+        assert!(model.term.selection.is_none());
     }
 
     #[test]
@@ -473,6 +513,40 @@ mod tests {
             0,
             range
         ));
+    }
+
+    #[test]
+    fn selection_invalidates_when_its_live_line_changes_offscreen() {
+        let mut model = Model::new(12, 2);
+        model.feed(b"alpha\r\nbeta\r\ngamma\r\ndelta");
+        model.begin_selection(0, 0, SelectionType::Simple);
+        model.extend_selection(4, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("gamma"));
+
+        model.scroll_up(2);
+        assert!(model.display_offset() > 0);
+        assert_eq!(model.selection_text().as_deref(), Some("gamma"));
+        model.term.reset_damage();
+        model.feed(b"\x1b[1;1HZZ");
+
+        assert!(model.term.selection.is_none());
+    }
+
+    #[test]
+    fn selection_anchor_tracks_its_line_when_output_scrolls_the_grid() {
+        let mut model = Model::new(12, 2);
+        model.feed(b"alpha\r\nbeta");
+        model.begin_selection(0, 0, SelectionType::Simple);
+        model.extend_selection(4, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("alpha"));
+
+        model.feed(b"\r\ngamma");
+        model.extend_selection(4, 1);
+
+        assert_eq!(
+            model.selection_text().as_deref(),
+            Some("alpha\nbeta\ngamma")
+        );
     }
     #[test]
     fn cursor_shape_osc_and_dsr_writeback_are_exposed() {

@@ -61,7 +61,7 @@ pub fn encode_key(key: Key<'_>, modifiers: Modifiers, application_cursor: bool) 
                 b'\\' | b'4' => 0x1c,
                 b']' | b'5' => 0x1d,
                 b'^' | b'6' => 0x1e,
-                b'_' | b'7' => 0x1f,
+                b'/' | b'_' | b'7' => 0x1f,
                 b'?' | b'8' => 0x7f,
                 b'A'..=b'Z' => b - b'A' + 1,
                 b'a'..=b'z' => b - b'a' + 1,
@@ -300,6 +300,18 @@ mod tests {
                 "Ctrl-{text:?}"
             );
         }
+        assert_eq!(
+            encode_key(
+                Key::Text("/"),
+                Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            Some(vec![0x1f]),
+            "Ctrl+/ is the xterm alias for Ctrl+_"
+        );
     }
 
     #[test]

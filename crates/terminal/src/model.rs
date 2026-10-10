@@ -15,6 +15,14 @@ use alacritty_terminal::{
 };
 use vte::ansi::{Processor, Rgb};
 
+macro_rules! delegate_handler {
+    ($($method:ident($($name:ident: $ty:ty),*);)*) => {
+        $(fn $method(&mut self, $($name: $ty),*) {
+            self.term.$method($($name),*);
+        })*
+    };
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
     Title(String),
@@ -59,10 +67,193 @@ pub struct Model {
     listener: Listener,
     osc: crate::osc::Observer,
     blocks: crate::blocks::BlockList,
+    /// Total input bytes already consumed by the observer; maps absolute OSC offsets to chunks.
+    stream_bytes_seen: u64,
+    /// Maximum primary-grid history rows retained by alacritty_terminal.
+    scrollback_limit: usize,
+    /// Number of primary history rows actually evicted since the model was created.
+    evicted_rows: u64,
+    /// Current DECSTBM region, tracked because Term does not expose it.
+    scroll_region: std::ops::Range<usize>,
     selection_anchor: Option<Point>,
     selection_anchor_is_start: bool,
     selection_kind: Option<SelectionType>,
     selection_snapshot: Option<String>,
+}
+
+/// VTE handler proxy that delegates every operation to Term while observing
+/// only operations which can push primary rows out of its bounded history.
+struct EvictionTracker<'a> {
+    term: &'a mut Term<Listener>,
+    evicted_rows: &'a mut u64,
+    history_limit: usize,
+    region: std::ops::Range<usize>,
+}
+
+impl EvictionTracker<'_> {
+    fn is_full_primary_region(&self) -> bool {
+        self.region.start == 0
+            && self.region.end == self.term.screen_lines()
+            && !self
+                .term
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
+    }
+
+    fn record_eviction(&mut self, rows: usize) {
+        if rows == 0 || !self.is_full_primary_region() {
+            return;
+        }
+        let history = self.term.grid().history_size();
+        self.record_eviction_from(history, rows);
+    }
+
+    fn record_eviction_from(&mut self, history: usize, rows: usize) {
+        let evicted = (history + rows)
+            .saturating_sub(self.history_limit)
+            .min(rows);
+        *self.evicted_rows = self.evicted_rows.saturating_add(evicted as u64);
+    }
+
+    fn linefeed_scrolls_primary(&self) -> bool {
+        self.is_full_primary_region()
+            && self.term.grid().cursor.point.line.0 + 1 == self.region.end as i32
+    }
+}
+
+impl vte::ansi::Handler for EvictionTracker<'_> {
+    fn input(&mut self, character: char) {
+        let cursor = &self.term.grid().cursor;
+        let pending_wrap = cursor.input_needs_wrap;
+        let at_last_column = cursor.point.column.0 + 1 == self.term.columns();
+        let bottom_row = cursor.point.line.0 + 1 == self.region.end as i32;
+        let can_wrap = self.is_full_primary_region()
+            && bottom_row
+            && self
+                .term
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::LINE_WRAP);
+        let candidate_line = cursor.point.line;
+        let candidate_column = cursor.point.column;
+        let history_before = self.term.grid().history_size();
+        self.term.input(character);
+        let wide_char_wrapped = can_wrap
+            && at_last_column
+            && self.term.grid()[candidate_line][candidate_column]
+                .flags
+                .contains(Flags::LEADING_WIDE_CHAR_SPACER);
+        if can_wrap && (pending_wrap || wide_char_wrapped) {
+            self.record_eviction_from(history_before, 1);
+        }
+    }
+
+    fn linefeed(&mut self) {
+        if self.linefeed_scrolls_primary() {
+            self.record_eviction(1);
+        }
+        self.term.linefeed();
+    }
+
+    fn newline(&mut self) {
+        if self.linefeed_scrolls_primary() {
+            self.record_eviction(1);
+        }
+        self.term.newline();
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        let bounded = rows.min(self.region.end.saturating_sub(self.region.start));
+        self.record_eviction(bounded);
+        self.term.scroll_up(rows);
+    }
+
+    fn delete_lines(&mut self, rows: usize) {
+        if self.is_full_primary_region() && self.term.grid().cursor.point.line.0 == 0 {
+            self.record_eviction(rows.min(self.term.screen_lines()));
+        }
+        self.term.delete_lines(rows);
+    }
+
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        let bottom = bottom.unwrap_or_else(|| self.term.screen_lines());
+        if top < bottom {
+            self.region = top.saturating_sub(1).min(self.term.screen_lines())
+                ..bottom.min(self.term.screen_lines());
+        }
+        self.term.set_scrolling_region(top, Some(bottom));
+    }
+
+    fn reset_state(&mut self) {
+        self.term.reset_state();
+        self.region = 0..self.term.screen_lines();
+    }
+
+    delegate_handler! {
+        set_title(arg0: Option<String>);
+        set_cursor_style(arg0: Option<vte::ansi::CursorStyle>);
+        set_cursor_shape(_shape: vte::ansi::CursorShape);
+        goto(_line: i32, _col: usize);
+        goto_line(_line: i32);
+        goto_col(_col: usize);
+        insert_blank(arg0: usize);
+        move_up(arg0: usize);
+        move_down(arg0: usize);
+        identify_terminal(_intermediate: Option<char>);
+        device_status(arg0: usize);
+        move_forward(_col: usize);
+        move_backward(_col: usize);
+        move_down_and_cr(_row: usize);
+        move_up_and_cr(_row: usize);
+        put_tab(_count: u16);
+        backspace();
+        carriage_return();
+        bell();
+        substitute();
+        set_horizontal_tabstop();
+        scroll_down(arg0: usize);
+        insert_blank_lines(arg0: usize);
+        erase_chars(arg0: usize);
+        delete_chars(arg0: usize);
+        move_backward_tabs(_count: u16);
+        move_forward_tabs(_count: u16);
+        save_cursor_position();
+        restore_cursor_position();
+        clear_line(_mode: vte::ansi::LineClearMode);
+        clear_screen(_mode: vte::ansi::ClearMode);
+        clear_tabs(_mode: vte::ansi::TabulationClearMode);
+        set_tabs(_interval: u16);
+        reverse_index();
+        terminal_attribute(_attr: vte::ansi::Attr);
+        set_mode(_mode: vte::ansi::Mode);
+        unset_mode(_mode: vte::ansi::Mode);
+        report_mode(_mode: vte::ansi::Mode);
+        set_private_mode(_mode: vte::ansi::PrivateMode);
+        unset_private_mode(_mode: vte::ansi::PrivateMode);
+        report_private_mode(_mode: vte::ansi::PrivateMode);
+        set_keypad_application_mode();
+        unset_keypad_application_mode();
+        set_active_charset(arg0: vte::ansi::CharsetIndex);
+        configure_charset(arg0: vte::ansi::CharsetIndex, arg1: vte::ansi::StandardCharset);
+        set_color(arg0: usize, arg1: vte::ansi::Rgb);
+        dynamic_color_sequence(arg0: String, arg1: usize, arg2: &str);
+        reset_color(arg0: usize);
+        clipboard_store(arg0: u8, arg1: &[u8]);
+        clipboard_load(arg0: u8, arg1: &str);
+        decaln();
+        push_title();
+        pop_title();
+        text_area_size_pixels();
+        text_area_size_chars();
+        set_hyperlink(arg0: Option<vte::ansi::Hyperlink>);
+        set_mouse_cursor_icon(arg0: winit::window::CursorIcon);
+        report_keyboard_mode();
+        push_keyboard_mode(_mode: vte::ansi::KeyboardModes);
+        pop_keyboard_modes(_to_pop: u16);
+        set_keyboard_mode(_mode: vte::ansi::KeyboardModes, _behavior: vte::ansi::KeyboardModesApplyBehavior);
+        set_modify_other_keys(_mode: vte::ansi::ModifyOtherKeys);
+        report_modify_other_keys();
+        set_scp(_char_path: vte::ansi::ScpCharPath, _update_mode: vte::ansi::ScpUpdateMode);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -84,9 +275,17 @@ impl Dimensions for Size {
 
 impl Model {
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::with_scrollback_limit(cols, rows, 10_000)
+    }
+
+    fn with_scrollback_limit(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         let listener = Listener::default();
+        let config = Config {
+            scrolling_history: scrollback_limit,
+            ..Config::default()
+        };
         let term = Term::new(
-            Config::default(),
+            config,
             &Size {
                 cols: cols.max(1),
                 rows: rows.max(1),
@@ -99,6 +298,10 @@ impl Model {
             listener,
             osc: crate::osc::Observer::new(),
             blocks: crate::blocks::BlockList::default(),
+            stream_bytes_seen: 0,
+            scrollback_limit,
+            evicted_rows: 0,
+            scroll_region: 0..rows.max(1),
             selection_anchor: None,
             selection_anchor_is_start: true,
             selection_kind: None,
@@ -106,14 +309,34 @@ impl Model {
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<crate::osc::ObservedEvent> {
-        let previous_range = self
-            .term
-            .selection
-            .as_ref()
-            .and_then(|selection| selection.to_range(&self.term));
+        let mut selected_damage = false;
+        let mut full_damage = false;
         let events = self.osc.feed(bytes);
-        self.blocks.consume(&events);
-        self.processor.advance(&mut self.term, bytes);
+        let stream_start = self.stream_bytes_seen;
+        let mut consumed = 0usize;
+        let mut offscreen_mutation = false;
+        for event in &events {
+            let end = event
+                .end_offset
+                .saturating_sub(stream_start)
+                .min(bytes.len() as u64) as usize;
+            let end = end.max(consumed);
+            let (intersects, full, mutation) = self.advance_segment(&bytes[consumed..end]);
+            selected_damage |= intersects;
+            full_damage |= full;
+            offscreen_mutation |= mutation;
+            consumed = end;
+
+            let anchor = matches!(&event.event, crate::osc::Event::SemanticMark(_))
+                .then(|| self.grid_anchor());
+            self.blocks.consume_event(event, anchor);
+        }
+        let (intersects, full, mutation) = self.advance_segment(&bytes[consumed..]);
+        selected_damage |= intersects;
+        full_damage |= full;
+        offscreen_mutation |= mutation;
+        self.stream_bytes_seen = self.stream_bytes_seen.saturating_add(bytes.len() as u64);
+
         if !bytes.is_empty() && self.term.selection.is_some() {
             let range = self
                 .term
@@ -121,42 +344,102 @@ impl Model {
                 .as_ref()
                 .and_then(|selection| selection.to_range(&self.term));
             let offset = self.term.grid().display_offset();
-            let intersects_selection = match self.term.damage() {
-                alacritty_terminal::term::TermDamage::Full => true,
-                alacritty_terminal::term::TermDamage::Partial(damage) => {
-                    range.is_some_and(|range| {
-                        damage
-                            .into_iter()
-                            .any(|line| damage_intersects_selection(line, offset, range))
-                    })
-                }
-            };
-            if let (Some(previous), Some(current), Some(anchor)) =
-                (previous_range, range, self.selection_anchor.as_mut())
-            {
-                let previous_anchor_line = if self.selection_anchor_is_start {
-                    previous.start.line
-                } else {
-                    previous.end.line
-                };
-                let current_anchor_line = if self.selection_anchor_is_start {
-                    current.start.line
-                } else {
-                    current.end.line
-                };
-                anchor.line += current_anchor_line - previous_anchor_line;
-            }
             let partially_offscreen = range.is_some_and(|range| {
                 selection_outside_viewport(range, offset, self.term.grid().screen_lines())
             });
-            self.term.reset_damage();
-            if (intersects_selection || partially_offscreen)
+            if (selected_damage || (partially_offscreen && (full_damage || offscreen_mutation)))
                 && self.term.selection_to_string() != self.selection_snapshot
             {
                 self.clear_selection();
             }
+        } else if !bytes.is_empty() {
+            self.term.reset_damage();
         }
         events
+    }
+
+    fn advance_segment(&mut self, bytes: &[u8]) -> (bool, bool, bool) {
+        if bytes.is_empty() {
+            return (false, false, false);
+        }
+        let previous_range = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
+        let evicted_before = self.evicted_rows;
+        let mut tracker = EvictionTracker {
+            term: &mut self.term,
+            evicted_rows: &mut self.evicted_rows,
+            history_limit: self.scrollback_limit,
+            region: self.scroll_region.clone(),
+        };
+        self.processor.advance(&mut tracker, bytes);
+        self.scroll_region = tracker.region;
+        if self.evicted_rows > evicted_before {
+            self.blocks.expire_primary_anchors_before(self.evicted_rows);
+        }
+        let range = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
+        if let (Some(previous), Some(current), Some(anchor)) =
+            (previous_range, range, self.selection_anchor.as_mut())
+        {
+            let previous_anchor_line = if self.selection_anchor_is_start {
+                previous.start.line
+            } else {
+                previous.end.line
+            };
+            let current_anchor_line = if self.selection_anchor_is_start {
+                current.start.line
+            } else {
+                current.end.line
+            };
+            anchor.line += current_anchor_line - previous_anchor_line;
+        }
+        let offset = self.term.grid().display_offset();
+        // Alacritty filters damage in history while scrolled away from the
+        // bottom. For that case, compare selected text only when this segment
+        // contains terminal data outside OSC metadata, not for every feed.
+        let mutation = contains_non_osc_terminal_data(bytes);
+        let (full, intersects) = match self.term.damage() {
+            alacritty_terminal::term::TermDamage::Full => (true, true),
+            alacritty_terminal::term::TermDamage::Partial(damage) => (
+                false,
+                range.is_some_and(|range| {
+                    damage
+                        .into_iter()
+                        .any(|line| damage_intersects_selection(line, offset, range))
+                }),
+            ),
+        };
+        self.term.reset_damage();
+        (intersects, full, mutation)
+    }
+
+    fn grid_anchor(&self) -> crate::blocks::GridAnchor {
+        use crate::blocks::{GridAnchor, GridScreen};
+        let alternate = self
+            .term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+        let grid = self.term.grid();
+        let point = grid.cursor.point;
+        GridAnchor {
+            line: if alternate {
+                point.line.0.max(0) as i64
+            } else {
+                self.evicted_rows as i64 + grid.history_size() as i64 + point.line.0 as i64
+            },
+            column: point.column.0,
+            screen: if alternate {
+                GridScreen::Alternate
+            } else {
+                GridScreen::Primary
+            },
+        }
     }
 
     pub fn blocks(&self) -> &crate::blocks::BlockList {
@@ -164,10 +447,13 @@ impl Model {
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        self.term.resize(Size {
-            cols: cols.max(1),
-            rows: rows.max(1),
-        });
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if self.term.columns() != cols || self.term.screen_lines() != rows {
+            self.blocks.invalidate_anchors();
+        }
+        self.term.resize(Size { cols, rows });
+        self.scroll_region = 0..rows;
     }
     pub fn application_cursor_keys(&self) -> bool {
         self.term
@@ -326,6 +612,41 @@ fn damage_intersects_selection(
     damage.left <= right && damage.right >= left
 }
 
+fn contains_non_osc_terminal_data(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"\x1b]") {
+            index += 2;
+            let mut terminated = false;
+            while index < bytes.len() {
+                if matches!(bytes[index], b'\x07' | b'\x18' | b'\x1a') {
+                    index += 1;
+                    terminated = true;
+                    break;
+                }
+                if bytes[index] == b'\x1b' {
+                    if bytes[index..].starts_with(b"\x1b\\") {
+                        index += 2;
+                        terminated = true;
+                        break;
+                    }
+                    // VTE aborts this OSC; retain the ESC as the start of
+                    // the next terminal sequence.
+                    terminated = true;
+                    break;
+                }
+                index += 1;
+            }
+            if !terminated {
+                return false;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
 fn selection_outside_viewport(
     selection: SelectionRange,
     display_offset: usize,
@@ -379,6 +700,26 @@ mod tests {
             .collect()
     }
 
+    fn primary(line: i64, column: usize) -> crate::blocks::GridAnchor {
+        crate::blocks::GridAnchor {
+            line,
+            column,
+            screen: crate::blocks::GridScreen::Primary,
+        }
+    }
+
+    #[test]
+    fn offscreen_selection_checks_skip_osc_only_segments() {
+        assert!(!contains_non_osc_terminal_data(b"\x1b]133;A\x1b\\"));
+        assert!(!contains_non_osc_terminal_data(
+            b"\x1b]7;file://host/tmp\x1b\\"
+        ));
+        assert!(!contains_non_osc_terminal_data(b"\x1b]133;A\x18"));
+        assert!(contains_non_osc_terminal_data(b"\x1b]bad\x18text"));
+        assert!(contains_non_osc_terminal_data(b"output"));
+        assert!(contains_non_osc_terminal_data(b"\x1b[2J"));
+    }
+
     #[test]
     fn feed_updates_the_owned_block_list_from_observed_shell_marks() {
         let mut model = Model::new(20, 2);
@@ -390,6 +731,185 @@ mod tests {
         assert_eq!(blocks[0].state, crate::blocks::BlockState::Finished);
         assert_eq!(blocks[0].exit_status, Some(4));
         assert_eq!(blocks[0].cwd.as_ref().unwrap().path, b"/tmp");
+    }
+
+    #[test]
+    fn marks_in_one_chunk_capture_cursor_positions_at_each_boundary() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"\x1b]133;A\x1b\\p> \x1b]133;B\x1b\\abc\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+        let block = &model.blocks().blocks()[0];
+        assert_eq!(block.grid_anchors.prompt_start, Some(primary(0, 0)));
+        assert_eq!(block.grid_anchors.input_start, Some(primary(0, 3)));
+        assert_eq!(block.grid_anchors.output_start, Some(primary(0, 6)));
+        assert_eq!(block.grid_anchors.end, Some(primary(0, 6)));
+    }
+
+    #[test]
+    fn split_osc_completion_uses_absolute_offset_but_current_chunk_cursor() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"abc\x1b]133;A");
+        assert!(model.blocks().blocks().is_empty());
+        model.feed(b"\x1b\\xy\x1b]133;B\x1b\\");
+        let block = &model.blocks().blocks()[0];
+        assert_eq!(block.boundaries.prompt_start, Some(12));
+        assert_eq!(block.grid_anchors.prompt_start, Some(primary(0, 3)));
+        assert_eq!(block.grid_anchors.input_start, Some(primary(0, 5)));
+    }
+
+    #[test]
+    fn wrapped_mark_anchor_uses_the_wrapped_grid_row() {
+        let mut model = Model::new(4, 2);
+        model.feed(b"\x1b]133;A\x1b\\abcde\x1b]133;C\x1b\\");
+        assert_eq!(
+            model.blocks().blocks()[0].grid_anchors.output_start,
+            Some(primary(1, 1))
+        );
+    }
+
+    #[test]
+    fn anchor_row_stays_stable_as_scrollback_grows_without_eviction() {
+        let mut model = Model::new(8, 2);
+        model.feed(b"\x1b]133;A\x1b\\");
+        let initial = model.blocks().blocks()[0].grid_anchors.prompt_start;
+        assert_eq!(initial, Some(primary(0, 0)));
+        model.feed(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        model.scroll_up(2);
+        assert_eq!(
+            model.blocks().blocks()[0].grid_anchors.prompt_start,
+            initial
+        );
+    }
+
+    #[test]
+    fn resize_invalidates_anchors_that_may_have_reflowed() {
+        let mut model = Model::new(8, 2);
+        model.feed(b"\x1b]133;A\x1b\\");
+        assert!(
+            model.blocks().blocks()[0]
+                .grid_anchors
+                .prompt_start
+                .is_some()
+        );
+        model.resize(3, 4);
+        assert_eq!(model.blocks().blocks()[0].grid_anchors.prompt_start, None);
+
+        let mut wider = Model::new(3, 4);
+        wider.feed(b"\x1b]133;A\x1b\\");
+        wider.resize(8, 2);
+        assert_eq!(wider.blocks().blocks()[0].grid_anchors.prompt_start, None);
+    }
+
+    #[test]
+    fn alternate_screen_marks_are_not_anchored_to_primary_rows() {
+        let mut model = Model::new(8, 2);
+        model.feed(b"\x1b[?1049h\x1b]133;A\x1b\\");
+        let anchor = model.blocks().blocks()[0].grid_anchors.prompt_start;
+        assert_eq!(
+            anchor.unwrap().screen,
+            crate::blocks::GridScreen::Alternate,
+            "alternate-screen rows must not masquerade as primary rows"
+        );
+    }
+
+    #[test]
+    fn completed_blocks_with_evicted_rows_are_expired() {
+        let mut model = Model::with_scrollback_limit(20, 2, 4);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+        assert!(
+            model.blocks().blocks()[0]
+                .grid_anchors
+                .prompt_start
+                .is_some()
+        );
+        let lines = b"x\r\n".repeat(20);
+        model.feed(&lines);
+        assert!(model.blocks().blocks().is_empty());
+    }
+
+    #[test]
+    fn full_scrollback_evicts_only_anchors_older_than_the_exact_boundary() {
+        let mut model = Model::with_scrollback_limit(20, 2, 2);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+        model.feed(b"one\r\ntwo\r\nthree\r\n");
+        assert_eq!(model.evicted_rows, 0, "history growth is not eviction");
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+        assert_eq!(model.blocks().blocks().len(), 2);
+        let newer_anchor = model
+            .blocks()
+            .blocks()
+            .last()
+            .unwrap()
+            .grid_anchors
+            .prompt_start;
+        assert!(newer_anchor.is_some());
+
+        model.feed(b"four\r\n");
+
+        let blocks = model.blocks().blocks();
+        assert_eq!(
+            model.evicted_rows, 1,
+            "one full-screen scroll evicts one row"
+        );
+        assert_eq!(
+            blocks.len(),
+            1,
+            "only the actually evicted block should be pruned"
+        );
+        assert_eq!(blocks[0].grid_anchors.prompt_start, newer_anchor);
+    }
+
+    #[test]
+    fn partial_scroll_region_never_advances_primary_eviction_boundary() {
+        let mut model = Model::with_scrollback_limit(20, 3, 1);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\");
+        model.feed(b"one\r\ntwo\r\nthree\r\n");
+        model.feed(b"\x1b]133;A\x1b\\");
+        let anchor = model
+            .blocks()
+            .blocks()
+            .last()
+            .unwrap()
+            .grid_anchors
+            .prompt_start;
+        let evicted_before = model.evicted_rows;
+        model.feed(b"\x1b[2;3r\x1b[3;1Hpartial\r\n");
+        assert_eq!(model.evicted_rows, evicted_before);
+        assert_eq!(
+            model
+                .blocks()
+                .blocks()
+                .last()
+                .unwrap()
+                .grid_anchors
+                .prompt_start,
+            anchor,
+            "scrolling inside a partial DECSTBM region does not evict history rows"
+        );
+    }
+
+    #[test]
+    fn wrapped_printable_input_counts_only_rows_evicted_after_history_fills() {
+        let mut model = Model::with_scrollback_limit(2, 2, 2);
+        model.feed(b"abcde");
+        assert_eq!(model.term.grid().history_size(), 1);
+        assert_eq!(model.evicted_rows, 0);
+        model.feed(b"fg");
+        assert_eq!(model.term.grid().history_size(), 2);
+        assert_eq!(model.evicted_rows, 0);
+        model.feed(b"hi");
+        assert_eq!(model.term.grid().history_size(), 2);
+        assert_eq!(model.evicted_rows, 1);
+    }
+
+    #[test]
+    fn wide_character_wrap_counts_the_actual_full_history_scroll() {
+        let mut model = Model::with_scrollback_limit(2, 2, 1);
+        model.feed("abc日".as_bytes());
+        assert_eq!(model.term.grid().history_size(), 1);
+        assert_eq!(model.evicted_rows, 0);
+        model.feed("本".as_bytes());
+        assert_eq!(model.term.grid().history_size(), 1);
+        assert_eq!(model.evicted_rows, 1);
     }
 
     #[test]
@@ -569,6 +1089,27 @@ mod tests {
             model.selection_text().as_deref(),
             Some("alpha\nbeta\ngamma")
         );
+    }
+
+    #[test]
+    fn backward_selection_anchor_rebases_when_output_scrolls_the_grid() {
+        let mut model = Model::new(12, 2);
+        model.feed(b"alpha\r\nbeta");
+        model.begin_selection(4, 1, SelectionType::Simple);
+        model.extend_selection(0, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("alpha\nbeta"));
+
+        model.feed(b"\r\ngamma");
+        assert_eq!(model.selection_text().as_deref(), Some("alpha\nbeta"));
+        let range = model
+            .term
+            .selection
+            .as_ref()
+            .unwrap()
+            .to_range(&model.term)
+            .unwrap();
+        assert!(!model.selection_anchor_is_start);
+        assert_eq!(model.selection_anchor.unwrap().line, range.end.line);
     }
     #[test]
     fn cursor_shape_osc_and_dsr_writeback_are_exposed() {

@@ -11,6 +11,21 @@ pub enum BlockState {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GridScreen {
+    Primary,
+    Alternate,
+}
+
+/// A primary row is an absolute row: total evicted rows plus the retained
+/// history and viewport index. It remains stable while scrollback grows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GridAnchor {
+    pub line: i64,
+    pub column: usize,
+    pub screen: GridScreen,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PhaseBoundaries {
     pub prompt_start: Option<u64>,
@@ -20,14 +35,43 @@ pub struct PhaseBoundaries {
     pub cancelled: Option<u64>,
 }
 
-/// Reserved anchor slots; T2 will populate these with terminal-grid positions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GridAnchors {
-    pub prompt_start: Option<(i64, usize)>,
-    pub input_start: Option<(i64, usize)>,
-    pub output_start: Option<(i64, usize)>,
-    pub end: Option<(i64, usize)>,
+    pub prompt_start: Option<GridAnchor>,
+    pub input_start: Option<GridAnchor>,
+    pub output_start: Option<GridAnchor>,
+    pub end: Option<GridAnchor>,
 }
+
+impl GridAnchors {
+    fn expire_primary_before(&mut self, boundary: u64) {
+        for anchor in [
+            &mut self.prompt_start,
+            &mut self.input_start,
+            &mut self.output_start,
+            &mut self.end,
+        ] {
+            if anchor.is_some_and(|anchor| {
+                anchor.screen == GridScreen::Primary && anchor.line < boundary as i64
+            }) {
+                *anchor = None;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn has_anchor(&self) -> bool {
+        self.prompt_start.is_some()
+            || self.input_start.is_some()
+            || self.output_start.is_some()
+            || self.end.is_some()
+    }
+}
+
+const MAX_BLOCKS: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkingDirectory {
@@ -49,6 +93,7 @@ pub struct Block {
 pub struct BlockList {
     blocks: Vec<Block>,
     cwd: Option<WorkingDirectory>,
+    next_id: u64,
 }
 
 impl BlockList {
@@ -67,84 +112,135 @@ impl BlockList {
 
     pub fn consume(&mut self, events: &[ObservedEvent]) {
         for observed in events {
-            match &observed.event {
-                Event::CurrentDirectory { host, path } => {
-                    self.cwd = Some(WorkingDirectory {
-                        host: host.clone(),
-                        path: path.clone(),
-                    });
-                }
-                Event::SemanticMark(SemanticMark::PromptStart) => {
-                    if let Some(block) = self.blocks.last_mut() {
-                        match block.state {
-                            BlockState::Prompt | BlockState::Input => {
-                                block.state = BlockState::Cancelled;
-                                block.boundaries.cancelled = Some(observed.end_offset);
-                            }
-                            BlockState::Running => block.state = BlockState::Finished,
-                            BlockState::Finished | BlockState::Cancelled => {}
+            self.consume_event(observed, None);
+        }
+    }
+
+    pub(crate) fn consume_event(&mut self, observed: &ObservedEvent, anchor: Option<GridAnchor>) {
+        match &observed.event {
+            Event::CurrentDirectory { host, path } => {
+                self.cwd = Some(WorkingDirectory {
+                    host: host.clone(),
+                    path: path.clone(),
+                });
+            }
+            Event::SemanticMark(SemanticMark::PromptStart) => {
+                if let Some(block) = self.blocks.last_mut() {
+                    match block.state {
+                        BlockState::Prompt | BlockState::Input => {
+                            block.state = BlockState::Cancelled;
+                            block.boundaries.cancelled = Some(observed.end_offset);
+                            block.grid_anchors.end = anchor;
                         }
+                        BlockState::Running => {
+                            block.state = BlockState::Finished;
+                            block.boundaries.finished = Some(observed.end_offset);
+                            block.exit_status = None;
+                            block.grid_anchors.end = anchor;
+                        }
+                        BlockState::Finished | BlockState::Cancelled => {}
+                    }
+                }
+                let mut block = self.new_block();
+                block.boundaries.prompt_start = Some(observed.end_offset);
+                block.grid_anchors.prompt_start = anchor;
+                block.cwd = self.cwd.clone();
+                self.push(block);
+            }
+            Event::SemanticMark(SemanticMark::InputStart) => {
+                let current = self.blocks.last().map(|block| block.state);
+                if current == Some(BlockState::Prompt) {
+                    let block = self.blocks.last_mut().expect("current block exists");
+                    block.boundaries.input_start = Some(observed.end_offset);
+                    block.grid_anchors.input_start = anchor;
+                    block.state = BlockState::Input;
+                } else if current != Some(BlockState::Input) {
+                    if current == Some(BlockState::Running) {
+                        let block = self.blocks.last_mut().expect("running block exists");
+                        block.state = BlockState::Finished;
+                        block.boundaries.finished = Some(observed.end_offset);
+                        block.grid_anchors.end = anchor;
                     }
                     let mut block = self.new_block();
-                    block.boundaries.prompt_start = Some(observed.end_offset);
-                    block.cwd = self.cwd.clone();
-                    self.blocks.push(block);
+                    block.boundaries.input_start = Some(observed.end_offset);
+                    block.grid_anchors.input_start = anchor;
+                    block.state = BlockState::Input;
+                    self.push(block);
                 }
-                Event::SemanticMark(SemanticMark::InputStart) => {
-                    let current = self.blocks.last().map(|block| block.state);
-                    if current == Some(BlockState::Prompt) {
-                        let block = self.blocks.last_mut().expect("current block exists");
-                        block.boundaries.input_start = Some(observed.end_offset);
-                        block.state = BlockState::Input;
-                    } else if current != Some(BlockState::Input) {
-                        if current == Some(BlockState::Running) {
-                            self.blocks.last_mut().expect("running block exists").state =
-                                BlockState::Finished;
-                        }
-                        let mut block = self.new_block();
-                        block.boundaries.input_start = Some(observed.end_offset);
-                        block.state = BlockState::Input;
-                        self.blocks.push(block);
-                    }
+            }
+            Event::SemanticMark(SemanticMark::OutputStart) => {
+                let current = self.blocks.last().map(|block| block.state);
+                if current == Some(BlockState::Prompt) || current == Some(BlockState::Input) {
+                    let block = self.blocks.last_mut().expect("current block exists");
+                    block.boundaries.output_start = Some(observed.end_offset);
+                    block.grid_anchors.output_start = anchor;
+                    block.state = BlockState::Running;
+                } else if current != Some(BlockState::Running) {
+                    let mut block = self.new_block();
+                    block.boundaries.output_start = Some(observed.end_offset);
+                    block.grid_anchors.output_start = anchor;
+                    block.state = BlockState::Running;
+                    self.push(block);
                 }
-                Event::SemanticMark(SemanticMark::OutputStart) => {
-                    let current = self.blocks.last().map(|block| block.state);
-                    if current == Some(BlockState::Prompt) || current == Some(BlockState::Input) {
-                        let block = self.blocks.last_mut().expect("current block exists");
-                        block.boundaries.output_start = Some(observed.end_offset);
-                        block.state = BlockState::Running;
-                    } else if current != Some(BlockState::Running) {
-                        let mut block = self.new_block();
-                        block.boundaries.output_start = Some(observed.end_offset);
-                        block.state = BlockState::Running;
-                        self.blocks.push(block);
-                    }
-                }
-                Event::SemanticMark(SemanticMark::CommandFinished { exit_status }) => {
-                    let current = self.blocks.last().map(|block| block.state);
-                    if matches!(
-                        current,
-                        Some(BlockState::Prompt | BlockState::Input | BlockState::Running)
-                    ) {
-                        let block = self.blocks.last_mut().expect("current block exists");
-                        block.boundaries.finished = Some(observed.end_offset);
-                        block.exit_status = *exit_status;
-                        block.state = BlockState::Finished;
-                    } else {
-                        let mut block = self.new_block();
-                        block.boundaries.finished = Some(observed.end_offset);
-                        block.exit_status = *exit_status;
-                        block.state = BlockState::Finished;
-                        self.blocks.push(block);
-                    }
+            }
+            Event::SemanticMark(SemanticMark::CommandFinished { exit_status }) => {
+                let current = self.blocks.last().map(|block| block.state);
+                if matches!(
+                    current,
+                    Some(BlockState::Prompt | BlockState::Input | BlockState::Running)
+                ) {
+                    let block = self.blocks.last_mut().expect("current block exists");
+                    block.boundaries.finished = Some(observed.end_offset);
+                    block.exit_status = *exit_status;
+                    block.state = BlockState::Finished;
+                    block.grid_anchors.end = anchor;
                 }
             }
         }
     }
 
-    fn new_block(&self) -> Block {
+    /// Resize/reflow has no stable row mapping in alacritty_terminal 0.26.
+    pub(crate) fn invalidate_anchors(&mut self) {
+        for block in &mut self.blocks {
+            block.grid_anchors.clear();
+        }
+    }
+
+    /// Expire primary anchors below the exact evicted-row boundary and discard
+    /// completed blocks that no longer have any surviving grid anchors.
+    pub(crate) fn expire_primary_anchors_before(&mut self, boundary: u64) {
+        for block in &mut self.blocks {
+            block.grid_anchors.expire_primary_before(boundary);
+        }
+        self.blocks.retain(|block| {
+            matches!(
+                block.state,
+                BlockState::Prompt | BlockState::Input | BlockState::Running
+            ) || block.grid_anchors.has_anchor()
+        });
+    }
+
+    fn push(&mut self, block: Block) {
+        self.blocks.push(block);
+        if self.blocks.len() > MAX_BLOCKS {
+            let removable = self
+                .blocks
+                .iter()
+                .position(|block| {
+                    !matches!(
+                        block.state,
+                        BlockState::Prompt | BlockState::Input | BlockState::Running
+                    )
+                })
+                .unwrap_or(0);
+            self.blocks.remove(removable);
+        }
+    }
+
+    fn new_block(&mut self) -> Block {
+        self.next_id = self.next_id.saturating_add(1);
         Block {
-            id: self.blocks.len() as u64 + 1,
+            id: self.next_id,
             boundaries: PhaseBoundaries::default(),
             exit_status: None,
             cwd: self.cwd.clone(),
@@ -200,9 +296,9 @@ mod tests {
                 vec![BlockState::Running],
             ),
             (
-                "finished without output mark",
+                "finished marker without an open block is ignored",
                 vec![SemanticMark::CommandFinished { exit_status: None }],
-                vec![BlockState::Finished],
+                vec![],
             ),
             (
                 "cancelled input followed by fresh prompt",
@@ -351,13 +447,16 @@ mod tests {
     }
 
     #[test]
-    fn finish_without_output_mark_is_retained() {
-        let list = blocks(&[mark(
-            7,
-            SemanticMark::CommandFinished {
-                exit_status: Some(3),
-            },
-        )]);
+    fn finish_without_output_mark_closes_an_open_block() {
+        let list = blocks(&[
+            mark(6, SemanticMark::PromptStart),
+            mark(
+                7,
+                SemanticMark::CommandFinished {
+                    exit_status: Some(3),
+                },
+            ),
+        ]);
         assert_eq!(list.blocks().len(), 1);
         assert_eq!(list.blocks()[0].boundaries.output_start, None);
         assert_eq!(list.blocks()[0].state, BlockState::Finished);
@@ -398,5 +497,46 @@ mod tests {
     fn no_shell_integration_events_produce_no_blocks() {
         assert!(blocks(&[]).blocks().is_empty());
         assert!(blocks(&[cwd(1, b"host", b"/work")]).blocks().is_empty());
+    }
+
+    #[test]
+    fn command_finished_without_an_open_block_does_not_create_a_phantom() {
+        let list = blocks(&[mark(
+            7,
+            SemanticMark::CommandFinished {
+                exit_status: Some(3),
+            },
+        )]);
+        assert!(list.blocks().is_empty());
+    }
+
+    #[test]
+    fn interrupted_running_block_records_its_implicit_end_boundary() {
+        let list = blocks(&[
+            mark(1, SemanticMark::PromptStart),
+            mark(2, SemanticMark::OutputStart),
+            mark(3, SemanticMark::PromptStart),
+        ]);
+        let old = &list.blocks()[0];
+        assert_eq!(old.state, BlockState::Finished);
+        assert_eq!(old.boundaries.finished, Some(3));
+        assert_eq!(old.exit_status, None);
+    }
+
+    #[test]
+    fn block_history_is_bounded_and_keeps_monotonic_ids() {
+        let mut list = BlockList::default();
+        for i in 0..2048 {
+            let base = i * 2;
+            list.consume(&[
+                mark(base, SemanticMark::PromptStart),
+                mark(
+                    base + 1,
+                    SemanticMark::CommandFinished { exit_status: None },
+                ),
+            ]);
+        }
+        assert!(list.blocks().len() <= 1024);
+        assert!(list.blocks().last().unwrap().id > 1024);
     }
 }

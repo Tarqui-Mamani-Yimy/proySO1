@@ -112,7 +112,7 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
   - R3-path-prefixed-command-completion-empty: a command-position prefix containing `/` (`./scr<Tab>`, `/usr/bin/py<Tab>`) offers nothing; it must fall back to executable file completion (`completion.rs:132-136`).
   - Suggestions: highlighter byte/char offset unit test (`highlighter.rs:32-37`); a terminal write failure of integration marks should not end the REPL (`repl.rs:230-231`); per-prompt PATH scan cost (`repl.rs:225`).
 - [x] **T8 — Phase verification** — user stopped the Claude verifier and assigned it to Codex (note: not independent, Codex wrote the phase). Workspace 621 tests green twice; make ci only regression-37; PTY smoke a,b,c,d,f,h PASS. (e) OSC 7 `localhost`: false alarm, this machine's hostname is `localhost` (orchestrator checked hostname/uname -n/gethostname). (g) real defect -> T8b.
-- [ ] **T8b — `SO1SH_HIGHLIGHT=0` still emits SGR** (codex-impl, RUNNING): reedline falls back to its default highlighter (`\x1b[37m`) when ours is skipped (`repl.rs:207-212`); install a plain no-style highlighter.
+- [x] **T8b — `SO1SH_HIGHLIGHT=0` still emits SGR** (codex-impl) — `9067920` PlainHighlighter; PTY RED showed `\x1b[37m`, GREEN after.: reedline falls back to its default highlighter (`\x1b[37m`) when ours is skipped (`repl.rs:207-212`); install a plain no-style highlighter.
 
 ## Verification evidence
 - T0 (`09567a4` runtime errors omit unknown `0:0` positions; `fb0693b` clear REPL failure marker on handled errors, remove dead WIFSTOPPED checks; `9b082b2` PTY test: slash-less `SO1SH_RC` resolves in cwd — Codex refuted the T5 review claim of PATH search with evidence `builtins.rs:418`). Workspace 557 green (orchestrator spot-check).
@@ -164,6 +164,12 @@ left small follow-ups (see Phase 1 result in `odd/tasks/phase-1-shell-mvp.md`).
 - T7 (`38d6e97`): history ghost-text hints (Right/End accept), epsh-lexer highlighting (resolved vs unknown commands via per-prompt PATH cache, strings, operators, variables, comments), never alters submitted text, plain-text fallback on lexer errors, `SO1SH_HIGHLIGHT=0` opt-out; dependency nu-ansi-term (MIT, already in reedline's tree). Orchestrator 2/2 workspace runs green.
 
 - Native review for T5..T7+T6b: correction -> `a848e3f` -> provider `recover` (scope_changed, lineage review-bd6c08d86940dc7f) -> consolidated review approved, acknowledged; 2 WARNINGs -> T6c.
+
+
+## Phase 2 result
+- All implementation and verification tasks done on `feat/phase-2-modern-shell` (stacked on Phase 1). Last commit `9067920`.
+- Native review: everything up to `a848e3f` reviewed and acknowledged. Pending unreviewed slice `a848e3f..9067920` (T2e test isolation, rustfmt, T6c, T8b) is under the slice budget, so the native assessment did not require review yet.
+- Not pushed or merged: delivery (merges to `main`, PR/chain strategy) is the user's decision.
 
 ## Progress / Next step
 - Next: T6 (tab completion) on `codex-impl` (+ OSC 7 hostname); then T7, T2e, T8.

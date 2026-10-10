@@ -12,6 +12,10 @@ pub struct RenderCell {
     pub cursor: bool,
 }
 
+pub fn apply_selection_highlight(cell: &mut RenderCell) {
+    std::mem::swap(&mut cell.foreground, &mut cell.background);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFailure {
     Lost,
@@ -534,6 +538,20 @@ mod tests {
         assert_eq!(cell.foreground, [4, 5, 6]);
         assert_eq!(cell.background, [1, 2, 3]);
         assert!(cell.cursor && cell.bold);
+    }
+
+    #[test]
+    fn selection_highlight_swaps_foreground_and_background() {
+        let mut cell = RenderCell {
+            character: 'x',
+            foreground: [1, 2, 3],
+            background: [4, 5, 6],
+            bold: false,
+            cursor: false,
+        };
+        apply_selection_highlight(&mut cell);
+        assert_eq!(cell.foreground, [4, 5, 6]);
+        assert_eq!(cell.background, [1, 2, 3]);
     }
 
     #[test]

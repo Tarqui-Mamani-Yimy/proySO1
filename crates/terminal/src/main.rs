@@ -1,3 +1,4 @@
+use alacritty_terminal::selection::SelectionType;
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Weight};
 use glyphon::{
     Cache, Color, FontSystem, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
@@ -7,18 +8,21 @@ use so1_terminal::{
     clamp_surface_size,
     keyboard::{
         ImePreeditGate, Key as TerminalKey, Modifiers as KeyModifiers, encode_ime_commit,
-        encode_key,
+        encode_key, encode_paste,
     },
     model::{Model, ModelEvent},
     renderer::{
         ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, SurfaceRetryBackoff,
-        WakeupGate, WheelAccumulator, grid_size, project_terminal_metrics, unicode_cell_width,
+        WakeupGate, WheelAccumulator, apply_selection_highlight, grid_size,
+        project_terminal_metrics, unicode_cell_width,
     },
+    selection::{ClickTracker, SelectionGesture},
 };
 use std::{path::PathBuf, sync::Arc, time::Instant};
+use winit::dpi::PhysicalPosition;
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseScrollDelta, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowAttributes, WindowId},
@@ -45,6 +49,9 @@ struct TerminalWindow {
     retry_redraw_at: Option<Instant>,
     occluded: bool,
     redraw_pending: bool,
+    cursor_position: PhysicalPosition<f64>,
+    selecting: bool,
+    click_tracker: ClickTracker,
 }
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -103,6 +110,9 @@ impl TerminalWindow {
             retry_redraw_at: None,
             occluded: false,
             redraw_pending: false,
+            cursor_position: PhysicalPosition::new(0.0, 0.0),
+            selecting: false,
+            click_tracker: ClickTracker::default(),
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -307,6 +317,56 @@ impl TerminalWindow {
         }
     }
 
+    fn cell_at_cursor(&self) -> Option<(usize, usize)> {
+        let gpu = self.gpu.as_ref()?;
+        let (columns, rows) = grid_size(
+            gpu.config.width,
+            gpu.config.height,
+            gpu.cell_width,
+            gpu.cell_height,
+        );
+        Some((
+            ((self.cursor_position.x / f64::from(gpu.cell_width)).floor() as usize)
+                .min(columns - 1),
+            ((self.cursor_position.y / f64::from(gpu.cell_height)).floor() as usize).min(rows - 1),
+        ))
+    }
+
+    fn copy_selection(&self) {
+        let Some(text) = self.model.as_ref().and_then(Model::selection_text) else {
+            return;
+        };
+        if let Err(error) =
+            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
+        {
+            eprintln!("so1term: clipboard copy failed: {error}");
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("so1term: clipboard paste failed: {error}");
+                return;
+            }
+        };
+        let bracketed = self
+            .model
+            .as_ref()
+            .is_some_and(Model::bracketed_paste_enabled);
+        let bytes = encode_paste(&text, bracketed);
+        if let Some(pty) = self.pty.as_mut()
+            && let Err(error) = pty.write(&bytes)
+        {
+            eprintln!("so1term: clipboard paste write failed: {error}");
+        }
+        if let Some(model) = self.model.as_mut() {
+            model.scroll_to_bottom();
+        }
+        self.request_redraw();
+    }
+
     fn draw(&mut self) -> Result<FrameRecovery, String> {
         let (Some(gpu), Some(model)) = (self.gpu.as_mut(), self.model.as_ref()) else {
             return Ok(FrameRecovery::WaitForEvent);
@@ -342,7 +402,14 @@ impl TerminalWindow {
         self.surface_retry.reset();
         let rows = model.visible_cells();
         let cursor = model.cursor();
-        let cells = so1_terminal::renderer::render_cells(&rows, (cursor.column, cursor.row));
+        let mut cells = so1_terminal::renderer::render_cells(&rows, (cursor.column, cursor.row));
+        for (row, row_cells) in cells.iter_mut().enumerate() {
+            for (column, cell) in row_cells.iter_mut().enumerate() {
+                if model.cell_selected(column, row) {
+                    apply_selection_highlight(cell);
+                }
+            }
+        }
         let width = gpu.config.width as f32;
         let height = gpu.config.height as f32;
         gpu.vertices.clear();
@@ -648,6 +715,18 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         .filter(|text| !text.is_empty())
                         .map(|text| TerminalKey::Text(text.as_str())),
                 };
+                if let Some(TerminalKey::Text(text)) = terminal_key {
+                    let clipboard_shortcut = (mods.control && mods.shift)
+                        || (cfg!(target_os = "macos") && mods.super_key);
+                    if clipboard_shortcut && text.eq_ignore_ascii_case("c") {
+                        self.copy_selection();
+                        return;
+                    }
+                    if clipboard_shortcut && text.eq_ignore_ascii_case("v") {
+                        self.paste_clipboard();
+                        return;
+                    }
+                }
                 if let (Some(key), Some(model)) = (terminal_key, self.model.as_mut())
                     && !self.ime_gate.suppresses_key(key, mods.control)
                 {
@@ -663,6 +742,40 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             }
             WindowEvent::Ime(winit::event::Ime::Enabled) => {}
             WindowEvent::Ime(winit::event::Ime::Disabled) => self.ime_gate.disable(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = position;
+                if self.selecting
+                    && let (Some(point), Some(model)) = (self.cell_at_cursor(), self.model.as_mut())
+                {
+                    model.extend_selection(point.0, point.1);
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
+                (ElementState::Pressed, MouseButton::Left) => {
+                    if let (Some(point), Some(model)) = (self.cell_at_cursor(), self.model.as_mut())
+                    {
+                        let gesture = self.click_tracker.click(point, Instant::now());
+                        let kind = match gesture {
+                            SelectionGesture::Simple => SelectionType::Simple,
+                            SelectionGesture::Semantic => SelectionType::Semantic,
+                            SelectionGesture::Lines => SelectionType::Lines,
+                        };
+                        model.begin_selection(point.0, point.1, kind);
+                        self.selecting = true;
+                        self.request_redraw();
+                    }
+                }
+                (ElementState::Pressed, _) => {
+                    if let Some(model) = self.model.as_mut() {
+                        model.clear_selection();
+                    }
+                    self.selecting = false;
+                    self.request_redraw();
+                }
+                (ElementState::Released, MouseButton::Left) => self.selecting = false,
+                _ => {}
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(model) = self.model.as_mut()
                     && !model.mouse_or_alternate_screen_active()

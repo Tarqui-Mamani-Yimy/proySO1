@@ -18,3 +18,4 @@ portable-pty = "0.9"
 libc = "0.2"
 alacritty_terminal = "0.26"
 vte = "0.15"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }

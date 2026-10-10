@@ -6,7 +6,8 @@ use std::rc::Rc;
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener},
     grid::{Dimensions, Scroll},
-    index::{Column, Line, Point},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     term::{
         Config, Term,
         cell::{Cell, Flags},
@@ -95,8 +96,24 @@ impl Model {
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<crate::osc::ObservedEvent> {
+        let selection_before = (!bytes.is_empty()).then(|| {
+            self.term
+                .selection
+                .as_ref()
+                .map(|_| self.term.selection_to_string())
+        });
         let events = self.osc.feed(bytes);
         self.processor.advance(&mut self.term, bytes);
+        let selection_after = self
+            .term
+            .selection
+            .as_ref()
+            .map(|_| self.term.selection_to_string());
+        if let Some(before) = selection_before
+            && before != selection_after
+        {
+            self.term.selection = None;
+        }
         events
     }
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -127,6 +144,38 @@ impl Model {
     }
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+    fn selection_point(&self, column: usize, row: usize) -> Point {
+        Point::new(
+            Line(row as i32 - self.term.grid().display_offset() as i32),
+            Column(column.min(self.term.grid().columns() - 1)),
+        )
+    }
+    pub fn begin_selection(&mut self, column: usize, row: usize, kind: SelectionType) {
+        self.term.selection = Some(Selection::new(
+            kind,
+            self.selection_point(column, row),
+            Side::Left,
+        ));
+    }
+    pub fn extend_selection(&mut self, column: usize, row: usize) {
+        let point = self.selection_point(column, row);
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, Side::Right);
+        }
+    }
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+    pub fn cell_selected(&self, column: usize, row: usize) -> bool {
+        self.term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term))
+            .is_some_and(|range| range.contains(self.selection_point(column, row)))
     }
     pub fn scroll_up(&mut self, lines: usize) {
         self.term
@@ -191,6 +240,7 @@ fn color(value: vte::ansi::Color) -> CellColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::selection::SelectionType;
     use std::{
         thread,
         time::{Duration, Instant},
@@ -274,6 +324,43 @@ mod tests {
         assert!(!m.application_cursor_keys());
         assert!(!m.bracketed_paste_enabled());
         assert!(!m.mouse_or_alternate_screen_active());
+    }
+
+    #[test]
+    fn alacritty_selection_extracts_words_lines_and_highlights_cells() {
+        let mut model = Model::new(20, 3);
+        model.feed(b"alpha beta\r\nsecond line");
+        model.begin_selection(7, 0, SelectionType::Semantic);
+        assert_eq!(model.selection_text().as_deref(), Some("beta"));
+        assert!(model.cell_selected(7, 0));
+        assert!(!model.cell_selected(2, 0));
+        model.begin_selection(3, 0, SelectionType::Lines);
+        assert_eq!(model.selection_text().as_deref(), Some("alpha beta\n"));
+        model.feed(b"!");
+        assert_eq!(model.selection_text().as_deref(), Some("alpha beta\n"));
+    }
+
+    #[test]
+    fn output_overwriting_selected_text_clears_selection() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"alpha beta");
+        model.begin_selection(0, 0, SelectionType::Simple);
+        model.extend_selection(4, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("alpha"));
+        model.feed(b"\x1b[1;1H!\x1b[K");
+        assert_eq!(model.selection_text(), None);
+    }
+
+    #[test]
+    fn dragged_selection_tracks_scrollback_cells() {
+        let mut model = Model::new(12, 2);
+        model.feed(b"first\r\nsecond\r\nthird\r\n");
+        model.scroll_up(100);
+        model.begin_selection(0, 0, SelectionType::Simple);
+        model.extend_selection(4, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("first"));
+        assert!(model.cell_selected(4, 0));
+        assert!(!model.cell_selected(1, 1));
     }
     #[test]
     fn cursor_shape_osc_and_dsr_writeback_are_exposed() {

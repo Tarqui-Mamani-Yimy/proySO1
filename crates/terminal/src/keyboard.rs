@@ -142,14 +142,26 @@ pub fn encode_ime_commit(text: &str, _bracketed_paste: bool) -> Vec<u8> {
 }
 
 pub fn encode_paste(text: &str, bracketed: bool) -> Cow<'_, [u8]> {
+    let sanitized = sanitize_paste(text);
+    let bytes = if sanitized == text {
+        Cow::Borrowed(text.as_bytes())
+    } else {
+        Cow::Owned(sanitized.into_bytes())
+    };
     if bracketed {
         let mut out = b"\x1b[200~".to_vec();
-        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(&bytes);
         out.extend_from_slice(b"\x1b[201~");
         Cow::Owned(out)
     } else {
-        Cow::Borrowed(text.as_bytes())
+        bytes
     }
+}
+
+pub fn sanitize_paste(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(*character, '\n' | '\r' | '\t'))
+        .collect()
 }
 
 #[cfg(test)]
@@ -458,5 +470,15 @@ mod tests {
             encode_paste("aλ", true).as_ref(),
             b"\x1b[200~a\xce\xbb\x1b[201~"
         );
+    }
+
+    #[test]
+    fn paste_sanitizes_escape_and_controls_before_bracketing() {
+        assert_eq!(sanitize_paste("a\x1b[201~\u{009b}b\n\t"), "a[201~b\n\t");
+        assert_eq!(
+            encode_paste("a\x1b[201~", true).as_ref(),
+            b"\x1b[200~a[201~\x1b[201~"
+        );
+        assert_eq!(encode_paste("a\x1b[201~", false).as_ref(), b"a[201~");
     }
 }

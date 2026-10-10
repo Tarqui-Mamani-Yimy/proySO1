@@ -53,7 +53,7 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 ## Tasks (refined after T0)
 - [x] **T0 — Exploration and stack decision** (Codex, read-only)
 - [x] **T1 — Crate skeleton + stack spike** — `35f0b83`: window opens on Linux (adapter Intel UHD Graphics TGL GT1), wgpu clear, close/resize, clear GPU-init errors; unit tests for per-platform shell candidates and surface clamping. Windows/macOS cross-checks skipped: targets not installed. Correction (review): T1 did NOT add or type-check alacritty_terminal — that moves to T4. Native review approved (review-d79f338b8280e79e).: `crates/terminal`, open a window, clear it with wgpu; type-check Term; GPU init failure reported clearly.
-- [ ] **T2 — OSC observer**: pure incremental parser for OSC 133 A/B/C/D and OSC 7, split at every byte boundary, malformed input (Phase 4 seam).
+- [x] **T2 — OSC observer**: pure incremental parser for OSC 133 A/B/C/D and OSC 7, split at every byte boundary, malformed input (Phase 4 seam).
 - [ ] **T3 — PTY lifecycle**: spawn `so1sh`, stream output, write input, resize, child exit, cleanup.
 - [ ] **T4 — VT model adapter**: PTY chunks -> alacritty_terminal; tests for grid contents, cursor, scrollback without a window.
 - [ ] **T5 — Renderer**: draw the visible grid (glyphon), colors, cursor; GPU smoke optional so headless CI stays useful. Also fix (T1 review): when a frame cannot be acquired (Lost/Outdated/Timeout/Occluded) `draw()` never requests another redraw (`crates/terminal/src/main.rs:82-88`).
@@ -69,4 +69,4 @@ no terminal of our own to consume them. Phase 4 (blocks) builds on this MVP.
 _(filled per task)_
 
 ## Progress / Next step
-- T1 done. Next: T2 (OSC observer) on `codex-impl`. Pending user decision: install rustup targets for Windows/macOS compile checks.
+- T2 done (`a9226d5`): `crates/terminal/src/osc.rs`, absolute end offsets, every-split test (orchestrator checked the expected offsets are derived from sequence lengths, not copied from output). Next: T3 (PTY lifecycle). Pending user decision: install rustup targets for Windows/macOS compile checks.

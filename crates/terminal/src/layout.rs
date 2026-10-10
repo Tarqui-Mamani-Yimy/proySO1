@@ -14,7 +14,7 @@ fn allocate_id(counter: &AtomicU64) -> u64 {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PaneId(pub u64);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TabId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +101,14 @@ pub enum CloseResult {
 pub enum TabCloseResult {
     Closed(TabId),
     LastTab,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneCloseResult {
+    PaneClosed { tab: TabId },
+    TabClosed { tab: TabId },
+    LastTab { tab: TabId },
+    PaneNotFound,
 }
 
 #[derive(Clone, Debug)]
@@ -862,6 +870,26 @@ impl TabSet {
         &self.tabs
     }
 
+    pub fn tab_mut(&mut self, index: usize) -> Option<&mut Tab> {
+        self.tabs.get_mut(index)
+    }
+
+    pub fn tab_index_for_pane(&self, pane: PaneId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.layout_tree().panes().contains(&pane))
+    }
+
+    /// Update the shared window/cell geometry for every tab, including hidden tabs.
+    pub fn resize_all(&mut self, window: Rect, cell: CellSize) {
+        self.template.window = window;
+        self.template.cell = CellSize::new(cell.width, cell.height);
+        for tab in &mut self.tabs {
+            tab.layout_tree_mut().resize_window(window);
+            tab.layout_tree_mut().resize_cell_size(cell);
+        }
+    }
+
     pub fn tab_ids(&self) -> Vec<TabId> {
         self.tabs.iter().map(Tab::id).collect()
     }
@@ -901,6 +929,29 @@ impl TabSet {
         let removed = self.tabs.remove(self.active_index);
         self.active_index = self.active_index.min(self.tabs.len() - 1);
         TabCloseResult::Closed(removed.id)
+    }
+
+    /// Remove a pane by identity while preserving the active-tab index when a
+    /// background tab closes. A tab whose last pane exits is removed atomically.
+    pub fn close_pane(&mut self, pane: PaneId) -> PaneCloseResult {
+        let Some(index) = self.tab_index_for_pane(pane) else {
+            return PaneCloseResult::PaneNotFound;
+        };
+        let tab_id = self.tabs[index].id();
+        if self.tabs[index].layout_tree().panes().len() > 1 {
+            self.tabs[index].close_pane(pane);
+            return PaneCloseResult::PaneClosed { tab: tab_id };
+        }
+        if self.tabs.len() == 1 {
+            return PaneCloseResult::LastTab { tab: tab_id };
+        }
+        self.tabs.remove(index);
+        if index < self.active_index {
+            self.active_index -= 1;
+        } else if index == self.active_index {
+            self.active_index = self.active_index.min(self.tabs.len() - 1);
+        }
+        PaneCloseResult::TabClosed { tab: tab_id }
     }
 
     pub fn next(&mut self) {
@@ -1129,5 +1180,33 @@ mod tests {
         assert_eq!(tabs.active_mut().unwrap().focus_by_click(145, 20), None);
         assert_eq!(tabs.active().unwrap().active_pane(), second);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn resize_all_keeps_each_tab_grid_aligned_below_the_tab_bar() {
+        let mut tabs = TabSet::new(Rect::new(0, 0, 800, 600), CellSize::new(10, 10), 4, 5, 3);
+        tabs.add_tab();
+        tabs.resize_all(Rect::new(0, 20, 800, 580), CellSize::new(10, 10));
+        for tab in tabs.tabs() {
+            let layout = tab.layout();
+            assert_eq!(layout.len(), 1);
+            assert_eq!(layout[0].rect.y, 20);
+            assert_eq!(layout[0].rows, 58);
+        }
+    }
+
+    #[test]
+    fn pane_exit_in_a_background_tab_does_not_change_the_active_tab() {
+        let mut tabs = TabSet::new(Rect::new(0, 0, 800, 600), CellSize::new(10, 10), 4, 5, 3);
+        let first = tabs.active().unwrap().id();
+        let second = tabs.add_tab();
+        let background_pane = tabs.active().unwrap().active_pane();
+        tabs.select(0);
+        assert_eq!(
+            tabs.close_pane(background_pane),
+            PaneCloseResult::TabClosed { tab: second }
+        );
+        assert_eq!(tabs.active().unwrap().id(), first);
+        assert_eq!(tabs.tabs().len(), 1);
     }
 }

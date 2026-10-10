@@ -11,7 +11,7 @@ use so1_terminal::{
         ImePreeditGate, Key as TerminalKey, Modifiers as KeyModifiers, encode_ime_commit,
         encode_key, encode_paste,
     },
-    layout::{CellSize, Direction, FocusDirection, LayoutTree, PaneId, PaneLayout, Rect, Tab},
+    layout::{CellSize, Direction, FocusDirection, PaneId, PaneLayout, Rect, Tab, TabSet},
     model::{Model, ModelEvent},
     renderer::{
         BlockDecorationColor, BlockViewport, ExitPollBackoff, ExitPollDecision, FrameRecovery,
@@ -38,8 +38,9 @@ enum UserEvent {
 struct TerminalWindow {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
-    tab: Option<Tab>,
+    tabs: Option<TabSet>,
     panes: BTreeMap<PaneId, Pane>,
+    selection_origin: Option<PaneId>,
     failed: bool,
     modifiers: winit::keyboard::ModifiersState,
     ime_gate: ImePreeditGate,
@@ -56,6 +57,8 @@ struct TerminalWindow {
 struct Pane {
     pty: so1_terminal::pty::Pty,
     model: Model,
+    title: String,
+    cwd: PathBuf,
     wakeup: Arc<WakeupGate>,
     wheel: WheelAccumulator,
     selection_router: SelectionRouter,
@@ -127,6 +130,87 @@ enum PaneAction {
     SplitDown,
     Close,
     Focus(FocusDirection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TabAction {
+    New,
+    Close,
+    Next,
+    Previous,
+    Select(usize),
+}
+
+fn close_pane_lifecycle(tabs: &mut TabSet, pane: PaneId) -> bool {
+    let result = tabs.close_pane(pane);
+    matches!(
+        result,
+        so1_terminal::layout::PaneCloseResult::LastTab { .. }
+    )
+}
+
+fn tab_bar_height(tab_count: usize, cell_height: f32) -> u32 {
+    if tab_count <= 1 {
+        0
+    } else {
+        cell_height.ceil().max(1.0) as u32
+    }
+}
+
+fn tab_content_rect(window: Rect, tab_count: usize, cell_height: f32) -> Rect {
+    let height = tab_bar_height(tab_count, cell_height).min(window.height);
+    Rect::new(
+        window.x,
+        window.y.saturating_add(height),
+        window.width,
+        window.height.saturating_sub(height),
+    )
+}
+
+fn tab_index_at(x: f64, width: u32, count: usize) -> Option<usize> {
+    if !x.is_finite() || x < 0.0 || x >= f64::from(width) || count == 0 {
+        return None;
+    }
+    Some(((x / f64::from(width) * count as f64).floor() as usize).min(count - 1))
+}
+
+fn tab_shortcut(key: &Key, mods: KeyModifiers, macos: bool, tab_count: usize) -> Option<TabAction> {
+    let command = if macos { mods.super_key } else { mods.control };
+    match key {
+        Key::Character(text) if command && mods.shift && text.eq_ignore_ascii_case("t") => {
+            Some(TabAction::New)
+        }
+        Key::Character(text) if command && mods.shift && text.eq_ignore_ascii_case("q") => {
+            Some(TabAction::Close)
+        }
+        Key::Named(NamedKey::Tab) if mods.control && mods.shift => Some(TabAction::Previous),
+        Key::Named(NamedKey::Tab) if mods.control => Some(TabAction::Next),
+        Key::Character(text) if if macos { mods.super_key } else { mods.alt } => {
+            let index = text.chars().next()?.to_digit(10)?.checked_sub(1)? as usize;
+            (index < tab_count && index < 9).then_some(TabAction::Select(index))
+        }
+        _ => None,
+    }
+}
+
+fn selection_target(
+    origin: Option<PaneId>,
+    hit: Option<PaneId>,
+    state: PointerState,
+) -> Option<PaneId> {
+    match state {
+        PointerState::Pressed => hit,
+        PointerState::Released => origin,
+    }
+}
+
+fn pane_is_in_active_tab(tabs: &TabSet, pane: PaneId) -> bool {
+    tabs.active()
+        .is_some_and(|tab| tab.layout_tree().panes().contains(&pane))
+}
+
+fn pane_exit_needs_redraw(active_tab_pane: bool, tabs_before: usize, tabs_after: usize) -> bool {
+    active_tab_pane || tabs_before != tabs_after
 }
 
 fn pane_action(key: &Key, mods: KeyModifiers, macos: bool) -> Option<PaneAction> {
@@ -218,6 +302,33 @@ fn pane_cell_at(
     ))
 }
 
+fn pane_cell_for_id(
+    x: f64,
+    y: f64,
+    pane: PaneId,
+    layouts: &[PaneLayout],
+    cell_width: f32,
+    cell_height: f32,
+) -> Option<(PaneId, usize, usize)> {
+    let layout = layouts
+        .iter()
+        .find(|layout| layout.pane == pane && !layout.hidden)?;
+    if !x.is_finite() || !y.is_finite() || cell_width <= 0.0 || cell_height <= 0.0 {
+        return None;
+    }
+    let local_x =
+        (x - f64::from(layout.rect.x)).clamp(0.0, f64::from(layout.rect.width.saturating_sub(1)));
+    let local_y =
+        (y - f64::from(layout.rect.y)).clamp(0.0, f64::from(layout.rect.height.saturating_sub(1)));
+    let column = (local_x / f64::from(cell_width)).floor() as usize;
+    let row = (local_y / f64::from(cell_height)).floor() as usize;
+    Some((
+        pane,
+        column.min(layout.cols.saturating_sub(1) as usize),
+        row.min(layout.rows.saturating_sub(1) as usize),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_overlay_rect(
     vertices: &mut Vec<RectVertex>,
@@ -278,8 +389,9 @@ impl TerminalWindow {
         Self {
             window: None,
             gpu: None,
-            tab: None,
+            tabs: None,
             panes: BTreeMap::new(),
+            selection_origin: None,
             failed: false,
             modifiers: winit::keyboard::ModifiersState::empty(),
             ime_gate: ImePreeditGate::default(),
@@ -404,7 +516,7 @@ impl TerminalWindow {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let tab = Tab::from_tree(LayoutTree::new(
+        let tabs = TabSet::new(
             Rect::new(0, 0, width, height),
             CellSize::new(
                 physical_cell_width.ceil() as u32,
@@ -413,16 +525,18 @@ impl TerminalWindow {
             4,
             20,
             5,
-        ));
-        let pane_id = tab.active_pane();
-        let (cols, rows) = tab
+        );
+        let pane_id = tabs.active().expect("initial tab exists").active_pane();
+        let (cols, rows) = tabs
+            .active()
+            .expect("initial tab exists")
             .layout()
             .into_iter()
             .find(|layout| layout.pane == pane_id && !layout.hidden)
             .map(|layout| (layout.cols as usize, layout.rows as usize))
             .unwrap_or_else(|| grid_size(width, height, physical_cell_width, physical_cell_height));
         self.window = Some(Arc::clone(&window));
-        self.tab = Some(tab);
+        self.tabs = Some(tabs);
         self.panes.insert(
             pane_id,
             Self::create_pane(
@@ -466,7 +580,7 @@ impl TerminalWindow {
         let wakeup = Arc::new(WakeupGate::default());
         let notify_wakeup = Arc::clone(&wakeup);
         let pty = so1_terminal::pty::Pty::spawn_shell_notified(
-            cwd,
+            cwd.clone(),
             cols as u16,
             rows as u16,
             move || {
@@ -479,6 +593,8 @@ impl TerminalWindow {
         Ok(Pane {
             pty,
             model: Model::new(cols, rows),
+            title: "so1sh".to_owned(),
+            cwd,
             wakeup,
             wheel: WheelAccumulator::default(),
             selection_router: SelectionRouter::default(),
@@ -494,25 +610,25 @@ impl TerminalWindow {
         gpu.config.width = w;
         gpu.config.height = h;
         gpu.surface.configure(&gpu.device, &gpu.config);
-        let Some(tab) = self.tab.as_mut() else { return };
-        tab.layout_tree_mut().resize_window(Rect::new(0, 0, w, h));
-        tab.layout_tree_mut().resize_cell_size(CellSize::new(
-            gpu.cell_width.ceil() as u32,
-            gpu.cell_height.ceil() as u32,
-        ));
-        for layout in tab.layout() {
-            if layout.hidden {
-                continue;
-            }
+        let Some(tabs) = self.tabs.as_mut() else {
+            return;
+        };
+        let cell = CellSize::new(gpu.cell_width.ceil() as u32, gpu.cell_height.ceil() as u32);
+        let pane_rect = tab_content_rect(Rect::new(0, 0, w, h), tabs.tabs().len(), gpu.cell_height);
+        tabs.resize_all(pane_rect, cell);
+        let layouts: Vec<_> = tabs.tabs().iter().flat_map(Tab::layout).collect();
+        for layout in layouts {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
-                pane.model
-                    .resize(layout.cols as usize, layout.rows as usize);
-                let _ = pane.pty.resize(
-                    layout.cols.min(u16::MAX as u32) as u16,
-                    layout.rows.min(u16::MAX as u32) as u16,
-                    layout.rect.width.min(u16::MAX as u32) as u16,
-                    layout.rect.height.min(u16::MAX as u32) as u16,
-                );
+                if !layout.hidden {
+                    pane.model
+                        .resize(layout.cols as usize, layout.rows as usize);
+                    let _ = pane.pty.resize(
+                        layout.cols.min(u16::MAX as u32) as u16,
+                        layout.rows.min(u16::MAX as u32) as u16,
+                        layout.rect.width.min(u16::MAX as u32) as u16,
+                        layout.rect.height.min(u16::MAX as u32) as u16,
+                    );
+                }
                 invalidate_glyph_cache(
                     &mut pane.glyph_buffers,
                     &mut pane.glyph_keys,
@@ -532,7 +648,7 @@ impl TerminalWindow {
     }
 
     fn focused_pane_id(&self) -> Option<PaneId> {
-        self.tab.as_ref().map(Tab::active_pane)
+        self.tabs.as_ref()?.active().map(Tab::active_pane)
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
@@ -551,17 +667,28 @@ impl TerminalWindow {
             .filter_map(|(id, pane)| pane.pty.try_wait().ok().flatten().map(|_| *id))
             .collect();
         for pane in exited {
-            if let Some(tab) = self.tab.as_mut()
-                && matches!(
-                    tab.close_pane(pane),
-                    so1_terminal::layout::CloseResult::LastPane
-                )
-            {
-                self.panes.remove(&pane);
+            let tab_count_before = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
+            let active_pane_exited = self
+                .tabs
+                .as_ref()
+                .is_some_and(|tabs| pane_is_in_active_tab(tabs, pane));
+            let close_window = self
+                .tabs
+                .as_mut()
+                .is_none_or(|tabs| close_pane_lifecycle(tabs, pane));
+            self.panes.remove(&pane);
+            if close_window {
                 event_loop.exit();
                 return;
             }
-            self.panes.remove(&pane);
+            if let Some(gpu) = self.gpu.as_ref() {
+                self.resize(gpu.config.width, gpu.config.height);
+            }
+            self.refresh_window_title();
+            let tab_count_after = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
+            if pane_exit_needs_redraw(active_pane_exited, tab_count_before, tab_count_after) {
+                self.request_redraw();
+            }
         }
         if !self.panes.is_empty()
             && let ExitPollDecision::RetryAt(deadline) =
@@ -572,7 +699,10 @@ impl TerminalWindow {
     }
 
     fn pane_layouts(&self) -> Vec<PaneLayout> {
-        self.tab.as_ref().map_or_else(Vec::new, Tab::layout)
+        self.tabs
+            .as_ref()
+            .and_then(TabSet::active)
+            .map_or_else(Vec::new, Tab::layout)
     }
 
     fn pane_and_cell_at_cursor(&self) -> Option<(PaneId, usize, usize)> {
@@ -588,8 +718,9 @@ impl TerminalWindow {
 
     fn split_focused(&mut self, direction: Direction) -> Result<(), String> {
         let pane_id = self
-            .tab
+            .tabs
             .as_mut()
+            .and_then(TabSet::active_mut)
             .ok_or_else(|| "pane layout is not initialized".to_owned())?
             .split_focused(direction)
             .map_err(|error| format!("cannot split pane: {error:?}"))?;
@@ -616,7 +747,7 @@ impl TerminalWindow {
                 Ok(())
             }
             Err(error) => {
-                if let Some(tab) = self.tab.as_mut() {
+                if let Some(tab) = self.tabs.as_mut().and_then(TabSet::active_mut) {
                     let _ = tab.close_pane(pane_id);
                 }
                 Err(error)
@@ -625,12 +756,14 @@ impl TerminalWindow {
     }
 
     fn close_focused(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(tab) = self.tab.as_mut() else { return };
-        let pane_id = tab.active_pane();
-        if matches!(
-            tab.close_pane(pane_id),
-            so1_terminal::layout::CloseResult::LastPane
-        ) {
+        let Some(pane_id) = self.focused_pane_id() else {
+            return;
+        };
+        let close_window = self
+            .tabs
+            .as_mut()
+            .is_none_or(|tabs| close_pane_lifecycle(tabs, pane_id));
+        if close_window {
             self.panes.remove(&pane_id);
             event_loop.exit();
             return;
@@ -639,13 +772,113 @@ impl TerminalWindow {
         if let Some(gpu) = self.gpu.as_ref() {
             self.resize(gpu.config.width, gpu.config.height);
         }
+        self.refresh_window_title();
         self.request_redraw();
     }
 
     fn focus_direction(&mut self, direction: FocusDirection) {
-        if let Some(tab) = self.tab.as_mut() {
+        if let Some(tab) = self.tabs.as_mut().and_then(TabSet::active_mut) {
             tab.move_focus(direction);
         }
+        self.request_redraw();
+    }
+
+    fn refresh_window_title(&self) {
+        let Some(window) = &self.window else { return };
+        let title = self
+            .tabs
+            .as_ref()
+            .and_then(TabSet::active)
+            .and_then(|tab| self.panes.get(&tab.active_pane()))
+            .map(|pane| pane.title.as_str())
+            .unwrap_or("so1sh");
+        window.set_title(&format!("so1term — {title}"));
+    }
+
+    fn new_tab(&mut self) -> Result<(), String> {
+        let cwd = self
+            .focused_pane()
+            .map(|pane| pane.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let tabs = self.tabs.as_mut().ok_or("tab set is not initialized")?;
+        tabs.add_tab();
+        let pane_id = tabs.active().expect("new tab exists").active_pane();
+        let layout = tabs
+            .active()
+            .expect("new tab exists")
+            .layout()
+            .into_iter()
+            .find(|layout| layout.pane == pane_id && !layout.hidden)
+            .ok_or_else(|| "new tab has no visible pane".to_owned())?;
+        let pane = Self::create_pane(
+            pane_id,
+            layout.cols as usize,
+            layout.rows as usize,
+            cwd,
+            self.proxy.clone(),
+        )?;
+        self.panes.insert(pane_id, pane);
+        self.resize(
+            self.gpu.as_ref().map_or(1, |gpu| gpu.config.width),
+            self.gpu.as_ref().map_or(1, |gpu| gpu.config.height),
+        );
+        self.refresh_window_title();
+        self.request_redraw();
+        Ok(())
+    }
+
+    fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(tabs) = self.tabs.as_mut() else {
+            return;
+        };
+        let Some(active) = tabs.active() else { return };
+        let panes = active.layout_tree().panes();
+        if matches!(
+            tabs.close_active(),
+            so1_terminal::layout::TabCloseResult::LastTab
+        ) {
+            self.panes.clear();
+            event_loop.exit();
+            return;
+        }
+        for pane in panes {
+            self.panes.remove(&pane);
+        }
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.resize(gpu.config.width, gpu.config.height);
+        }
+        self.refresh_window_title();
+        self.request_redraw();
+    }
+
+    fn apply_tab_action(&mut self, action: TabAction, event_loop: &ActiveEventLoop) {
+        match action {
+            TabAction::New => {
+                if let Err(error) = self.new_tab() {
+                    eprintln!("so1term: {error}");
+                }
+            }
+            TabAction::Close => self.close_active_tab(event_loop),
+            TabAction::Next => {
+                if let Some(tabs) = self.tabs.as_mut() {
+                    tabs.next();
+                }
+            }
+            TabAction::Previous => {
+                if let Some(tabs) = self.tabs.as_mut() {
+                    tabs.prev();
+                }
+            }
+            TabAction::Select(index) => {
+                if let Some(tabs) = self.tabs.as_mut() {
+                    tabs.select(index);
+                }
+            }
+        }
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.resize(gpu.config.width, gpu.config.height);
+        }
+        self.refresh_window_title();
         self.request_redraw();
     }
 
@@ -751,8 +984,26 @@ impl TerminalWindow {
     fn draw(&mut self) -> Result<FrameRecovery, String> {
         let layouts = self.pane_layouts();
         let focused = self.focused_pane_id();
-        let dividers = self.tab.as_ref().map_or_else(Vec::new, |tab| {
+        let tabs = self.tabs.as_ref();
+        let tab_count = tabs.map_or(0, |tabs| tabs.tabs().len());
+        let active_tab_index = tabs.and_then(TabSet::active_index).unwrap_or(0);
+        let tab_bar_height = self
+            .gpu
+            .as_ref()
+            .map_or(0, |gpu| tab_bar_height(tab_count, gpu.cell_height));
+        let dividers = tabs.and_then(TabSet::active).map_or_else(Vec::new, |tab| {
             tab.layout_tree().divider_rects(tab.active_pane())
+        });
+        let tab_labels: Vec<String> = tabs.map_or_else(Vec::new, |tabs| {
+            tabs.tabs()
+                .iter()
+                .map(|tab| {
+                    self.panes
+                        .get(&tab.active_pane())
+                        .map(|pane| pane.title.clone())
+                        .unwrap_or_else(|| "so1sh".into())
+                })
+                .collect()
         });
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(FrameRecovery::WaitForEvent);
@@ -1155,6 +1406,134 @@ impl TerminalWindow {
             }
             gpu.queue.submit([encoder.finish()]);
         }
+        if tab_count > 1 && tab_bar_height > 0 {
+            gpu.vertices.clear();
+            let tab_width = gpu.config.width as f32 / tab_count as f32;
+            let mut label_buffers = Vec::with_capacity(tab_labels.len());
+            for (index, label) in tab_labels.iter().enumerate() {
+                let left = index as f32 * tab_width;
+                let right = if index + 1 == tab_count {
+                    gpu.config.width as f32
+                } else {
+                    (index + 1) as f32 * tab_width
+                };
+                push_overlay_rect(
+                    &mut gpu.vertices,
+                    left,
+                    0.0,
+                    right,
+                    tab_bar_height as f32,
+                    gpu.config.width as f32,
+                    gpu.config.height as f32,
+                    if index == active_tab_index {
+                        [54, 62, 74]
+                    } else {
+                        [34, 39, 47]
+                    },
+                );
+                let mut buffer = Buffer::new(
+                    &mut gpu.font_system,
+                    Metrics::new(gpu.font_size, gpu.cell_height),
+                );
+                buffer.set_size(
+                    Some((right - left - 10.0).max(1.0)),
+                    Some(tab_bar_height as f32),
+                );
+                let attrs = Attrs::new()
+                    .family(Family::Monospace)
+                    .color(Color::rgb(225, 225, 225));
+                buffer.set_text(label, &attrs, cosmic_text::Shaping::Advanced, None);
+                buffer.shape_until_scroll(&mut gpu.font_system, true);
+                label_buffers.push(buffer);
+            }
+            let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
+            if required > gpu.vertex_buffer_capacity_bytes {
+                let capacity = so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+                    gpu.vertex_buffer_capacity_bytes,
+                    required,
+                );
+                gpu.vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("terminal tab-bar vertex buffer"),
+                    size: capacity as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                gpu.vertex_buffer_capacity_bytes = capacity;
+            }
+            if required > 0 {
+                gpu.queue
+                    .write_buffer(&gpu.vertex_buffer, 0, bytemuck::cast_slice(&gpu.vertices));
+            }
+            let areas: Vec<_> = label_buffers
+                .iter()
+                .enumerate()
+                .map(|(index, buffer)| TextArea {
+                    buffer,
+                    left: index as f32 * tab_width + 5.0,
+                    top: 0.0,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: 0,
+                        right: gpu.config.width as i32,
+                        bottom: tab_bar_height as i32,
+                    },
+                    default_color: Color::rgb(225, 225, 225),
+                    custom_glyphs: &[],
+                })
+                .collect();
+            gpu.viewport.update(
+                &gpu.queue,
+                Resolution {
+                    width: gpu.config.width,
+                    height: gpu.config.height,
+                },
+            );
+            gpu.text_renderer
+                .prepare(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut gpu.font_system,
+                    &mut gpu.atlas,
+                    &gpu.viewport,
+                    areas,
+                    &mut gpu.swash_cache,
+                )
+                .map_err(|error| format!("could not prepare tab labels: {error}"))?;
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("so1term tab bar"),
+                });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("tab bar background and labels"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_scissor_rect(
+                    0,
+                    0,
+                    gpu.config.width,
+                    tab_bar_height.min(gpu.config.height),
+                );
+                pass.set_pipeline(&gpu.rect_pipeline);
+                pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
+                pass.draw(0..gpu.vertices.len() as u32, 0..1);
+                gpu.text_renderer
+                    .render(&gpu.atlas, &gpu.viewport, &mut pass)
+                    .map_err(|error| format!("could not render tab labels: {error}"))?;
+            }
+            gpu.queue.submit([encoder.finish()]);
+        }
         gpu.queue.present(frame);
         Ok(FrameRecovery::WaitForEvent)
     }
@@ -1163,29 +1542,41 @@ impl TerminalWindow {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             for bytes in pane.pty.drain_output() {
                 changed = true;
-                pane.model.feed(&bytes);
+                for observed in pane.model.feed(&bytes) {
+                    if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = observed.event
+                    {
+                        let text = String::from_utf8_lossy(&path).into_owned();
+                        pane.cwd = PathBuf::from(text);
+                        pane.title = pane
+                            .cwd
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("so1sh")
+                            .to_owned();
+                    }
+                }
                 for ev in pane.model.take_events() {
                     match ev {
                         ModelEvent::PtyWrite(bytes) => {
                             let _ = pane.pty.write(&bytes);
                         }
-                        ModelEvent::Title(title) => {
-                            if let Some(window) = &self.window {
-                                window.set_title(&format!("so1term — {title}"));
-                            }
-                        }
-                        ModelEvent::ResetTitle => {
-                            if let Some(window) = &self.window {
-                                window.set_title("so1term");
-                            }
-                        }
+                        ModelEvent::Title(_) | ModelEvent::ResetTitle => {}
                         ModelEvent::Bell | ModelEvent::Other(_) => {}
                     }
                 }
             }
         }
+        if self.focused_pane_id() == Some(pane_id) {
+            self.refresh_window_title();
+        }
         self.poll_child_exit(event_loop);
-        if changed {
+        if changed
+            && self
+                .tabs
+                .as_ref()
+                .is_some_and(|tabs| pane_is_in_active_tab(tabs, pane_id))
+        {
             self.request_redraw();
         }
     }
@@ -1264,6 +1655,16 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     control: self.modifiers.contains(ModifiersState::CONTROL),
                     super_key: self.modifiers.contains(ModifiersState::SUPER),
                 };
+                let tab_count = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
+                if let Some(action) = tab_shortcut(
+                    &event.logical_key,
+                    mods,
+                    cfg!(target_os = "macos"),
+                    tab_count,
+                ) {
+                    self.apply_tab_action(action, event_loop);
+                    return;
+                }
                 let action = block_shortcut(&event.logical_key, mods, cfg!(target_os = "macos"));
                 let action = route_block_shortcut(
                     action,
@@ -1359,7 +1760,22 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             WindowEvent::Ime(winit::event::Ime::Disabled) => self.ime_gate.disable(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = position;
-                if let Some((pane_id, column, row)) = self.pane_and_cell_at_cursor()
+                let endpoint = if let Some(origin) = self.selection_origin {
+                    let gpu = self.gpu.as_ref();
+                    gpu.and_then(|gpu| {
+                        pane_cell_for_id(
+                            position.x,
+                            position.y,
+                            origin,
+                            &self.pane_layouts(),
+                            gpu.cell_width,
+                            gpu.cell_height,
+                        )
+                    })
+                } else {
+                    self.pane_and_cell_at_cursor()
+                };
+                if let Some((pane_id, column, row)) = endpoint
                     && let Some(pane) = self.panes.get_mut(&pane_id)
                     && pane.selection_router.cursor_moved(Some((column, row)))
                         == PointerAction::Extend
@@ -1379,10 +1795,42 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 } else {
                     PointerState::Released
                 };
+                if state == PointerState::Pressed && button == PointerButton::Primary {
+                    let tab_count = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
+                    let bar_height = self
+                        .gpu
+                        .as_ref()
+                        .map_or(0, |gpu| tab_bar_height(tab_count, gpu.cell_height));
+                    if self.cursor_position.y >= 0.0
+                        && self.cursor_position.y < f64::from(bar_height)
+                        && let Some(gpu) = self.gpu.as_ref()
+                        && let Some(index) =
+                            tab_index_at(self.cursor_position.x, gpu.config.width, tab_count)
+                        && let Some(tabs) = self.tabs.as_mut()
+                    {
+                        tabs.select(index);
+                        self.refresh_window_title();
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 let hit = self.pane_and_cell_at_cursor();
                 if state == PointerState::Pressed
+                    && button == PointerButton::Primary
+                    && let Some(previous) = self.selection_origin
+                    && Some(previous) != hit.map(|(pane_id, _, _)| pane_id)
+                    && let Some(pane) = self.panes.get_mut(&previous)
+                {
+                    let _ = pane.selection_router.mouse_input(
+                        PointerButton::Primary,
+                        PointerState::Released,
+                        None,
+                        Instant::now(),
+                    );
+                }
+                if state == PointerState::Pressed
                     && let Some((pane_id, _, _)) = hit
-                    && let Some(tab) = self.tab.as_mut()
+                    && let Some(tab) = self.tabs.as_mut().and_then(TabSet::active_mut)
                 {
                     let _ = tab.focus_by_click(
                         self.cursor_position.x.max(0.0) as u32,
@@ -1390,22 +1838,41 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     );
                     debug_assert_eq!(tab.active_pane(), pane_id);
                 }
-                let action = hit
-                    .and_then(|(pane_id, column, row)| {
+                if state == PointerState::Pressed && button == PointerButton::Primary {
+                    self.selection_origin = hit.map(|(pane_id, _, _)| pane_id);
+                }
+                let route_id =
+                    selection_target(self.selection_origin, hit.map(|(id, _, _)| id), state);
+                let route_cell = route_id.and_then(|id| {
+                    if state == PointerState::Pressed {
+                        hit
+                    } else {
+                        let gpu = self.gpu.as_ref()?;
+                        pane_cell_for_id(
+                            self.cursor_position.x,
+                            self.cursor_position.y,
+                            id,
+                            &self.pane_layouts(),
+                            gpu.cell_width,
+                            gpu.cell_height,
+                        )
+                    }
+                });
+                let action = route_id
+                    .and_then(|pane_id| {
                         let pane = self.panes.get_mut(&pane_id)?;
-                        Some(pane.selection_router.mouse_input(
-                            button,
-                            state,
-                            Some((column, row)),
-                            Instant::now(),
-                        ))
+                        let cell = route_cell.map(|(_, column, row)| (column, row));
+                        Some(
+                            pane.selection_router
+                                .mouse_input(button, state, cell, Instant::now()),
+                        )
                     })
                     .unwrap_or(PointerAction::Ignore);
-                let pane_id = hit.map(|(pane_id, _, _)| pane_id);
+                let pane_id = route_id;
                 match action {
                     PointerAction::Begin(gesture) => {
                         if let (Some((_, column, row)), Some(pane)) = (
-                            hit,
+                            route_cell,
                             pane_id.and_then(|pane_id| self.panes.get_mut(&pane_id)),
                         ) {
                             let kind = match gesture {
@@ -1426,6 +1893,9 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 }
                 if action != PointerAction::Ignore {
                     self.request_redraw();
+                }
+                if state == PointerState::Released && button == PointerButton::Primary {
+                    self.selection_origin = None;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1520,14 +1990,148 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockShortcut, GlyphKey, PaneAction, block_marker_bounds, block_shortcut,
-        glyph_key_requires_reshape, invalidate_glyph_cache, overlay_vertex_range, pane_action,
-        pane_cell_at, route_block_shortcut,
+        BlockShortcut, GlyphKey, PaneAction, TabAction, block_marker_bounds, block_shortcut,
+        close_pane_lifecycle, glyph_key_requires_reshape, invalidate_glyph_cache,
+        overlay_vertex_range, pane_action, pane_cell_at, pane_exit_needs_redraw,
+        pane_is_in_active_tab, route_block_shortcut, selection_target, tab_bar_height,
+        tab_content_rect, tab_index_at, tab_shortcut,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
     use so1_terminal::model::Model;
+    use so1_terminal::selection::PointerState;
     use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn tab_bar_geometry_is_hidden_for_one_tab_and_reserves_one_cell_row_for_many() {
+        let window = Rect::new(0, 0, 800, 600);
+        assert_eq!(tab_bar_height(1, 20.0), 0);
+        assert_eq!(tab_bar_height(2, 20.0), 20);
+        assert_eq!(tab_content_rect(window, 1, 20.0), window);
+        assert_eq!(
+            tab_content_rect(window, 2, 20.0),
+            Rect::new(0, 20, 800, 580)
+        );
+        assert_eq!(tab_index_at(0.0, 800, 2), Some(0));
+        assert_eq!(tab_index_at(799.0, 800, 2), Some(1));
+        assert_eq!(tab_index_at(800.0, 800, 2), None);
+    }
+
+    #[test]
+    fn tab_shortcuts_route_new_close_cycle_and_numbered_selection() {
+        let control_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            tab_shortcut(&Key::Character("t".into()), control_shift, false, 2),
+            Some(TabAction::New)
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Character("q".into()), control_shift, false, 2),
+            Some(TabAction::Close)
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Named(NamedKey::Tab), control, false, 2),
+            Some(TabAction::Next)
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Named(NamedKey::Tab), control_shift, false, 2),
+            Some(TabAction::Previous)
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Character("2".into()), alt, false, 3),
+            Some(TabAction::Select(1))
+        );
+        assert_eq!(
+            tab_shortcut(&Key::Character("9".into()), alt, false, 2),
+            None
+        );
+        assert_eq!(
+            tab_shortcut(
+                &Key::Character("2".into()),
+                Modifiers {
+                    super_key: true,
+                    ..alt
+                },
+                true,
+                3
+            ),
+            Some(TabAction::Select(1))
+        );
+    }
+
+    #[test]
+    fn drag_release_routes_to_the_pane_that_started_selection() {
+        let origin = PaneId(11);
+        let other = PaneId(12);
+        assert_eq!(
+            selection_target(None, Some(origin), PointerState::Pressed),
+            Some(origin)
+        );
+        assert_eq!(
+            selection_target(Some(origin), Some(other), PointerState::Released),
+            Some(origin)
+        );
+        assert_eq!(
+            selection_target(None, Some(other), PointerState::Released),
+            None
+        );
+    }
+
+    #[test]
+    fn hidden_tab_output_does_not_request_a_redraw_for_the_active_tab() {
+        use so1_terminal::layout::{CellSize, TabSet};
+        let mut tabs = TabSet::new(Rect::new(0, 0, 800, 600), CellSize::new(10, 10), 4, 5, 3);
+        let first = tabs.active().unwrap().active_pane();
+        tabs.add_tab();
+        assert_ne!(first, tabs.active().unwrap().active_pane());
+        assert!(pane_is_in_active_tab(
+            &tabs,
+            tabs.active().unwrap().active_pane()
+        ));
+        assert!(!pane_is_in_active_tab(&tabs, first));
+    }
+
+    #[test]
+    fn hidden_tab_exit_only_redraws_when_the_visible_tab_bar_changes() {
+        assert!(!pane_exit_needs_redraw(false, 2, 2));
+        assert!(pane_exit_needs_redraw(false, 2, 1));
+        assert!(pane_exit_needs_redraw(true, 2, 2));
+    }
+
+    #[test]
+    fn pane_exit_uses_the_same_close_lifecycle_and_returns_resized_siblings() {
+        use so1_terminal::layout::{CellSize, Direction, TabSet};
+        let mut tabs = TabSet::new(Rect::new(0, 0, 1200, 600), CellSize::new(10, 10), 4, 5, 3);
+        let left = tabs.active().unwrap().active_pane();
+        let right = tabs
+            .active_mut()
+            .unwrap()
+            .split_focused(Direction::Horizontal)
+            .unwrap();
+        let before = tabs
+            .active()
+            .unwrap()
+            .layout()
+            .into_iter()
+            .find(|pane| pane.pane == left)
+            .unwrap()
+            .cols;
+        assert!(!close_pane_lifecycle(&mut tabs, right));
+        let after = tabs.active().unwrap().layout();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].cols > before);
+    }
 
     #[test]
     fn pointer_routing_uses_visible_pane_rects_and_local_cell_coordinates() {

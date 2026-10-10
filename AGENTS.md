@@ -315,12 +315,21 @@ perpendicular center, top/left position, and PaneId. Pane IDs are globally
 monotonic across trees. Tab navigation wraps; closing the active tab selects the tab now occupying
 its index, or the previous final tab when the removed tab was last.
 
-In the current single-tab window, each pane owns one PTY, VT `Model`, view
-state, wakeup gate, and glyph cache; PTY output notifications carry its globally
-unique `PaneId`. `Ctrl+Shift+D` splits right, `Ctrl+Shift+E` splits down,
-`Ctrl+Shift+W` closes the focused pane, and `Ctrl+Alt+Arrow` moves focus by
-geometry. On macOS, use `Cmd+Shift+D/E/W` and `Cmd+Option+Arrow`. These bindings
-are reserved by so1term and do not replace block navigation (`Ctrl+Shift+Up/Down`).
+Each pane owns one PTY, VT `Model`, view state, wakeup gate, and glyph cache;
+PTY output notifications carry its globally unique `PaneId`. `Ctrl+Shift+D`
+splits right, `Ctrl+Shift+E` splits down, `Ctrl+Shift+W` closes the focused pane,
+and `Ctrl+Alt+Arrow` moves focus by geometry. On macOS, use `Cmd+Shift+D/E/W`
+and `Cmd+Option+Arrow`. Tabs use a single-row bar at the top only while more
+than one tab exists; the bar takes one terminal cell row from every tab's PTY
+grid. `Ctrl+Shift+T` creates a tab, `Ctrl+Shift+Q` closes the active tab,
+`Ctrl+Tab` / `Ctrl+Shift+Tab` cycle tabs, and `Alt+1..9` selects a numbered tab.
+On macOS use `Cmd+Shift+T/Q` and `Cmd+1..9`; Ctrl+Tab cycling remains unchanged.
+`Ctrl+Shift+W` still closes only the focused pane, and closes its tab if that was
+the tab's last pane. A tab label is the active pane's OSC 7 cwd basename, or
+`so1sh` until a cwd mark arrives. Hidden tabs continue draining and applying PTY
+output but do not request redraws. The final pane of the final tab exits the
+window. These bindings are reserved by so1term and do not replace block
+navigation (`Ctrl+Shift+Up/Down`).
 
 ### Embedder Builtins
 

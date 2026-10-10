@@ -123,7 +123,7 @@ impl Model {
         )
     }
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_down(usize::MAX);
+        self.term.scroll_display(Scroll::Bottom);
     }
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
@@ -250,6 +250,16 @@ mod tests {
         m.scroll_down(100);
         assert_eq!(m.display_offset(), 0);
     }
+    #[test]
+    fn scroll_to_bottom_uses_terminal_bottom_position() {
+        let mut model = Model::new(10, 2);
+        model.feed(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        model.scroll_up(100);
+        assert!(model.display_offset() > 0);
+        model.scroll_to_bottom();
+        assert_eq!(model.display_offset(), 0);
+    }
+
     #[test]
     fn terminal_input_modes_follow_application_escape_sequences() {
         let mut m = Model::new(10, 2);

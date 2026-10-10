@@ -28,13 +28,41 @@ pub struct Modifiers {
     pub super_key: bool,
 }
 
+#[derive(Default)]
+pub struct ImePreeditGate {
+    composing: bool,
+}
+impl ImePreeditGate {
+    pub fn preedit(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.composing = true;
+        }
+    }
+    pub fn commit(&mut self) {
+        self.composing = false;
+    }
+    pub fn disable(&mut self) {
+        self.composing = false;
+    }
+    pub fn suppresses_keyboard_text(&self) -> bool {
+        self.composing
+    }
+}
+
 pub fn encode_key(key: Key<'_>, modifiers: Modifiers, application_cursor: bool) -> Option<Vec<u8>> {
     match key {
         Key::Text(value) if modifiers.control => {
             let bytes = value.bytes();
             let b = bytes.into_iter().next()?;
             let c = match b {
-                b'@'..=b'_' => b & 0x1f,
+                b'?' | b'8' => 0x7f,
+                b'2' => 0,
+                b'3' => 0x1b,
+                b'4' => 0x1c,
+                b'5' => 0x1d,
+                b'6' => 0x1e,
+                b'7' => 0x1f,
+                b' '..=b'_' => b & 0x1f,
                 b'a'..=b'z' => b - b'a' + 1,
                 _ => return None,
             };
@@ -42,7 +70,7 @@ pub fn encode_key(key: Key<'_>, modifiers: Modifiers, application_cursor: bool) 
         }
         Key::Text(value) => {
             let mut out = Vec::new();
-            if modifiers.alt || modifiers.super_key {
+            if modifiers.alt {
                 out.push(0x1b);
             }
             out.extend_from_slice(value.as_bytes());
@@ -271,6 +299,67 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn control_text_encodes_xterm_ascii_control_variants() {
+        let cases = [
+            (" ", 0),
+            ("@", 0),
+            ("2", 0),
+            ("?", 0x7f),
+            ("8", 0x7f),
+            ("[", 0x1b),
+            ("3", 0x1b),
+            ("\\", 0x1c),
+            ("4", 0x1c),
+            ("]", 0x1d),
+            ("5", 0x1d),
+            ("^", 0x1e),
+            ("6", 0x1e),
+            ("_", 0x1f),
+            ("7", 0x1f),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                encode_key(
+                    Key::Text(text),
+                    Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                    false
+                )
+                .unwrap(),
+                [expected]
+            );
+        }
+    }
+
+    #[test]
+    fn super_modifier_does_not_prefix_printable_text() {
+        assert_eq!(
+            encode_key(
+                Key::Text("x"),
+                Modifiers {
+                    super_key: true,
+                    ..Default::default()
+                },
+                false
+            )
+            .unwrap(),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn preedit_empty_update_keeps_text_suppressed_until_commit() {
+        let mut state = ImePreeditGate::default();
+        state.preedit("compose");
+        state.preedit("");
+        assert!(state.suppresses_keyboard_text());
+        state.commit();
+        assert!(!state.suppresses_keyboard_text());
     }
 
     #[test]

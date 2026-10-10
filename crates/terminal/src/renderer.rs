@@ -22,24 +22,95 @@ pub enum SurfaceFailure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameRecovery {
-    ReconfigureAndRedraw,
     RetryAfter(Duration),
     WaitForEvent,
 }
 
 pub fn frame_recovery(failure: SurfaceFailure) -> FrameRecovery {
     match failure {
-        SurfaceFailure::Lost | SurfaceFailure::Outdated => FrameRecovery::ReconfigureAndRedraw,
+        SurfaceFailure::Lost | SurfaceFailure::Outdated => {
+            FrameRecovery::RetryAfter(Duration::from_millis(50))
+        }
         SurfaceFailure::Timeout => FrameRecovery::RetryAfter(Duration::from_millis(50)),
         SurfaceFailure::Occluded => FrameRecovery::WaitForEvent,
     }
 }
 
-pub fn next_vertex_capacity(current: usize, required: usize) -> usize {
-    if required <= current {
-        current.max(1)
+#[derive(Default)]
+pub struct SurfaceRetryBackoff {
+    next_ms: u64,
+}
+impl SurfaceRetryBackoff {
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = if self.next_ms == 0 { 50 } else { self.next_ms };
+        self.next_ms = (delay * 2).min(1000);
+        Duration::from_millis(delay)
+    }
+    pub fn reset(&mut self) {
+        self.next_ms = 0;
+    }
+}
+
+#[derive(Default)]
+pub struct WheelAccumulator {
+    remainder: f64,
+}
+impl WheelAccumulator {
+    pub fn push_lines(&mut self, lines: f64) -> i32 {
+        let total = self.remainder + lines;
+        let whole = if total >= 0.0 {
+            (total + 1e-9).floor()
+        } else {
+            (total - 1e-9).ceil()
+        }
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        self.remainder = total - f64::from(whole);
+        whole
+    }
+}
+
+pub fn scaled_font_size(font_size: f32, scale_factor: f64) -> f32 {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor as f32
     } else {
-        required.max(1).next_power_of_two()
+        1.0
+    };
+    (font_size * scale).max(1.0)
+}
+
+pub fn unicode_cell_width(character: char) -> usize {
+    let code = character as u32;
+    if character == '\0'
+        || matches!(code, 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe00..=0xfe0f | 0xfe20..=0xfe2f)
+    {
+        0
+    } else if matches!(code, 0x1100..=0x115f | 0x2329..=0x232a | 0x2e80..=0xa4cf | 0xac00..=0xd7a3 | 0xf900..=0xfaff | 0xfe10..=0xfe19 | 0xfe30..=0xfe6f | 0xff00..=0xff60 | 0xffe0..=0xffe6 | 0x1f300..=0x1faff | 0x20000..=0x3fffd)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn glyph_cell_positions(text: &str, cell_width: f32) -> Vec<f32> {
+    let mut column = 0usize;
+    text.chars()
+        .map(|character| {
+            let x = column as f32 * cell_width;
+            column += unicode_cell_width(character);
+            x
+        })
+        .collect()
+}
+
+pub fn next_vertex_buffer_capacity_bytes(
+    current_capacity_bytes: usize,
+    required_bytes: usize,
+) -> usize {
+    if required_bytes <= current_capacity_bytes {
+        current_capacity_bytes.max(1)
+    } else {
+        required_bytes.max(1).next_power_of_two()
     }
 }
 
@@ -120,6 +191,24 @@ pub fn scaled_cell_metrics(cell_width: f32, cell_height: f32, scale_factor: f64)
     (
         (cell_width * scale).max(1.0),
         (cell_height * scale).max(1.0),
+    )
+}
+
+pub fn project_terminal_metrics(
+    logical_font_size: f32,
+    logical_cell_width: f32,
+    logical_cell_height: f32,
+    scale_factor: f64,
+) -> (f32, f32, f32) {
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor as f32
+    } else {
+        1.0
+    };
+    (
+        (logical_font_size * scale).max(1.0),
+        (logical_cell_width * scale).max(1.0),
+        (logical_cell_height * scale).max(1.0),
     )
 }
 
@@ -262,14 +351,48 @@ mod tests {
     }
 
     #[test]
+    fn surface_loss_backoff_bounds_reconfigure_redraw_rate() {
+        let mut backoff = SurfaceRetryBackoff::default();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(50));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+        for _ in 0..10 {
+            backoff.next_delay();
+        }
+        assert_eq!(backoff.next_delay(), Duration::from_millis(1000));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn anchored_glyph_positions_preserve_terminal_cell_columns() {
+        let positions = glyph_cell_positions("日a\0□🙂", 8.0);
+        assert_eq!(positions, [0.0, 16.0, 24.0, 24.0, 32.0]);
+    }
+
+    #[test]
+    fn wheel_accumulator_quantizes_across_events_and_preserves_direction() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.push_lines(0.4), 0);
+        assert_eq!(wheel.push_lines(0.4), 0);
+        assert_eq!(wheel.push_lines(0.4), 1);
+        assert_eq!(wheel.push_lines(-0.6), 0);
+        assert_eq!(wheel.push_lines(-0.6), -1);
+    }
+
+    #[test]
+    fn font_size_scales_with_hidpi_cell_metrics() {
+        assert_eq!(scaled_font_size(14.0, 2.0), 28.0);
+    }
+
+    #[test]
     fn failed_surface_frame_uses_bounded_retry_policy() {
         assert_eq!(
             frame_recovery(SurfaceFailure::Lost),
-            FrameRecovery::ReconfigureAndRedraw
+            FrameRecovery::RetryAfter(Duration::from_millis(50))
         );
         assert_eq!(
             frame_recovery(SurfaceFailure::Outdated),
-            FrameRecovery::ReconfigureAndRedraw
+            FrameRecovery::RetryAfter(Duration::from_millis(50))
         );
         assert_eq!(
             frame_recovery(SurfaceFailure::Timeout),
@@ -337,9 +460,9 @@ mod tests {
 
     #[test]
     fn vertex_capacity_grows_geometrically_and_is_retained() {
-        assert_eq!(next_vertex_capacity(1024, 700), 1024);
-        assert_eq!(next_vertex_capacity(1024, 1025), 2048);
-        assert_eq!(next_vertex_capacity(0, 1), 1);
+        assert_eq!(next_vertex_buffer_capacity_bytes(1024, 700), 1024);
+        assert_eq!(next_vertex_buffer_capacity_bytes(1024, 1025), 2048);
+        assert_eq!(next_vertex_buffer_capacity_bytes(0, 1), 1);
     }
 
     #[test]
@@ -349,6 +472,22 @@ mod tests {
         let (cw, ch) = scaled_cell_metrics(8.0, 16.0, 1.5);
         assert_eq!(grid_size(1200, 900, cw, ch), (100, 37));
         assert_eq!(scaled_cell_metrics(8.0, 16.0, f64::NAN), (8.0, 16.0));
+    }
+
+    #[test]
+    fn terminal_metric_projection_scales_logical_measurements_once() {
+        assert_eq!(
+            project_terminal_metrics(14.0, 8.0, 19.0, 2.0),
+            (28.0, 16.0, 38.0)
+        );
+        assert_eq!(
+            project_terminal_metrics(14.0, 8.0, 19.0, 1.0),
+            (14.0, 8.0, 19.0)
+        );
+        assert_eq!(
+            project_terminal_metrics(14.0, 8.0, 19.0, f64::NAN),
+            (14.0, 8.0, 19.0)
+        );
     }
 
     #[test]

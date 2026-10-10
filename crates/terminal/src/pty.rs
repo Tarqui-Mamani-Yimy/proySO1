@@ -262,8 +262,29 @@ mod tests {
         let _ = std::fs::remove_file(pid_path);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(
-            !Path::new(&format!("/proc/{child_pid}")).exists(),
-            "reaped shell's background process {child_pid} survived teardown"
+            wait_for_pid_gone_or_zombie(
+                child_pid as libc::pid_t,
+                Instant::now() + Duration::from_secs(2)
+            ),
+            "reaped shell's background process {child_pid} remained runnable after teardown"
+        );
+    }
+
+    #[test]
+    fn group_signal_requires_a_live_member_in_the_recorded_session() {
+        let members = [(10, 10, 10), (11, 11, 99), (12, 10, 88)];
+        assert!(group_has_session_member(10, 10, &members));
+        assert!(!group_has_session_member(10, 11, &members));
+        assert!(!group_has_session_member(99, 10, &members));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stat_state_parser_distinguishes_zombie_from_live() {
+        assert_eq!(process_state_from_stat("123 (sleep) S 1 2 3"), Some('S'));
+        assert_eq!(
+            process_state_from_stat("123 (sleep weird) Z 1 2 3"),
+            Some('Z')
         );
     }
 
@@ -333,8 +354,11 @@ mod tests {
             started.elapsed()
         );
         assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "background process {pid} remains"
+            wait_for_pid_gone_or_zombie(
+                pid as libc::pid_t,
+                Instant::now() + Duration::from_secs(2)
+            ),
+            "background process {pid} remained runnable after teardown"
         );
     }
 }
@@ -662,7 +686,7 @@ fn terminate_child_session(
     session_id: Option<i32>,
     extra_group: Option<u32>,
 ) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(session) = session_id {
         let mut groups = session_process_groups(session);
         if let Some(group) = extra_group.map(|group| group as libc::pid_t) {
@@ -688,7 +712,7 @@ fn terminate_child_session(
             signal_session_group(session, group, libc::SIGKILL);
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = (session_id, extra_group);
 
     match child.try_wait() {
@@ -731,11 +755,66 @@ fn pty_session_id(child: &dyn Child) -> Option<i32> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn group_has_session_member(
+    session: libc::pid_t,
+    group: libc::pid_t,
+    members: &[(libc::pid_t, libc::pid_t, libc::pid_t)],
+) -> bool {
+    members
+        .iter()
+        .any(|&(pid, pgid, sid)| pid > 0 && pgid == group && sid == session)
+}
+
+#[cfg(target_os = "macos")]
+fn session_process_members(session: libc::pid_t) -> Vec<(libc::pid_t, libc::pid_t)> {
+    let mut pids = vec![0 as libc::pid_t; 16_384];
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if count <= 0 {
+        return Vec::new();
+    }
+    pids.truncate((count as usize).min(pids.len()));
+    pids.into_iter()
+        .filter_map(|pid| {
+            if pid <= 0 || unsafe { libc::getsid(pid) } != session {
+                return None;
+            }
+            let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+            let copied = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    std::mem::size_of_val(&info) as libc::c_int,
+                )
+            };
+            if copied != std::mem::size_of_val(&info) as libc::c_int
+                || info.pbi_status == libc::SZOMB
+            {
+                return None;
+            }
+            let group = info.pbi_pgid as libc::pid_t;
+            (group > 0 && unsafe { libc::getpgid(pid) } == group).then_some((pid, group))
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn signal_session_group(session: libc::pid_t, group: libc::pid_t, signal: libc::c_int) {
-    let valid_member = session_process_members(session)
+    let verified_members: Vec<_> = session_process_members(session)
         .into_iter()
-        .any(|(pid, pgid)| pgid == group && unsafe { libc::getsid(pid) } == session);
+        .filter(|&(pid, pgid)| unsafe {
+            libc::getsid(pid) == session && libc::getpgid(pid) == pgid
+        })
+        .map(|(pid, pgid)| (pid, pgid, unsafe { libc::getsid(pid) }))
+        .collect();
+    let valid_member = group_has_session_member(session, group, &verified_members);
     if valid_member {
         unsafe {
             libc::kill(-group, signal);
@@ -761,7 +840,7 @@ fn session_process_members(session: libc::pid_t) -> Vec<(libc::pid_t, libc::pid_
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let after_command = stat.rsplit_once(") ")?.1;
             let fields: Vec<_> = after_command.split_whitespace().collect();
-            if matches!(fields.first().copied(), Some("Z" | "X")) {
+            if matches!(process_state_from_stat(&stat), Some('Z' | 'X')) {
                 return None;
             }
             let process_group = fields.get(2)?.parse::<libc::pid_t>().ok()?;
@@ -772,6 +851,28 @@ fn session_process_members(session: libc::pid_t) -> Vec<(libc::pid_t, libc::pid_
 }
 
 #[cfg(target_os = "linux")]
+fn process_state_from_stat(stat: &str) -> Option<char> {
+    stat.rsplit_once(") ")?.1.chars().next()
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn wait_for_pid_gone_or_zombie(pid: libc::pid_t, deadline: std::time::Instant) -> bool {
+    loop {
+        let path = format!("/proc/{pid}/stat");
+        match std::fs::read_to_string(path) {
+            Ok(stat) if matches!(process_state_from_stat(&stat), Some('Z' | 'X')) => return true,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn session_process_groups(session: libc::pid_t) -> Vec<libc::pid_t> {
     session_process_members(session)
         .into_iter()

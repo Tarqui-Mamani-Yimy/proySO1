@@ -5,11 +5,14 @@ use glyphon::{
 };
 use so1_terminal::{
     clamp_surface_size,
-    keyboard::{Key as TerminalKey, Modifiers as KeyModifiers, encode_ime_commit, encode_key},
+    keyboard::{
+        ImePreeditGate, Key as TerminalKey, Modifiers as KeyModifiers, encode_ime_commit,
+        encode_key,
+    },
     model::{Model, ModelEvent},
     renderer::{
-        ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, WakeupGate, grid_size,
-        scaled_cell_metrics,
+        ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, SurfaceRetryBackoff,
+        WakeupGate, WheelAccumulator, grid_size, project_terminal_metrics, unicode_cell_width,
     },
 };
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -32,7 +35,9 @@ struct TerminalWindow {
     pty: Option<so1_terminal::pty::Pty>,
     failed: bool,
     modifiers: winit::keyboard::ModifiersState,
-    ime_preedit_active: bool,
+    ime_gate: ImePreeditGate,
+    wheel: WheelAccumulator,
+    surface_retry: SurfaceRetryBackoff,
     proxy: EventLoopProxy<UserEvent>,
     pty_wakeup: Arc<WakeupGate>,
     exit_poll: ExitPollBackoff,
@@ -53,19 +58,30 @@ struct GpuState {
     viewport: Viewport,
     cell_width: f32,
     cell_height: f32,
+    font_size: f32,
+    logical_font_size: f32,
     logical_cell_width: f32,
     logical_cell_height: f32,
     rect_pipeline: wgpu::RenderPipeline,
-    line_buffers: Vec<Buffer>,
+    glyph_buffers: Vec<Buffer>,
+    glyph_positions: Vec<(usize, usize)>,
     vertices: Vec<RectVertex>,
     vertex_buffer: wgpu::Buffer,
-    vertex_capacity: usize,
+    vertex_buffer_capacity_bytes: usize,
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RectVertex {
     position: [f32; 2],
     color: [f32; 3],
+}
+
+fn invalidate_glyph_cache<T>(
+    glyph_buffers: &mut Vec<T>,
+    glyph_positions: &mut Vec<(usize, usize)>,
+) {
+    glyph_buffers.clear();
+    glyph_positions.clear();
 }
 impl TerminalWindow {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
@@ -77,7 +93,9 @@ impl TerminalWindow {
             pty: None,
             failed: false,
             modifiers: winit::keyboard::ModifiersState::empty(),
-            ime_preedit_active: false,
+            ime_gate: ImePreeditGate::default(),
+            wheel: WheelAccumulator::default(),
+            surface_retry: SurfaceRetryBackoff::default(),
             proxy,
             pty_wakeup: Arc::new(WakeupGate::default()),
             exit_poll: ExitPollBackoff::new(now),
@@ -145,6 +163,8 @@ impl TerminalWindow {
                     .map(|glyph| (glyph.w.max(1.0), run.line_height.max(1.0)))
             })
             .unwrap_or((font_size * 0.6, font_size * 1.35));
+        let (physical_font_size, physical_cell_width, physical_cell_height) =
+            project_terminal_metrics(font_size, cell_width, cell_height, window.scale_factor());
         let cache = Cache::new(&device);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, config.format);
         let text_renderer =
@@ -188,15 +208,13 @@ impl TerminalWindow {
             multiview_mask: None,
             cache: None,
         });
-        let vertex_capacity = 1024;
+        let vertex_buffer_capacity_bytes = 1024;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terminal reusable cell vertex buffer"),
-            size: vertex_capacity as u64,
+            size: vertex_buffer_capacity_bytes as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (physical_cell_width, physical_cell_height) =
-            scaled_cell_metrics(cell_width, cell_height, window.scale_factor());
         let (cols, rows) = grid_size(width, height, physical_cell_width, physical_cell_height);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let proxy = self.proxy.clone();
@@ -227,13 +245,16 @@ impl TerminalWindow {
             viewport,
             cell_width: physical_cell_width,
             cell_height: physical_cell_height,
+            font_size: physical_font_size,
+            logical_font_size: font_size,
             logical_cell_width: cell_width,
             logical_cell_height: cell_height,
             rect_pipeline,
-            line_buffers: Vec::new(),
+            glyph_buffers: Vec::new(),
+            glyph_positions: Vec::new(),
             vertices: Vec::new(),
             vertex_buffer,
-            vertex_capacity,
+            vertex_buffer_capacity_bytes,
         });
         Ok(())
     }
@@ -295,13 +316,11 @@ impl TerminalWindow {
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Lost => {
                 gpu.surface.configure(&gpu.device, &gpu.config);
-                return Ok(so1_terminal::renderer::frame_recovery(SurfaceFailure::Lost));
+                return Ok(FrameRecovery::RetryAfter(self.surface_retry.next_delay()));
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 gpu.surface.configure(&gpu.device, &gpu.config);
-                return Ok(so1_terminal::renderer::frame_recovery(
-                    SurfaceFailure::Outdated,
-                ));
+                return Ok(FrameRecovery::RetryAfter(self.surface_retry.next_delay()));
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
                 return Ok(so1_terminal::renderer::frame_recovery(
@@ -320,10 +339,10 @@ impl TerminalWindow {
             }
         };
 
+        self.surface_retry.reset();
         let rows = model.visible_cells();
         let cursor = model.cursor();
         let cells = so1_terminal::renderer::render_cells(&rows, (cursor.column, cursor.row));
-        let lines = so1_terminal::renderer::styled_lines(&cells);
         let width = gpu.config.width as f32;
         let height = gpu.config.height as f32;
         gpu.vertices.clear();
@@ -349,39 +368,47 @@ impl TerminalWindow {
             }
         }
 
-        while gpu.line_buffers.len() < lines.len() {
-            gpu.line_buffers.push(Buffer::new(
-                &mut gpu.font_system,
-                Metrics::new(gpu.cell_height / 1.35, gpu.cell_height),
-            ));
-        }
-        for (row, runs) in lines.iter().enumerate() {
-            if runs
-                .iter()
-                .all(|run| run.text.chars().all(char::is_whitespace))
-            {
-                continue;
-            }
-            let buffer = &mut gpu.line_buffers[row];
-            buffer.set_size(Some(width), Some(gpu.cell_height));
-            let default_attrs = Attrs::new().family(Family::Monospace);
-            let spans = runs.iter().map(|run| {
+        gpu.glyph_positions.clear();
+        for (row, row_cells) in cells.iter().enumerate() {
+            for (column, cell) in row_cells.iter().enumerate() {
+                if cell.character.is_whitespace() || cell.character == '\0' {
+                    continue;
+                }
+                let index = gpu.glyph_positions.len();
+                if index == gpu.glyph_buffers.len() {
+                    gpu.glyph_buffers.push(Buffer::new(
+                        &mut gpu.font_system,
+                        Metrics::new(gpu.font_size, gpu.cell_height),
+                    ));
+                }
+                let width_cells = unicode_cell_width(cell.character).max(1);
+                let buffer = &mut gpu.glyph_buffers[index];
+                buffer.set_size(
+                    Some(gpu.cell_width * width_cells as f32),
+                    Some(gpu.cell_height),
+                );
                 let attrs = Attrs::new()
                     .family(Family::Monospace)
                     .color(Color::rgb(
-                        run.foreground[0],
-                        run.foreground[1],
-                        run.foreground[2],
+                        cell.foreground[0],
+                        cell.foreground[1],
+                        cell.foreground[2],
                     ))
-                    .weight(if run.bold {
+                    .weight(if cell.bold {
                         Weight::BOLD
                     } else {
                         Weight::NORMAL
                     });
-                (run.text.as_str(), attrs)
-            });
-            buffer.set_rich_text(spans, &default_attrs, cosmic_text::Shaping::Advanced, None);
-            buffer.shape_until_scroll(&mut gpu.font_system, true);
+                let mut text = [0; 4];
+                buffer.set_text(
+                    cell.character.encode_utf8(&mut text),
+                    &attrs,
+                    cosmic_text::Shaping::Advanced,
+                    None,
+                );
+                buffer.shape_until_scroll(&mut gpu.font_system, true);
+                gpu.glyph_positions.push((row, column));
+            }
         }
         gpu.viewport.update(
             &gpu.queue,
@@ -390,30 +417,23 @@ impl TerminalWindow {
                 height: gpu.config.height,
             },
         );
-        let areas: Vec<_> = lines
+        let areas: Vec<_> = gpu
+            .glyph_positions
             .iter()
             .enumerate()
-            .filter_map(|(row, runs)| {
-                if runs
-                    .iter()
-                    .all(|run| run.text.chars().all(char::is_whitespace))
-                {
-                    return None;
-                }
-                Some(TextArea {
-                    buffer: &gpu.line_buffers[row],
-                    left: 0.0,
-                    top: row as f32 * gpu.cell_height,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: gpu.config.width as i32,
-                        bottom: gpu.config.height as i32,
-                    },
-                    default_color: Color::rgb(220, 220, 220),
-                    custom_glyphs: &[],
-                })
+            .map(|(index, &(row, column))| TextArea {
+                buffer: &gpu.glyph_buffers[index],
+                left: column as f32 * gpu.cell_width,
+                top: row as f32 * gpu.cell_height,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: gpu.config.width as i32,
+                    bottom: gpu.config.height as i32,
+                },
+                default_color: Color::rgb(220, 220, 220),
+                custom_glyphs: &[],
             })
             .collect();
         gpu.text_renderer
@@ -429,15 +449,18 @@ impl TerminalWindow {
             .map_err(|e| format!("could not prepare terminal text: {e}"))?;
 
         let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
-        let capacity = so1_terminal::renderer::next_vertex_capacity(gpu.vertex_capacity, required);
-        if capacity > gpu.vertex_capacity {
+        let capacity = so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+            gpu.vertex_buffer_capacity_bytes,
+            required,
+        );
+        if capacity > gpu.vertex_buffer_capacity_bytes {
             gpu.vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("terminal reusable cell vertex buffer"),
                 size: capacity as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            gpu.vertex_capacity = capacity;
+            gpu.vertex_buffer_capacity_bytes = capacity;
         }
         if required > 0 {
             gpu.queue
@@ -559,7 +582,6 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     return;
                 }
                 match self.draw() {
-                    Ok(FrameRecovery::ReconfigureAndRedraw) => self.request_redraw(),
                     Ok(FrameRecovery::RetryAfter(delay)) => {
                         self.retry_redraw_at = Some(Instant::now() + delay)
                     }
@@ -573,7 +595,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Ime(winit::event::Ime::Preedit(preedit, _)) => {
-                self.ime_preedit_active = !preedit.is_empty();
+                self.ime_gate.preedit(&preedit);
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 if let Some(model) = self.model.as_mut() {
@@ -584,7 +606,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     model.scroll_to_bottom();
                 }
                 self.request_redraw();
-                self.ime_preedit_active = false;
+                self.ime_gate.commit();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let mods = KeyModifiers {
@@ -626,7 +648,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         .filter(|text| !text.is_empty())
                         .map(|text| TerminalKey::Text(text.as_str())),
                 };
-                if !self.ime_preedit_active
+                if !self.ime_gate.suppresses_keyboard_text()
                     && let (Some(key), Some(model)) = (terminal_key, self.model.as_mut())
                 {
                     let app_cursor = model.application_cursor_keys();
@@ -640,34 +662,37 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 self.request_redraw();
             }
             WindowEvent::Ime(winit::event::Ime::Enabled) => {}
-            WindowEvent::Ime(winit::event::Ime::Disabled) => self.ime_preedit_active = false,
+            WindowEvent::Ime(winit::event::Ime::Disabled) => self.ime_gate.disable(),
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(model) = self.model.as_mut()
                     && !model.mouse_or_alternate_screen_active()
                 {
-                    let amount = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y.abs().ceil() as usize,
-                        MouseScrollDelta::PixelDelta(pos) => (pos.y.abs() / 16.0).ceil() as usize,
+                    let line_delta = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                        MouseScrollDelta::PixelDelta(pos) => pos.y / 16.0,
+                    };
+                    let lines = self.wheel.push_lines(line_delta);
+                    if lines > 0 {
+                        model.scroll_up(lines as usize);
                     }
-                    .max(1);
-                    if match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
-                        MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-                    } {
-                        model.scroll_up(amount);
-                    } else {
-                        model.scroll_down(amount);
+                    if lines < 0 {
+                        model.scroll_down(lines.unsigned_abs() as usize);
                     }
-                    self.request_redraw();
+                    if lines != 0 {
+                        self.request_redraw();
+                    }
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    (gpu.cell_width, gpu.cell_height) = scaled_cell_metrics(
+                    (gpu.font_size, gpu.cell_width, gpu.cell_height) = project_terminal_metrics(
+                        gpu.logical_font_size,
                         gpu.logical_cell_width,
                         gpu.logical_cell_height,
                         scale_factor,
                     );
+                    // Buffers retain their Metrics, so discard them when the device scale changes.
+                    invalidate_glyph_cache(&mut gpu.glyph_buffers, &mut gpu.glyph_positions);
                 }
                 if let Some(window) = self.window.as_ref() {
                     let size = window.inner_size();
@@ -701,6 +726,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
         ));
     }
 }
+
 fn main() {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(e) => e,
@@ -716,5 +742,21 @@ fn main() {
     }
     if app.failed {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invalidate_glyph_cache;
+
+    #[test]
+    fn scale_change_invalidates_buffers_with_stale_font_metrics() {
+        let mut buffers = vec![7_u8, 8];
+        let mut positions = vec![(0, 0), (1, 0)];
+
+        invalidate_glyph_cache(&mut buffers, &mut positions);
+
+        assert!(buffers.is_empty());
+        assert!(positions.is_empty());
     }
 }

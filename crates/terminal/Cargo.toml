@@ -1,0 +1,13 @@
+[package]
+name = "so1-terminal"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "so1term"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+wgpu = "30"
+pollster = "0.4"

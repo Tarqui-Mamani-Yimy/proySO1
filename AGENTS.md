@@ -37,7 +37,7 @@ Job resume (`fg`/`bg`) and done/stopped notifications are later Phase 2 tasks.
 ## Architecture
 
 ```
-Cargo.toml        Virtual workspace: crates/epsh and crates/shell
+Cargo.toml        Virtual workspace: crates/epsh, crates/shell, and crates/terminal
 crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
@@ -45,6 +45,9 @@ crates/shell/
   src/jobs.rs     Job table, job specs and the `jobs` builtin
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
+crates/terminal/
+  src/main.rs     so1term window/event loop and wgpu surface clear
+  src/lib.rs      Platform shell candidates and tested surface-size helpers
 crates/epsh/src/
   lib.rs          Public API, module declarations
   main.rs         Thin epsh CLI binary entry point

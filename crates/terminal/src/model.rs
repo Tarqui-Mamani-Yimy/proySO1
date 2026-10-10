@@ -58,6 +58,7 @@ pub struct Model {
     processor: Processor,
     listener: Listener,
     osc: crate::osc::Observer,
+    blocks: crate::blocks::BlockList,
     selection_anchor: Option<Point>,
     selection_anchor_is_start: bool,
     selection_kind: Option<SelectionType>,
@@ -97,6 +98,7 @@ impl Model {
             processor: Processor::new(),
             listener,
             osc: crate::osc::Observer::new(),
+            blocks: crate::blocks::BlockList::default(),
             selection_anchor: None,
             selection_anchor_is_start: true,
             selection_kind: None,
@@ -110,6 +112,7 @@ impl Model {
             .as_ref()
             .and_then(|selection| selection.to_range(&self.term));
         let events = self.osc.feed(bytes);
+        self.blocks.consume(&events);
         self.processor.advance(&mut self.term, bytes);
         if !bytes.is_empty() && self.term.selection.is_some() {
             let range = self
@@ -155,6 +158,11 @@ impl Model {
         }
         events
     }
+
+    pub fn blocks(&self) -> &crate::blocks::BlockList {
+        &self.blocks
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.term.resize(Size {
             cols: cols.max(1),
@@ -370,6 +378,20 @@ mod tests {
             .filter(|character| !character.is_whitespace())
             .collect()
     }
+
+    #[test]
+    fn feed_updates_the_owned_block_list_from_observed_shell_marks() {
+        let mut model = Model::new(20, 2);
+        model.feed(
+            b"\x1b]7;file://host/tmp\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\\x1b]133;D;4\x1b\\",
+        );
+        let blocks = model.blocks().blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].state, crate::blocks::BlockState::Finished);
+        assert_eq!(blocks[0].exit_status, Some(4));
+        assert_eq!(blocks[0].cwd.as_ref().unwrap().path, b"/tmp");
+    }
+
     #[test]
     fn text_sgr_cursor_and_clear_are_emulated() {
         let mut m = Model::new(10, 3);

@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod model;
 pub mod osc;
 pub mod pty;

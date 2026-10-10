@@ -46,11 +46,30 @@ need that control channel).
 - `~/proyectos/so1Shell-refs/wezterm` (kitty keyboard + graphics, mux server/client, unix domain sockets).
 - `~/proyectos/so1Shell-refs/herdr` (persistent server, CLI over socket).
 
+## Decision (T0, Codex spike 2026-10-10; consistent with planing.md §4)
+- Order: kitty keyboard -> kitty graphics -> control API -> persistent server (the server changes who owns every PTY/model, so it goes last).
+- Keyboard: alacritty_terminal 0.26 already implements CSI u mode push/pop/query/set behind `Config::kitty_keyboard` (term/mod.rs:349-365,1275-1328) — our Model uses Config::default() (model.rs:346-360). reedline 0.52.1 has `use_kitty_keyboard_enhancement` (engine.rs:430-441); crossterm 0.29 parses CSI u on Unix only. Windows shell-side support not claimed until tested.
+- Graphics: vte 0.15 has no APC hook (lib.rs:359,377,761-805) -> separate bounded incremental APC observer next to the OSC observer. Per-pane image store + placements anchored to stable rows (reuse the T2 eviction counter); alt-screen placements discarded on exit; width reflow invalidates placements. Textured quads clipped per pane. Limits: 128 MiB/pane, 512 MiB/process, dimension caps, bounded chunk state. File/temp transmission denied by default (opt-in allowed roots, canonicalized, no symlink escape); shared memory deferred.
+- Control: versioned bounded JSON-lines API with request ids; Unix socket in a 0700 runtime dir (socket 0600, ownership check, stale-socket handling), Windows named pipe with current-user ACL, never TCP; worker thread parses, mutations go through EventLoopProxy; send-text and get-text treated as sensitive.
+- Server: extract headless `crates/term-core` (model, blocks, layout) first; server owns PTYs + core state; GUI becomes a rendering/input client; initial snapshot + versioned per-pane deltas with resync; semantic input sent to the server; v1 = one attached GUI per session; attach resize policy decided in T11.
+
 ## Tasks
-- [ ] **T0 — Design spike** (codex-impl, read-only): order and architecture for the four features; how alacritty_terminal 0.26 / vte 0.15 handle kitty keyboard modes and APC graphics sequences; image storage and rendering in our wgpu pipeline; control-socket protocol and transport per platform; server/client split (what moves to the server, wire protocol, reattach, Windows story). Output: decision with tradeoffs, evidence, revised task list.
+- [x] **T0 — Design spike** (codex-impl, read-only) — decision above.
+- [ ] **T1 — Terminal kitty keyboard mode**: enable Term option, expose flags, CSI u encoding per flags, legacy unchanged; tests for push/pop/set/query, flag combos, alt screen.
+- [ ] **T2 — so1sh consumes the keyboard protocol**: reedline enhancement, PTY tests for Ctrl-C/D, Escape, modifiers, restore after errors; Windows limitation documented.
+- [ ] **T3 — Incremental APC parser**: pure, bounded, split chunks, abort/resync, malformed/oversized tests.
+- [ ] **T4 — Graphics data ingestion**: direct RGB/RGBA/PNG, ids, chunking, responses/quiet, quotas, off-thread decode, overflow/bomb tests.
+- [ ] **T5 — Guarded file/temp transmission**: allowed roots, regular-file and size checks, no-follow, temp constraints.
+- [ ] **T6 — Placement model**: per-pane store, stable-row anchors, delete semantics, eviction, alt screen, resize invalidation.
+- [ ] **T7 — Textured image rendering**: GPU texture cache, clipped quads, z-order, Linux smoke.
+- [ ] **T8 — Extract term-core**: headless model/blocks/layout crate; GUI unchanged behavior.
+- [ ] **T9 — Local control API and CLI**: JSON-lines, private socket/named pipe, EventLoopProxy routing, auth and integration tests.
+- [ ] **T10 — Persistent session server**: server owns PTYs/core state; startup, detach, shell exit, stop, recovery tests.
+- [ ] **T11 — Attach protocol and GUI client**: snapshot/delta, resync, semantic input, image blobs, attach/detach smoke.
+- [ ] **T12 — Phase verification**.
 
 ## Verification evidence
 _(filled per task)_
 
 ## Progress / Next step
-- Branch created from `main` (`60f2615`). Next: T0 on codex-impl.
+- Branch created from `main` (`60f2615`). T0 done. Next: T1 on codex-impl.

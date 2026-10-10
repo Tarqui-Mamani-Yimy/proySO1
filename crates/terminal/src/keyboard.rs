@@ -53,14 +53,17 @@ pub fn encode_key(key: Key<'_>, modifiers: Modifiers, application_cursor: bool) 
             let bytes = value.bytes();
             let b = bytes.into_iter().next()?;
             let c = match b {
+                // Xterm's conventional Ctrl aliases are letters plus the
+                // explicit punctuation/digit pairs; other punctuation and
+                // digits must not be folded into unrelated C0 controls.
+                b' ' | b'@' | b'2' => 0,
+                b'[' | b'3' => 0x1b,
+                b'\\' | b'4' => 0x1c,
+                b']' | b'5' => 0x1d,
+                b'^' | b'6' => 0x1e,
+                b'_' | b'7' => 0x1f,
                 b'?' | b'8' => 0x7f,
-                b'2' => 0,
-                b'3' => 0x1b,
-                b'4' => 0x1c,
-                b'5' => 0x1d,
-                b'6' => 0x1e,
-                b'7' => 0x1f,
-                b' '..=b'_' => b & 0x1f,
+                b'A'..=b'Z' => b - b'A' + 1,
                 b'a'..=b'z' => b - b'a' + 1,
                 _ => return None,
             };
@@ -265,6 +268,41 @@ mod tests {
     }
 
     #[test]
+    fn control_punctuation_and_digits_follow_xterm_c0_conventions() {
+        let cases = [
+            (" ", 0),
+            ("@", 0),
+            ("2", 0),
+            ("3", 0x1b),
+            ("4", 0x1c),
+            ("5", 0x1d),
+            ("6", 0x1e),
+            ("7", 0x1f),
+            ("8", 0x7f),
+            ("[", 0x1b),
+            ("\\", 0x1c),
+            ("]", 0x1d),
+            ("^", 0x1e),
+            ("_", 0x1f),
+            ("?", 0x7f),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                encode_key(
+                    Key::Text(text),
+                    Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                    false
+                ),
+                Some(vec![expected]),
+                "Ctrl-{text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn encodes_navigation_and_function_keys_in_normal_and_application_cursor_modes() {
         let cases = [
             (Key::Up, b"\x1b[A".as_slice(), b"\x1bOA".as_slice()),
@@ -307,6 +345,20 @@ mod tests {
             assert_eq!(
                 encode_key(key, Modifiers::default(), false).unwrap(),
                 expected
+            );
+        }
+        for text in ["!", "1", "0", "-"] {
+            assert_eq!(
+                encode_key(
+                    Key::Text(text),
+                    Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                    false,
+                ),
+                None,
+                "Ctrl+{text} is not an xterm C0 alias"
             );
         }
     }

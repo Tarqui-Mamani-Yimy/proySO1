@@ -61,6 +61,9 @@ pub struct WheelAccumulator {
 }
 impl WheelAccumulator {
     pub fn push_lines(&mut self, lines: f64) -> i32 {
+        if !lines.is_finite() {
+            return 0;
+        }
         let total = self.remainder + lines;
         let whole = if total >= 0.0 {
             (total + 1e-9).floor()
@@ -96,15 +99,15 @@ pub fn unicode_cell_width(character: char) -> usize {
     }
 }
 
-pub fn glyph_cell_positions(text: &str, cell_width: f32) -> Vec<f32> {
-    let mut column = 0usize;
-    text.chars()
-        .map(|character| {
-            let x = column as f32 * cell_width;
-            column += unicode_cell_width(character);
-            x
-        })
-        .collect()
+pub fn collect_glyph_positions(rows: &[Vec<RenderCell>], positions: &mut Vec<(usize, usize)>) {
+    positions.clear();
+    for (row, cells) in rows.iter().enumerate() {
+        for (column, cell) in cells.iter().enumerate() {
+            if !cell.character.is_whitespace() && cell.character != '\0' {
+                positions.push((row, column));
+            }
+        }
+    }
 }
 
 pub fn next_vertex_buffer_capacity_bytes(
@@ -368,9 +371,22 @@ mod tests {
     }
 
     #[test]
-    fn anchored_glyph_positions_preserve_terminal_cell_columns() {
-        let positions = glyph_cell_positions("日a\0□🙂", 8.0);
-        assert_eq!(positions, [0.0, 16.0, 24.0, 24.0, 32.0]);
+    fn renderer_glyph_positions_anchor_wide_and_fallback_glyphs_to_cells() {
+        let rows = vec![
+            "日a\0□🙂"
+                .chars()
+                .map(|character| RenderCell {
+                    character,
+                    foreground: [255; 3],
+                    background: [0; 3],
+                    bold: false,
+                    cursor: false,
+                })
+                .collect(),
+        ];
+        let mut positions = Vec::new();
+        collect_glyph_positions(&rows, &mut positions);
+        assert_eq!(positions, [(0, 0), (0, 1), (0, 3), (0, 4)]);
     }
 
     #[test]
@@ -381,6 +397,16 @@ mod tests {
         assert_eq!(wheel.push_lines(0.4), 1);
         assert_eq!(wheel.push_lines(-0.6), 0);
         assert_eq!(wheel.push_lines(-0.6), -1);
+    }
+
+    #[test]
+    fn wheel_accumulator_ignores_non_finite_deltas_without_poisoning_remainder() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.push_lines(f64::NAN), 0);
+        assert_eq!(wheel.push_lines(f64::INFINITY), 0);
+        assert_eq!(wheel.push_lines(f64::NEG_INFINITY), 0);
+        assert_eq!(wheel.push_lines(0.6), 0);
+        assert_eq!(wheel.push_lines(0.5), 1);
     }
 
     #[test]

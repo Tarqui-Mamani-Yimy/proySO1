@@ -7,6 +7,27 @@ pub enum SelectionGesture {
     Lines,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerAction {
+    Begin(SelectionGesture),
+    Extend,
+    Clear,
+    End,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerButton {
+    Primary,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerState {
+    Pressed,
+    Released,
+}
+
 #[derive(Default)]
 pub struct ClickTracker {
     last: Option<(Instant, (usize, usize), u8)>,
@@ -32,6 +53,50 @@ impl ClickTracker {
     }
 }
 
+#[derive(Default)]
+pub struct SelectionRouter {
+    selecting: bool,
+    clicks: ClickTracker,
+}
+
+impl SelectionRouter {
+    pub fn mouse_input(
+        &mut self,
+        button: PointerButton,
+        state: PointerState,
+        cell: Option<(usize, usize)>,
+        now: Instant,
+    ) -> PointerAction {
+        match (button, state) {
+            (PointerButton::Primary, PointerState::Pressed) => {
+                let Some(cell) = cell else {
+                    self.selecting = false;
+                    return PointerAction::Clear;
+                };
+                self.selecting = true;
+                PointerAction::Begin(self.clicks.click(cell, now))
+            }
+            (PointerButton::Primary, PointerState::Released) if self.selecting => {
+                self.selecting = false;
+                PointerAction::End
+            }
+            (_, PointerState::Pressed) => {
+                self.selecting = false;
+                PointerAction::Clear
+            }
+            _ => PointerAction::Ignore,
+        }
+    }
+
+    pub fn cursor_moved(&self, cell: Option<(usize, usize)>) -> PointerAction {
+        if self.selecting && cell.is_some() {
+            PointerAction::Extend
+        } else {
+            PointerAction::Ignore
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +117,37 @@ mod tests {
         assert_eq!(
             clicks.click((5, 2), start + Duration::from_millis(350)),
             SelectionGesture::Simple
+        );
+    }
+
+    #[test]
+    fn pointer_routing_starts_extends_ends_and_clears_selection() {
+        let now = Instant::now();
+        let mut router = SelectionRouter::default();
+        assert_eq!(
+            router.mouse_input(
+                PointerButton::Primary,
+                PointerState::Pressed,
+                Some((2, 1)),
+                now
+            ),
+            PointerAction::Begin(SelectionGesture::Simple)
+        );
+        assert_eq!(router.cursor_moved(Some((4, 1))), PointerAction::Extend);
+        assert_eq!(router.cursor_moved(None), PointerAction::Ignore);
+        assert_eq!(
+            router.mouse_input(
+                PointerButton::Primary,
+                PointerState::Released,
+                Some((4, 1)),
+                now
+            ),
+            PointerAction::End
+        );
+        assert_eq!(router.cursor_moved(Some((4, 1))), PointerAction::Ignore);
+        assert_eq!(
+            router.mouse_input(PointerButton::Other, PointerState::Pressed, None, now),
+            PointerAction::Clear
         );
     }
 }

@@ -7,9 +7,9 @@ use alacritty_terminal::{
     event::{Event as TermEvent, EventListener},
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
-    selection::{Selection, SelectionType},
+    selection::{Selection, SelectionRange, SelectionType},
     term::{
-        Config, Term,
+        Config, LineDamageBounds, Term,
         cell::{Cell, Flags},
     },
 };
@@ -58,6 +58,9 @@ pub struct Model {
     processor: Processor,
     listener: Listener,
     osc: crate::osc::Observer,
+    selection_anchor: Option<Point>,
+    selection_kind: Option<SelectionType>,
+    selection_snapshot: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -93,26 +96,35 @@ impl Model {
             processor: Processor::new(),
             listener,
             osc: crate::osc::Observer::new(),
+            selection_anchor: None,
+            selection_kind: None,
+            selection_snapshot: None,
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<crate::osc::ObservedEvent> {
-        let selection_before = (!bytes.is_empty()).then(|| {
-            self.term
-                .selection
-                .as_ref()
-                .map(|_| self.term.selection_to_string())
-        });
         let events = self.osc.feed(bytes);
         self.processor.advance(&mut self.term, bytes);
-        let selection_after = self
-            .term
-            .selection
-            .as_ref()
-            .map(|_| self.term.selection_to_string());
-        if let Some(before) = selection_before
-            && before != selection_after
-        {
-            self.term.selection = None;
+        if !bytes.is_empty() && self.term.selection.is_some() {
+            let range = self
+                .term
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.to_range(&self.term));
+            let offset = self.term.grid().display_offset();
+            let intersects_selection = match self.term.damage() {
+                alacritty_terminal::term::TermDamage::Full => true,
+                alacritty_terminal::term::TermDamage::Partial(damage) => {
+                    range.is_some_and(|range| {
+                        damage
+                            .into_iter()
+                            .any(|line| damage_intersects_selection(line, offset, range))
+                    })
+                }
+            };
+            self.term.reset_damage();
+            if intersects_selection && self.term.selection_to_string() != self.selection_snapshot {
+                self.clear_selection();
+            }
         }
         events
     }
@@ -152,20 +164,32 @@ impl Model {
         )
     }
     pub fn begin_selection(&mut self, column: usize, row: usize, kind: SelectionType) {
-        self.term.selection = Some(Selection::new(
-            kind,
-            self.selection_point(column, row),
-            Side::Left,
-        ));
+        let point = self.selection_point(column, row);
+        self.selection_anchor = Some(point);
+        self.selection_kind = Some(kind);
+        self.term.selection = Some(Selection::new(kind, point, Side::Left));
+        self.term.reset_damage();
+        self.selection_snapshot = self.term.selection_to_string();
     }
     pub fn extend_selection(&mut self, column: usize, row: usize) {
         let point = self.selection_point(column, row);
-        if let Some(selection) = self.term.selection.as_mut() {
-            selection.update(point, Side::Right);
+        if let (Some(anchor), Some(kind)) = (self.selection_anchor, self.selection_kind) {
+            let (anchor_side, point_side) = if point < anchor {
+                (Side::Right, Side::Left)
+            } else {
+                (Side::Left, Side::Right)
+            };
+            let mut selection = Selection::new(kind, anchor, anchor_side);
+            selection.update(point, point_side);
+            self.term.selection = Some(selection);
+            self.selection_snapshot = self.term.selection_to_string();
         }
     }
     pub fn clear_selection(&mut self) {
         self.term.selection = None;
+        self.selection_anchor = None;
+        self.selection_kind = None;
+        self.selection_snapshot = None;
     }
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
@@ -176,6 +200,28 @@ impl Model {
             .as_ref()
             .and_then(|selection| selection.to_range(&self.term))
             .is_some_and(|range| range.contains(self.selection_point(column, row)))
+    }
+    pub fn selected_cells(&self) -> Vec<(usize, usize)> {
+        let grid = self.term.grid();
+        let Some(range) = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term))
+        else {
+            return Vec::new();
+        };
+        let offset = grid.display_offset() as i32;
+        let mut selected = Vec::new();
+        for row in 0..grid.screen_lines() {
+            let line = Line(row as i32 - offset);
+            for column in 0..grid.columns() {
+                if range.contains(Point::new(line, Column(column))) {
+                    selected.push((column, row));
+                }
+            }
+        }
+        selected
     }
     pub fn scroll_up(&mut self, lines: usize) {
         self.term
@@ -218,6 +264,28 @@ impl Model {
             })
             .collect()
     }
+}
+
+fn damage_intersects_selection(
+    damage: LineDamageBounds,
+    display_offset: usize,
+    selection: SelectionRange,
+) -> bool {
+    let line = Line(damage.line as i32 - display_offset as i32);
+    if line < selection.start.line || line > selection.end.line {
+        return false;
+    }
+    let left = if selection.is_block || line == selection.start.line {
+        selection.start.column.0
+    } else {
+        0
+    };
+    let right = if selection.is_block || line == selection.end.line {
+        selection.end.column.0
+    } else {
+        usize::MAX
+    };
+    damage.left <= right && damage.right >= left
 }
 
 fn visible(cell: &Cell) -> VisibleCell {
@@ -361,6 +429,50 @@ mod tests {
         assert_eq!(model.selection_text().as_deref(), Some("first"));
         assert!(model.cell_selected(4, 0));
         assert!(!model.cell_selected(1, 1));
+    }
+
+    #[test]
+    fn simple_selection_includes_both_endpoints_in_either_drag_direction() {
+        let mut model = Model::new(20, 2);
+        model.feed(b"abcdef");
+        model.begin_selection(1, 0, SelectionType::Simple);
+        model.extend_selection(4, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("bcde"));
+        model.begin_selection(4, 0, SelectionType::Simple);
+        model.extend_selection(1, 0);
+        assert_eq!(model.selection_text().as_deref(), Some("bcde"));
+        assert!(model.cell_selected(1, 0));
+        assert!(model.cell_selected(4, 0));
+        assert_eq!(model.selected_cells(), [(1, 0), (2, 0), (3, 0), (4, 0)]);
+    }
+
+    #[test]
+    fn selection_damage_intersection_uses_visible_columns_and_rows() {
+        let range = SelectionRange::new(
+            Point::new(Line(2), Column(3)),
+            Point::new(Line(3), Column(5)),
+            false,
+        );
+        assert!(damage_intersects_selection(
+            LineDamageBounds::new(2, 3, 4),
+            0,
+            range
+        ));
+        assert!(!damage_intersects_selection(
+            LineDamageBounds::new(2, 0, 2),
+            0,
+            range
+        ));
+        assert!(damage_intersects_selection(
+            LineDamageBounds::new(3, 0, 0),
+            0,
+            range
+        ));
+        assert!(!damage_intersects_selection(
+            LineDamageBounds::new(4, 3, 4),
+            0,
+            range
+        ));
     }
     #[test]
     fn cursor_shape_osc_and_dsr_writeback_are_exposed() {

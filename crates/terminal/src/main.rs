@@ -1,4 +1,5 @@
 use alacritty_terminal::selection::SelectionType;
+use arboard::Clipboard;
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Weight};
 use glyphon::{
     Cache, Color, FontSystem, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
@@ -13,10 +14,10 @@ use so1_terminal::{
     model::{Model, ModelEvent},
     renderer::{
         ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure, SurfaceRetryBackoff,
-        WakeupGate, WheelAccumulator, apply_selection_highlight, grid_size,
-        project_terminal_metrics, unicode_cell_width,
+        WakeupGate, WheelAccumulator, apply_selection_highlight, collect_glyph_positions,
+        grid_size, project_terminal_metrics, unicode_cell_width,
     },
-    selection::{ClickTracker, SelectionGesture},
+    selection::{PointerAction, PointerButton, PointerState, SelectionGesture, SelectionRouter},
 };
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use winit::dpi::PhysicalPosition;
@@ -50,8 +51,8 @@ struct TerminalWindow {
     occluded: bool,
     redraw_pending: bool,
     cursor_position: PhysicalPosition<f64>,
-    selecting: bool,
-    click_tracker: ClickTracker,
+    selection_router: SelectionRouter,
+    clipboard: Option<Clipboard>,
 }
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -71,6 +72,7 @@ struct GpuState {
     logical_cell_height: f32,
     rect_pipeline: wgpu::RenderPipeline,
     glyph_buffers: Vec<Buffer>,
+    glyph_keys: Vec<Option<GlyphKey>>,
     glyph_positions: Vec<(usize, usize)>,
     vertices: Vec<RectVertex>,
     vertex_buffer: wgpu::Buffer,
@@ -83,11 +85,19 @@ struct RectVertex {
     color: [f32; 3],
 }
 
+type GlyphKey = (char, [u8; 3], bool, usize);
+
+fn glyph_key_requires_reshape(cached: Option<GlyphKey>, next: Option<GlyphKey>) -> bool {
+    cached != next
+}
+
 fn invalidate_glyph_cache<T>(
     glyph_buffers: &mut Vec<T>,
+    glyph_keys: &mut Vec<Option<GlyphKey>>,
     glyph_positions: &mut Vec<(usize, usize)>,
 ) {
     glyph_buffers.clear();
+    glyph_keys.clear();
     glyph_positions.clear();
 }
 impl TerminalWindow {
@@ -111,8 +121,8 @@ impl TerminalWindow {
             occluded: false,
             redraw_pending: false,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
-            selecting: false,
-            click_tracker: ClickTracker::default(),
+            selection_router: SelectionRouter::default(),
+            clipboard: None,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -261,6 +271,7 @@ impl TerminalWindow {
             logical_cell_height: cell_height,
             rect_pipeline,
             glyph_buffers: Vec::new(),
+            glyph_keys: Vec::new(),
             glyph_positions: Vec::new(),
             vertices: Vec::new(),
             vertex_buffer,
@@ -332,24 +343,43 @@ impl TerminalWindow {
         ))
     }
 
-    fn copy_selection(&self) {
+    fn clipboard(&mut self) -> Option<&mut Clipboard> {
+        if self.clipboard.is_none() {
+            match Clipboard::new() {
+                Ok(clipboard) => self.clipboard = Some(clipboard),
+                Err(error) => {
+                    eprintln!("so1term: clipboard initialization failed: {error}");
+                    return None;
+                }
+            }
+        }
+        self.clipboard.as_mut()
+    }
+
+    fn copy_selection(&mut self) {
         let Some(text) = self.model.as_ref().and_then(Model::selection_text) else {
             return;
         };
-        if let Err(error) =
-            arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
-        {
+        let Some(clipboard) = self.clipboard() else {
+            return;
+        };
+        if let Err(error) = clipboard.set_text(text) {
             eprintln!("so1term: clipboard copy failed: {error}");
         }
     }
 
     fn paste_clipboard(&mut self) {
-        let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("so1term: clipboard paste failed: {error}");
-                return;
-            }
+        let text = match self
+            .clipboard()
+            .and_then(|clipboard| match clipboard.get_text() {
+                Ok(text) => Some(text),
+                Err(error) => {
+                    eprintln!("so1term: clipboard paste failed: {error}");
+                    None
+                }
+            }) {
+            Some(text) => text,
+            None => return,
         };
         let bracketed = self
             .model
@@ -403,11 +433,9 @@ impl TerminalWindow {
         let rows = model.visible_cells();
         let cursor = model.cursor();
         let mut cells = so1_terminal::renderer::render_cells(&rows, (cursor.column, cursor.row));
-        for (row, row_cells) in cells.iter_mut().enumerate() {
-            for (column, cell) in row_cells.iter_mut().enumerate() {
-                if model.cell_selected(column, row) {
-                    apply_selection_highlight(cell);
-                }
+        for (column, row) in model.selected_cells() {
+            if let Some(cell) = cells.get_mut(row).and_then(|row| row.get_mut(column)) {
+                apply_selection_highlight(cell);
             }
         }
         let width = gpu.config.width as f32;
@@ -435,47 +463,47 @@ impl TerminalWindow {
             }
         }
 
-        gpu.glyph_positions.clear();
-        for (row, row_cells) in cells.iter().enumerate() {
-            for (column, cell) in row_cells.iter().enumerate() {
-                if cell.character.is_whitespace() || cell.character == '\0' {
-                    continue;
-                }
-                let index = gpu.glyph_positions.len();
-                if index == gpu.glyph_buffers.len() {
-                    gpu.glyph_buffers.push(Buffer::new(
-                        &mut gpu.font_system,
-                        Metrics::new(gpu.font_size, gpu.cell_height),
-                    ));
-                }
-                let width_cells = unicode_cell_width(cell.character).max(1);
-                let buffer = &mut gpu.glyph_buffers[index];
-                buffer.set_size(
-                    Some(gpu.cell_width * width_cells as f32),
-                    Some(gpu.cell_height),
-                );
-                let attrs = Attrs::new()
-                    .family(Family::Monospace)
-                    .color(Color::rgb(
-                        cell.foreground[0],
-                        cell.foreground[1],
-                        cell.foreground[2],
-                    ))
-                    .weight(if cell.bold {
-                        Weight::BOLD
-                    } else {
-                        Weight::NORMAL
-                    });
-                let mut text = [0; 4];
-                buffer.set_text(
-                    cell.character.encode_utf8(&mut text),
-                    &attrs,
-                    cosmic_text::Shaping::Advanced,
-                    None,
-                );
-                buffer.shape_until_scroll(&mut gpu.font_system, true);
-                gpu.glyph_positions.push((row, column));
+        collect_glyph_positions(&cells, &mut gpu.glyph_positions);
+        gpu.glyph_keys.resize(gpu.glyph_positions.len(), None);
+        for (index, &(row, column)) in gpu.glyph_positions.iter().enumerate() {
+            let cell = cells[row][column];
+            if index == gpu.glyph_buffers.len() {
+                gpu.glyph_buffers.push(Buffer::new(
+                    &mut gpu.font_system,
+                    Metrics::new(gpu.font_size, gpu.cell_height),
+                ));
             }
+            let width_cells = unicode_cell_width(cell.character).max(1);
+            let key = (cell.character, cell.foreground, cell.bold, width_cells);
+            if !glyph_key_requires_reshape(gpu.glyph_keys[index], Some(key)) {
+                continue;
+            }
+            let buffer = &mut gpu.glyph_buffers[index];
+            buffer.set_size(
+                Some(gpu.cell_width * width_cells as f32),
+                Some(gpu.cell_height),
+            );
+            let attrs = Attrs::new()
+                .family(Family::Monospace)
+                .color(Color::rgb(
+                    cell.foreground[0],
+                    cell.foreground[1],
+                    cell.foreground[2],
+                ))
+                .weight(if cell.bold {
+                    Weight::BOLD
+                } else {
+                    Weight::NORMAL
+                });
+            let mut text = [0; 4];
+            buffer.set_text(
+                cell.character.encode_utf8(&mut text),
+                &attrs,
+                cosmic_text::Shaping::Advanced,
+                None,
+            );
+            buffer.shape_until_scroll(&mut gpu.font_system, true);
+            gpu.glyph_keys[index] = Some(key);
         }
         gpu.viewport.update(
             &gpu.queue,
@@ -744,38 +772,55 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             WindowEvent::Ime(winit::event::Ime::Disabled) => self.ime_gate.disable(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = position;
-                if self.selecting
+                if self.selection_router.cursor_moved(self.cell_at_cursor())
+                    == PointerAction::Extend
                     && let (Some(point), Some(model)) = (self.cell_at_cursor(), self.model.as_mut())
                 {
                     model.extend_selection(point.0, point.1);
                     self.request_redraw();
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (ElementState::Pressed, MouseButton::Left) => {
-                    if let (Some(point), Some(model)) = (self.cell_at_cursor(), self.model.as_mut())
-                    {
-                        let gesture = self.click_tracker.click(point, Instant::now());
-                        let kind = match gesture {
-                            SelectionGesture::Simple => SelectionType::Simple,
-                            SelectionGesture::Semantic => SelectionType::Semantic,
-                            SelectionGesture::Lines => SelectionType::Lines,
-                        };
-                        model.begin_selection(point.0, point.1, kind);
-                        self.selecting = true;
-                        self.request_redraw();
+            WindowEvent::MouseInput { state, button, .. } => {
+                let button = if button == MouseButton::Left {
+                    PointerButton::Primary
+                } else {
+                    PointerButton::Other
+                };
+                let state = if state == ElementState::Pressed {
+                    PointerState::Pressed
+                } else {
+                    PointerState::Released
+                };
+                let action = self.selection_router.mouse_input(
+                    button,
+                    state,
+                    self.cell_at_cursor(),
+                    Instant::now(),
+                );
+                match action {
+                    PointerAction::Begin(gesture) => {
+                        if let (Some(point), Some(model)) =
+                            (self.cell_at_cursor(), self.model.as_mut())
+                        {
+                            let kind = match gesture {
+                                SelectionGesture::Simple => SelectionType::Simple,
+                                SelectionGesture::Semantic => SelectionType::Semantic,
+                                SelectionGesture::Lines => SelectionType::Lines,
+                            };
+                            model.begin_selection(point.0, point.1, kind);
+                        }
                     }
+                    PointerAction::Clear => {
+                        if let Some(model) = self.model.as_mut() {
+                            model.clear_selection();
+                        }
+                    }
+                    _ => {}
                 }
-                (ElementState::Pressed, _) => {
-                    if let Some(model) = self.model.as_mut() {
-                        model.clear_selection();
-                    }
-                    self.selecting = false;
+                if action != PointerAction::Ignore {
                     self.request_redraw();
                 }
-                (ElementState::Released, MouseButton::Left) => self.selecting = false,
-                _ => {}
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(model) = self.model.as_mut()
                     && !model.mouse_or_alternate_screen_active()
@@ -805,7 +850,11 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         scale_factor,
                     );
                     // Buffers retain their Metrics, so discard them when the device scale changes.
-                    invalidate_glyph_cache(&mut gpu.glyph_buffers, &mut gpu.glyph_positions);
+                    invalidate_glyph_cache(
+                        &mut gpu.glyph_buffers,
+                        &mut gpu.glyph_keys,
+                        &mut gpu.glyph_positions,
+                    );
                 }
                 if let Some(window) = self.window.as_ref() {
                     let size = window.inner_size();
@@ -860,16 +909,29 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::invalidate_glyph_cache;
+    use super::{GlyphKey, glyph_key_requires_reshape, invalidate_glyph_cache};
+
+    #[test]
+    fn glyph_cache_reshapes_only_when_a_visible_glyph_changes() {
+        let key = Some(('日', [255, 0, 0], true, 2));
+        assert!(glyph_key_requires_reshape(None, key));
+        assert!(!glyph_key_requires_reshape(key, key));
+        assert!(glyph_key_requires_reshape(
+            key,
+            Some(('日', [0, 255, 0], true, 2))
+        ));
+    }
 
     #[test]
     fn scale_change_invalidates_buffers_with_stale_font_metrics() {
         let mut buffers = vec![7_u8, 8];
+        let mut keys: Vec<Option<GlyphKey>> = vec![Some(('x', [1, 2, 3], false, 1))];
         let mut positions = vec![(0, 0), (1, 0)];
 
-        invalidate_glyph_cache(&mut buffers, &mut positions);
+        invalidate_glyph_cache(&mut buffers, &mut keys, &mut positions);
 
         assert!(buffers.is_empty());
+        assert!(keys.is_empty());
         assert!(positions.is_empty());
     }
 }

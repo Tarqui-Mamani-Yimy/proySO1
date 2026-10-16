@@ -283,6 +283,12 @@ starts a fresh block. Multiline PS2 input remains within one block. Metadata is
 written to the terminal, not through shell output or command redirections.
 Sequences use the 7-bit ST terminator (`ESC \\`). Set
 `SO1SH_SHELL_INTEGRATION=0` to disable all shell-integration sequences.
+On Unix interactive TTYs, so1sh also enables reedline's kitty keyboard
+enhancement when the terminal answers its bounded capability probe. Set
+`SO1SH_KITTY_KEYBOARD=0` to opt out; terminals that do not answer continue
+with legacy key handling after the probe timeout. Windows shell-side kitty
+keyboard consumption is not currently supported. The enhancement is popped
+before shell commands run so child programs receive the terminal's prior mode.
 
 so1term enables alacritty_terminal's kitty keyboard parser and exposes the
 active per-screen flags to its key encoder. With no flags, key bytes remain on

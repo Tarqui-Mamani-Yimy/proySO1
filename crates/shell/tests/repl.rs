@@ -141,6 +141,7 @@ fn session_with_term(args: &[&str], prompt: Option<&str>, term: &str) -> (PtySes
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", term)
         .env("SO1SH_SHELL_INTEGRATION", "0")
+        .env("SO1SH_KITTY_KEYBOARD", "0")
         .env("SO1SH_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
@@ -236,6 +237,49 @@ fn exited(session: &mut PtySession, code: i32) {
     assert!(
         matches!(session.process().wait().unwrap(), WaitStatus::Exited(_, actual) if actual == code)
     );
+}
+
+fn kitty_test_session(enabled: bool) -> (PtySession, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("HOME", dir.path())
+        .env("SO1SH_HIGHLIGHT", "0")
+        .env("SO1SH_KITTY_KEYBOARD", if enabled { "1" } else { "0" })
+        .current_dir(dir.path());
+    let mut session = spawn_command(command, Some(5_000)).unwrap();
+    session.process_mut().set_kill_timeout(Some(5_000));
+    (session, dir)
+}
+
+fn answer_kitty_probe(session: &mut PtySession) -> String {
+    let query = session.exp_string("\x1b[?u").unwrap();
+    send_raw(session, "\x1b[?1u\x1b[?1;2c");
+    query
+}
+
+fn send_raw(session: &mut PtySession, bytes: &str) {
+    session.send(bytes).unwrap();
+    session.flush().unwrap();
+}
+
+fn expect_kitty_output(session: &mut PtySession, expected: &str) -> String {
+    loop {
+        let (before, matched) = session
+            .exp_any(vec![
+                ReadUntil::String(expected.to_owned()),
+                ReadUntil::String("\x1b[6n".to_owned()),
+            ])
+            .unwrap();
+        if matched == "\x1b[6n" {
+            send_raw(session, "\x1b[1;1R");
+        } else {
+            return format!("{before}{matched}");
+        }
+    }
 }
 
 #[test]
@@ -2435,6 +2479,99 @@ fn highlighting_opt_out_keeps_typed_input_unstyled() {
     session.send_control('c').unwrap();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
+fn kitty_keyboard_probe_brackets_only_the_repl_and_handles_control_keys() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = kitty_test_session(true);
+    answer_kitty_probe(&mut session);
+    assert!(expect_kitty_output(&mut session, "\x1b[>1u").contains("\x1b[>1u"));
+    send_raw(&mut session, "\x1b[1;1Runfinished");
+    assert!(expect_kitty_output(&mut session, "unfinished").contains("unfinished"));
+    send_raw(&mut session, "\x1b[99;5u");
+    assert!(expect_kitty_output(&mut session, "\x1b[>1u").contains("\x1b[<1u"));
+    send_raw(&mut session, "\x1b[1;1R\x1b[27uagain");
+    assert!(expect_kitty_output(&mut session, "again").contains("again"));
+    send_raw(&mut session, "\x1b[99;5u");
+    assert!(expect_kitty_output(&mut session, "\x1b[>1u").contains("\x1b[<1u"));
+    send_raw(&mut session, "\x1b[1;1R\x1b[100;5u");
+    assert!(expect_kitty_output(&mut session, "\x1b[<1u").contains("\x1b[<1u"));
+    exited(&mut session, 0);
+}
+
+#[test]
+fn kitty_keyboard_ctrl_c_and_command_errors_restore_protocol_state() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = kitty_test_session(true);
+    answer_kitty_probe(&mut session);
+    expect_kitty_output(&mut session, "\x1b[>1u");
+
+    send_raw(&mut session, "\x1b[1;1Runfinished\x03");
+    let restored = expect_kitty_output(&mut session, "\x1b[<1u");
+    assert!(restored.contains("\x1b[<1u"));
+    expect_kitty_output(&mut session, "\x1b[>1u");
+    expect_kitty_output(&mut session, "$ ");
+
+    send_raw(&mut session, "\x1b[1;1Rfalse\r");
+    let restored_after_error = expect_kitty_output(&mut session, "\x1b[<1u");
+    assert!(restored_after_error.contains("\x1b[<1u"));
+    expect_kitty_output(&mut session, "\x1b[>1u");
+    expect_kitty_output(&mut session, "$ ");
+    send_raw(&mut session, "\x1b[1;1Rexit\r");
+    exited(&mut session, 1);
+}
+
+#[test]
+fn kitty_keyboard_opt_out_and_unanswered_probe_are_bounded() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut disabled, _dir) = kitty_test_session(false);
+    let startup = expect_kitty_output(&mut disabled, "$ ");
+    assert!(!startup.contains("\x1b[?u"));
+    submit(&mut disabled, "echo legacy");
+    disabled.exp_string("legacy\r\n").unwrap();
+    submit(&mut disabled, "exit");
+    exited(&mut disabled, 0);
+
+    let (mut unsupported, _dir) = kitty_test_session(true);
+    let started = std::time::Instant::now();
+    unsupported.exp_string("\x1b[?u").unwrap();
+    expect_kitty_output(&mut unsupported, "$ ");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    submit(&mut unsupported, "exit");
+    exited(&mut unsupported, 0);
+}
+
+#[test]
+fn kitty_ctrl_d_exits_after_popping_flags() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = kitty_test_session(true);
+    answer_kitty_probe(&mut session);
+    expect_kitty_output(&mut session, "\x1b[>1u");
+    send_raw(&mut session, "\x1b[1;1R\x1b[100;5u");
+    assert!(expect_kitty_output(&mut session, "\x1b[<1u").contains("\x1b[<1u"));
+    exited(&mut session, 0);
+}
+
+#[test]
+fn kitty_enter_pops_flags_before_returning_from_read_line() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = kitty_test_session(true);
+    answer_kitty_probe(&mut session);
+    expect_kitty_output(&mut session, "\x1b[>1u");
+    expect_kitty_output(&mut session, "$ ");
+    send_raw(&mut session, "\x1b[1;1Rcat -v");
+    expect_kitty_output(&mut session, "cat -v");
+    send_raw(&mut session, "\r");
+    assert!(expect_kitty_output(&mut session, "\x1b[<1u").contains("\x1b[<1u"));
+    send_raw(&mut session, "\x1b\r");
+    let legacy_key = expect_kitty_output(&mut session, "^[\r\n");
+    assert!(!legacy_key.contains("[27u"));
+    send_raw(&mut session, "\x04");
+    expect_kitty_output(&mut session, "\x1b[>1u");
+    send_raw(&mut session, "\x1b[1;1R\x1b[100;5u");
+    assert!(expect_kitty_output(&mut session, "\x1b[<1u").contains("\x1b[<1u"));
     exited(&mut session, 0);
 }
 

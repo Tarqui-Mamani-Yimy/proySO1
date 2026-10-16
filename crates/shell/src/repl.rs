@@ -212,6 +212,12 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     } else {
         editor = editor.with_highlighter(Box::new(PlainHighlighter));
     }
+    #[cfg(unix)]
+    {
+        let kitty_keyboard_enabled =
+            terminal.is_some() && std::env::var("SO1SH_KITTY_KEYBOARD").as_deref() != Ok("0");
+        editor = editor.use_kitty_keyboard_enhancement(kitty_keyboard_enabled);
+    }
     if shell_integration_enabled {
         editor = editor.with_semantic_markers(Some(Box::new(ShellSemanticMarkers(Arc::clone(
             &marker_state,

@@ -168,7 +168,7 @@ mod tests {
         )
         .unwrap();
         let command = format!(
-            "SO1SH_RC='{}' exec '{}'",
+            "SO1SH_KITTY_KEYBOARD=0 SO1SH_RC='{}' exec '{}'",
             rc_path.display(),
             executable.display()
         );
@@ -221,7 +221,7 @@ mod tests {
         )
         .unwrap();
         let command = format!(
-            "SO1SH_RC='{}' exec '{}'",
+            "SO1SH_KITTY_KEYBOARD=0 SO1SH_RC='{}' exec '{}'",
             rc_path.display(),
             executable.display()
         );

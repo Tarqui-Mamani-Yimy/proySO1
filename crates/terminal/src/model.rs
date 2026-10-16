@@ -1890,7 +1890,10 @@ mod tests {
         let executable = executable.expect(
             "so1sh binary required for real PTY prompt test; run `cargo build -p so1sh` first",
         );
-        let mut pty = crate::pty::Pty::spawn(&executable, "/", 80, 24).expect("spawn built so1sh");
+        let command = format!("SO1SH_KITTY_KEYBOARD=0 exec '{}'", executable.display());
+        let mut pty =
+            crate::pty::Pty::spawn_with_args("/bin/sh", ["-c", command.as_str()], "/", 80, 24)
+                .expect("spawn built so1sh with kitty keyboard negotiation disabled");
         let mut model = Model::new(80, 24);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

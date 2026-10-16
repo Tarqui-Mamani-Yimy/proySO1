@@ -22,7 +22,12 @@ use so1_terminal::{
     },
     selection::{PointerAction, PointerButton, PointerState, SelectionGesture, SelectionRouter},
 };
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 use winit::dpi::PhysicalPosition;
 use winit::{
     application::ApplicationHandler,
@@ -46,6 +51,7 @@ struct TerminalWindow {
     modifiers: winit::keyboard::ModifiersState,
     caps_lock: bool,
     num_lock: bool,
+    consumed_keys: ConsumedKeyPresses,
     ime_gate: ImePreeditGate,
     surface_retry: SurfaceRetryBackoff,
     proxy: EventLoopProxy<UserEvent>,
@@ -56,6 +62,23 @@ struct TerminalWindow {
     redraw_pending: bool,
     cursor_position: PhysicalPosition<f64>,
     clipboard: Option<Clipboard>,
+}
+
+#[derive(Default)]
+struct ConsumedKeyPresses(HashSet<winit::keyboard::PhysicalKey>);
+
+impl ConsumedKeyPresses {
+    fn mark(&mut self, key: winit::keyboard::PhysicalKey) {
+        self.0.insert(key);
+    }
+
+    fn suppress_press(&self, key: winit::keyboard::PhysicalKey) -> bool {
+        self.0.contains(&key)
+    }
+
+    fn suppress_release(&mut self, key: winit::keyboard::PhysicalKey) -> bool {
+        self.0.remove(&key)
+    }
 }
 struct Pane {
     pty: so1_terminal::pty::Pty,
@@ -379,6 +402,53 @@ fn key_from_winit<'a>(
         _ => None,
     };
     if kitty_active && !matches!(key, Key::Character(_)) {
+        let keypad_navigation = match (physical, key) {
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad0),
+                Key::Named(NamedKey::Insert),
+            ) => Some(so1_terminal::keyboard::KeypadKey::Insert),
+            (winit::keyboard::PhysicalKey::Code(KeyCode::Numpad1), Key::Named(NamedKey::End)) => {
+                Some(so1_terminal::keyboard::KeypadKey::End)
+            }
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad2),
+                Key::Named(NamedKey::ArrowDown),
+            ) => Some(so1_terminal::keyboard::KeypadKey::Down),
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad3),
+                Key::Named(NamedKey::PageDown),
+            ) => Some(so1_terminal::keyboard::KeypadKey::PageDown),
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad4),
+                Key::Named(NamedKey::ArrowLeft),
+            ) => Some(so1_terminal::keyboard::KeypadKey::Left),
+            (winit::keyboard::PhysicalKey::Code(KeyCode::Numpad5), Key::Named(NamedKey::Clear)) => {
+                Some(so1_terminal::keyboard::KeypadKey::Begin)
+            }
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad6),
+                Key::Named(NamedKey::ArrowRight),
+            ) => Some(so1_terminal::keyboard::KeypadKey::Right),
+            (winit::keyboard::PhysicalKey::Code(KeyCode::Numpad7), Key::Named(NamedKey::Home)) => {
+                Some(so1_terminal::keyboard::KeypadKey::Home)
+            }
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad8),
+                Key::Named(NamedKey::ArrowUp),
+            ) => Some(so1_terminal::keyboard::KeypadKey::Up),
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::Numpad9),
+                Key::Named(NamedKey::PageUp),
+            ) => Some(so1_terminal::keyboard::KeypadKey::PageUp),
+            (
+                winit::keyboard::PhysicalKey::Code(KeyCode::NumpadDecimal),
+                Key::Named(NamedKey::Delete),
+            ) => Some(so1_terminal::keyboard::KeypadKey::Delete),
+            _ => None,
+        };
+        if let Some(key) = keypad_navigation {
+            return Some(KeyInput::new(TerminalKey::NumpadKey(key)));
+        }
         if let Some(number) = physical_numpad {
             return Some(KeyInput::new(TerminalKey::Numpad(number)));
         }
@@ -700,6 +770,7 @@ impl TerminalWindow {
             modifiers: winit::keyboard::ModifiersState::empty(),
             caps_lock: false,
             num_lock: false,
+            consumed_keys: ConsumedKeyPresses::default(),
             ime_gate: ImePreeditGate::default(),
             surface_retry: SurfaceRetryBackoff::default(),
             proxy,
@@ -1948,6 +2019,9 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 self.ime_gate.commit();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                if self.consumed_keys.suppress_release(event.physical_key) {
+                    return;
+                }
                 let flags = self
                     .focused_pane()
                     .map_or(KeyboardFlags::empty(), |pane| pane.model.keyboard_flags());
@@ -1979,6 +2053,9 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.consumed_keys.suppress_press(event.physical_key) {
+                    return;
+                }
                 if !event.repeat {
                     match &event.logical_key {
                         Key::Named(NamedKey::CapsLock) => self.caps_lock = !self.caps_lock,
@@ -2001,6 +2078,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     active_tab_index,
                 ) {
                     self.apply_tab_action(action, event_loop);
+                    self.consumed_keys.mark(event.physical_key);
                     return;
                 }
                 let action = block_shortcut(&event.logical_key, mods, cfg!(target_os = "macos"));
@@ -2011,6 +2089,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 );
                 if let Some(action) = action {
                     self.handle_block_shortcut(action);
+                    self.consumed_keys.mark(event.physical_key);
                     return;
                 }
                 match pane_action(&event.logical_key, mods, cfg!(target_os = "macos")) {
@@ -2018,20 +2097,24 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         if let Err(error) = self.split_focused(Direction::Horizontal) {
                             eprintln!("so1term: {error}");
                         }
+                        self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                     Some(PaneAction::SplitDown) => {
                         if let Err(error) = self.split_focused(Direction::Vertical) {
                             eprintln!("so1term: {error}");
                         }
+                        self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                     Some(PaneAction::Close) => {
                         self.close_focused(event_loop);
+                        self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                     Some(PaneAction::Focus(direction)) => {
                         self.focus_direction(direction);
+                        self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                     None => {}
@@ -2056,10 +2139,12 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         || (cfg!(target_os = "macos") && mods.super_key);
                     if clipboard_shortcut && text.eq_ignore_ascii_case("c") {
                         self.copy_selection();
+                        self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                     if clipboard_shortcut && text.eq_ignore_ascii_case("v") {
                         self.paste_clipboard();
+                        self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                 }
@@ -2324,13 +2409,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockShortcut, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction, TabAction, TerminalKey,
-        apply_title_event, block_marker_bounds, block_shortcut, close_pane_lifecycle,
-        create_tab_with, cwd_basename_title, encode_key_with_flags, glyph_key_requires_reshape,
-        invalidate_glyph_cache, key_from_winit, modifier_event_state, overlay_vertex_range,
-        pane_action, pane_cell_at, pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title,
-        route_block_shortcut, selection_target, tab_action_changes_geometry, tab_bar_height,
-        tab_content_rect, tab_index_at, tab_shortcut, tab_style,
+        BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction,
+        TabAction, TerminalKey, apply_title_event, block_marker_bounds, block_shortcut,
+        close_pane_lifecycle, create_tab_with, cwd_basename_title, encode_key_with_flags,
+        glyph_key_requires_reshape, invalidate_glyph_cache, key_from_winit, modifier_event_state,
+        overlay_vertex_range, pane_action, pane_cell_at, pane_exit_needs_redraw,
+        pane_is_in_active_tab, pane_tab_title, route_block_shortcut, selection_target,
+        tab_action_changes_geometry, tab_bar_height, tab_content_rect, tab_index_at, tab_shortcut,
+        tab_style,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
@@ -2478,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    fn keypad_special_codes_are_only_used_for_non_text_kitty_events() {
+    fn keypad_navigation_uses_keypad_codes_only_for_non_text_kitty_events() {
         let logical = Key::Character("4".into());
         let legacy = key_from_winit(
             &logical,
@@ -2497,7 +2583,35 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(kitty.key, TerminalKey::Numpad(7));
+        assert_eq!(
+            kitty.key,
+            TerminalKey::NumpadKey(so1_terminal::keyboard::KeypadKey::Home)
+        );
+    }
+
+    #[test]
+    fn numpad_navigation_does_not_become_a_digit_when_numlock_is_off() {
+        let physical = winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Numpad7);
+        let home = Key::Named(NamedKey::Home);
+        let legacy = key_from_winit(&home, None, physical, false).unwrap();
+        assert_eq!(legacy.key, TerminalKey::Home);
+        let kitty = key_from_winit(&home, None, physical, true).unwrap();
+        assert_eq!(
+            kitty.key,
+            TerminalKey::NumpadKey(so1_terminal::keyboard::KeypadKey::Home)
+        );
+    }
+
+    #[test]
+    fn consumed_shortcut_press_suppresses_repeat_and_release() {
+        let key = winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC);
+        let mut consumed = ConsumedKeyPresses::default();
+        consumed.mark(key);
+        assert!(consumed.suppress_press(key));
+        assert!(consumed.suppress_press(key), "repeat remains consumed");
+        assert!(consumed.suppress_release(key));
+        assert!(!consumed.suppress_press(key));
+        assert!(!consumed.suppress_release(key));
     }
 
     #[test]

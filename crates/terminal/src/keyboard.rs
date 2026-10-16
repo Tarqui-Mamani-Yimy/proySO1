@@ -269,6 +269,9 @@ pub fn encode_key_with_flags(
     let all = flags.contains(KeyboardFlags::REPORT_ALL);
     let disambiguate = flags.contains(KeyboardFlags::DISAMBIGUATE);
     let event_types = flags.contains(KeyboardFlags::REPORT_EVENT_TYPES);
+    if matches!(input.key, Key::Modifier(_)) && !all {
+        return None;
+    }
     let base_code = input.key_code.or_else(|| kitty_key_code(input.key))?;
     let is_text = matches!(input.key, Key::Text(_));
     let legacy_control_key = matches!(input.key, Key::Enter | Key::Tab | Key::Backspace)
@@ -668,6 +671,30 @@ mod tests {
             )
             .unwrap(),
             b"\x1bOA"
+        );
+    }
+
+    #[test]
+    fn lone_modifier_keys_require_report_all() {
+        let key = KeyInput::new(Key::Modifier(ModifierKey::LeftControl));
+        for flags in [
+            KeyboardFlags::DISAMBIGUATE,
+            KeyboardFlags::REPORT_EVENT_TYPES,
+        ] {
+            assert_eq!(
+                encode_key_with_flags(key, Modifiers::default(), false, flags, KeyEventKind::Press),
+                None
+            );
+        }
+        assert_eq!(
+            encode_key_with_flags(
+                key,
+                Modifiers::default(),
+                false,
+                KeyboardFlags::REPORT_ALL,
+                KeyEventKind::Press
+            ),
+            Some(b"\x1b[57442u".to_vec())
         );
     }
 

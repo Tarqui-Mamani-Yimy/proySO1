@@ -54,6 +54,7 @@ crates/terminal/
   src/keyboard.rs Xterm and kitty CSI-u key encoding, paste helpers, and IME preedit gate
   src/model.rs    alacritty_terminal adapter, snapshots, selections, and write-back events
   src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
+  src/apc.rs      Bounded incremental APC payload observer over PTY bytes
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
   src/renderer.rs Grid/color helpers and pure block-overlay projection
   src/selection.rs Click tracking and pure mouse-selection routing

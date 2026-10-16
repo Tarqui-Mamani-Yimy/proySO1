@@ -83,6 +83,7 @@ impl ConsumedKeyPresses {
 struct Pane {
     pty: so1_terminal::pty::Pty,
     model: Model,
+    apc_observer: so1_terminal::apc::Observer,
     title: String,
     explicit_title: Option<String>,
     cwd: PathBuf,
@@ -970,6 +971,7 @@ impl TerminalWindow {
         Ok(Pane {
             pty,
             model: Model::new(cols, rows),
+            apc_observer: so1_terminal::apc::Observer::default(),
             title: cwd_basename_title(&cwd),
             explicit_title: None,
             cwd,
@@ -1913,6 +1915,9 @@ impl TerminalWindow {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             for bytes in pane.pty.drain_output() {
                 changed = true;
+                for payload in pane.apc_observer.feed(&bytes) {
+                    Self::observe_apc_payload(&payload);
+                }
                 for observed in pane.model.feed(&bytes) {
                     if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = observed.event
                     {
@@ -1949,6 +1954,10 @@ impl TerminalWindow {
         {
             self.request_redraw();
         }
+    }
+
+    fn observe_apc_payload(_payload: &[u8]) {
+        // Graphics ingestion is introduced by the following task.
     }
 }
 impl ApplicationHandler<UserEvent> for TerminalWindow {

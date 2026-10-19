@@ -5,14 +5,78 @@ use flate2::{Decompress, FlushDecompress, Status};
 use so1_terminal::layout::PaneId;
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::Cursor,
+    fs::{File, OpenOptions},
+    io::{Cursor, Read},
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 
 pub const PANE_LIMIT: usize = 128 * 1024 * 1024;
 pub const PROCESS_LIMIT: usize = 512 * 1024 * 1024;
 pub const DIMENSION_LIMIT: u32 = 10_000;
 const CHUNK_LIMIT: usize = PANE_LIMIT.div_ceil(3) * 4 + 8;
-const SUPPORTED_KEYS: &[&str] = &["a", "f", "i", "I", "s", "v", "t", "o", "S", "m", "q"];
+const SUPPORTED_KEYS: &[&str] = &["a", "f", "i", "I", "s", "v", "t", "o", "S", "O", "m", "q"];
+
+/// Canonical filesystem roots captured once when the terminal starts.
+#[derive(Clone, Debug, Default)]
+pub struct GraphicsFilePolicy {
+    allowed_roots: Vec<AllowedRoot>,
+    temp_root: Option<AllowedRoot>,
+}
+
+#[derive(Clone, Debug)]
+struct AllowedRoot {
+    path: PathBuf,
+    directory: Arc<File>,
+}
+
+impl AllowedRoot {
+    fn open(path: PathBuf) -> Option<Self> {
+        let directory = open_root_directory(&path).ok()?;
+        Some(Self {
+            path,
+            directory: Arc::new(directory),
+        })
+    }
+}
+
+impl GraphicsFilePolicy {
+    pub fn from_env() -> Self {
+        let roots = std::env::var_os("SO1TERM_GRAPHICS_ALLOWED_ROOTS")
+            .into_iter()
+            .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        Self::from_roots(roots, Some(std::env::temp_dir()))
+    }
+
+    fn from_roots(roots: Vec<PathBuf>, temp: Option<PathBuf>) -> Self {
+        let allowed_roots = roots
+            .into_iter()
+            .filter_map(|path| path.canonicalize().ok())
+            .filter(|path| path.is_dir())
+            .filter_map(AllowedRoot::open)
+            .collect();
+        let temp_root = temp
+            .and_then(|path| path.canonicalize().ok())
+            .and_then(AllowedRoot::open);
+        Self {
+            allowed_roots,
+            temp_root,
+        }
+    }
+
+    fn startup() -> &'static Self {
+        static POLICY: OnceLock<GraphicsFilePolicy> = OnceLock::new();
+        POLICY.get_or_init(Self::from_env)
+    }
+}
+
+impl Default for GraphicsProtocol {
+    fn default() -> Self {
+        Self::new(GraphicsFilePolicy::startup().clone())
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ControlData(BTreeMap<String, String>);
@@ -22,6 +86,14 @@ impl ControlData {
         self.0.get(key).map(String::as_str)
     }
     fn number(&self, key: &str) -> Result<Option<u32>, GraphicsError> {
+        self.get(key)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| GraphicsError::invalid("invalid numeric field"))
+            })
+            .transpose()
+    }
+    fn number_u64(&self, key: &str) -> Result<Option<u64>, GraphicsError> {
         self.get(key)
             .map(|v| {
                 v.parse()
@@ -91,6 +163,12 @@ impl GraphicsError {
             message: "invalid image data",
         }
     }
+    fn permission() -> Self {
+        Self {
+            code: "EPERM",
+            message: "file transmission denied",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +230,7 @@ pub struct DecodeJob {
     control: ControlData,
     pub response: ResponseContext,
     pub action: String,
+    file_policy: GraphicsFilePolicy,
 }
 
 pub struct GraphicsCompletion {
@@ -163,10 +242,19 @@ pub struct GraphicsCompletion {
 pub fn decode_transfer(job: DecodeJob) -> GraphicsCompletion {
     let response = job.response.clone();
     let action = job.action.clone();
+    let file_medium = matches!(job.control.get("t"), Some("f" | "t"));
+    let image = decode(job).map_err(|error| {
+        if file_medium {
+            // Do not turn path, permission, or file-size probes into distinct replies.
+            GraphicsError::permission()
+        } else {
+            error
+        }
+    });
     GraphicsCompletion {
         response,
         action,
-        image: decode(job),
+        image,
     }
 }
 
@@ -178,10 +266,10 @@ pub enum Ingest {
     Reply(Option<Vec<u8>>),
 }
 
-#[derive(Default)]
 pub struct GraphicsProtocol {
     chunk: Option<Chunk>,
     decoding: bool,
+    file_policy: GraphicsFilePolicy,
 }
 
 struct Chunk {
@@ -191,6 +279,14 @@ struct Chunk {
 }
 
 impl GraphicsProtocol {
+    pub fn new(file_policy: GraphicsFilePolicy) -> Self {
+        Self {
+            chunk: None,
+            decoding: false,
+            file_policy,
+        }
+    }
+
     pub fn ingest(&mut self, apc: &[u8]) -> Ingest {
         if apc.first() != Some(&b'G') {
             return Ingest::Ignored;
@@ -323,11 +419,254 @@ impl GraphicsProtocol {
             control: metadata,
             response: ctx,
             action,
+            file_policy: self.file_policy.clone(),
         })
     }
     pub fn finish_decode(&mut self) {
         self.decoding = false;
     }
+}
+
+fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, GraphicsError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|_| GraphicsError::invalid("file path is not valid UTF-8"))
+    }
+}
+
+fn read_file_payload(
+    path: &Path,
+    control: &ControlData,
+    policy: &GraphicsFilePolicy,
+    temporary: bool,
+) -> Result<Vec<u8>, GraphicsError> {
+    if policy.allowed_roots.is_empty() || !path.is_absolute() {
+        return Err(GraphicsError::permission());
+    }
+    #[cfg(windows)]
+    {
+        let _ = (path, control, policy, temporary);
+        Err(GraphicsError::permission())
+    }
+    #[cfg(not(windows))]
+    {
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| GraphicsError::permission())?;
+        let allowed_root = policy
+            .allowed_roots
+            .iter()
+            .find(|root| canonical.starts_with(&root.path));
+        let temp_root = policy
+            .temp_root
+            .as_ref()
+            .filter(|root| canonical.starts_with(&root.path));
+        let root = if temporary {
+            allowed_root.or(temp_root)
+        } else {
+            allowed_root
+        }
+        .ok_or_else(GraphicsError::permission)?;
+        if temporary
+            && !canonical
+                .to_string_lossy()
+                .contains("tty-graphics-protocol")
+        {
+            return Err(GraphicsError::permission());
+        }
+        let relative = canonical
+            .strip_prefix(&root.path)
+            .map_err(|_| GraphicsError::permission())?;
+        if relative.as_os_str().is_empty() {
+            return Err(GraphicsError::permission());
+        }
+
+        let canonical_metadata =
+            std::fs::metadata(&canonical).map_err(|_| GraphicsError::permission())?;
+        if !canonical_metadata.is_file() {
+            return Err(GraphicsError::permission());
+        }
+        let mut opened = open_beneath(root, relative)?;
+        let file = &mut opened.file;
+        let opened_metadata = file.metadata().map_err(|_| GraphicsError::permission())?;
+        if !opened_metadata.is_file() || !same_file(&canonical_metadata, &opened_metadata) {
+            return Err(GraphicsError::permission());
+        }
+        let offset = control.number_u64("O")?.unwrap_or(0);
+        let file_len = opened_metadata.len();
+        if offset > file_len {
+            return Err(GraphicsError::invalid("file offset is out of bounds"));
+        }
+        let count = control.number_u64("S")?.unwrap_or(file_len - offset);
+        let end = offset
+            .checked_add(count)
+            .ok_or_else(GraphicsError::permission)?;
+        if end > file_len {
+            return Err(GraphicsError::permission());
+        }
+        if count > PANE_LIMIT.min(PROCESS_LIMIT) as u64 {
+            return Err(GraphicsError::too_large());
+        }
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| GraphicsError::decode())?;
+        let mut bytes = Vec::with_capacity(count as usize);
+        file.take(count)
+            .read_to_end(&mut bytes)
+            .map_err(|_| GraphicsError::permission())?;
+        if bytes.len() as u64 != count {
+            return Err(GraphicsError::permission());
+        }
+        if temporary {
+            unlink_opened_file(&opened)?;
+        }
+        Ok(bytes)
+    }
+}
+
+#[cfg(unix)]
+struct OpenedFile {
+    file: File,
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::CString,
+}
+
+#[cfg(unix)]
+fn open_root_directory(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_root_directory(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no safe directory open",
+    ))
+}
+
+#[cfg(unix)]
+fn open_beneath(root: &AllowedRoot, relative: &Path) -> Result<OpenedFile, GraphicsError> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
+        path::Component,
+    };
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => {
+                CString::new(name.as_bytes()).map_err(|_| GraphicsError::permission())
+            }
+            _ => Err(GraphicsError::permission()),
+        })
+        .collect::<Result<_, _>>()?;
+    let (last, parents) = components
+        .split_last()
+        .ok_or_else(GraphicsError::permission)?;
+    let root_fd = unsafe { libc::dup(root.directory.as_raw_fd()) };
+    if root_fd < 0 {
+        return Err(GraphicsError::permission());
+    }
+    let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for component in parents {
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(GraphicsError::permission());
+        }
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    let fd = unsafe {
+        libc::openat(
+            current.as_raw_fd(),
+            last.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(GraphicsError::permission());
+    }
+    Ok(OpenedFile {
+        file: unsafe { File::from_raw_fd(fd) },
+        parent: current,
+        name: last.clone(),
+    })
+}
+
+#[cfg(unix)]
+fn unlink_opened_file(opened: &OpenedFile) -> Result<(), GraphicsError> {
+    use std::{mem::MaybeUninit, os::fd::AsRawFd};
+    let mut opened_stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(opened.file.as_raw_fd(), opened_stat.as_mut_ptr()) } != 0 {
+        return Err(GraphicsError::permission());
+    }
+    let opened_stat = unsafe { opened_stat.assume_init() };
+    let mut current = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            opened.parent.as_raw_fd(),
+            opened.name.as_ptr(),
+            current.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(GraphicsError::permission());
+    }
+    let current = unsafe { current.assume_init() };
+    if opened_stat.st_dev != current.st_dev || opened_stat.st_ino != current.st_ino {
+        return Err(GraphicsError::permission());
+    }
+    if unsafe { libc::unlinkat(opened.parent.as_raw_fd(), opened.name.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(GraphicsError::permission())
+    }
+}
+
+#[cfg(not(unix))]
+struct OpenedFile {
+    file: File,
+}
+
+#[cfg(not(unix))]
+fn open_beneath(_root: &AllowedRoot, _relative: &Path) -> Result<OpenedFile, GraphicsError> {
+    Err(GraphicsError::permission())
+}
+
+#[cfg(not(unix))]
+fn unlink_opened_file(_opened: &OpenedFile) -> Result<(), GraphicsError> {
+    Err(GraphicsError::permission())
+}
+
+#[cfg(unix)]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn response_hint(control: &[u8]) -> ResponseContext {
@@ -367,14 +706,26 @@ fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsE
         }
         _ => return Err(GraphicsError::invalid("invalid action")),
     }
-    match control.get("t").unwrap_or("d") {
-        "d" => {}
-        "f" | "t" | "s" => {
-            return Err(GraphicsError::unsupported(
-                "transmission medium is not implemented yet",
+    let medium = control.get("t").unwrap_or("d");
+    match medium {
+        "d" | "f" | "t" => {}
+        "s" => return Err(GraphicsError::unsupported("shared memory is not supported")),
+        _ => return Err(GraphicsError::invalid("invalid transmission medium")),
+    }
+    if medium == "f" || medium == "t" {
+        if medium == "t" && (control.get("O").is_some() || control.get("S").is_some()) {
+            return Err(GraphicsError::invalid(
+                "S and O are only supported for file transmission",
             ));
         }
-        _ => return Err(GraphicsError::invalid("invalid transmission medium")),
+        if control.number_u64("S")? == Some(0) {
+            return Err(GraphicsError::invalid("file size must be positive"));
+        }
+        control.number_u64("O")?;
+    } else if control.get("O").is_some() {
+        return Err(GraphicsError::invalid(
+            "O is only supported for file transmission",
+        ));
     }
     let format = control.number("f")?.unwrap_or(32);
     if ![24, 32, 100].contains(&format) {
@@ -391,7 +742,7 @@ fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsE
             .number("v")?
             .ok_or_else(|| GraphicsError::invalid("missing height"))?;
         checked_pixels(width, height, format)?;
-    } else if control.get("o") == Some("z") && control.number("S")?.is_none() {
+    } else if medium == "d" && control.get("o") == Some("z") && control.number("S")?.is_none() {
         return Err(GraphicsError::invalid("compressed PNG requires S"));
     }
     Ok(())
@@ -415,7 +766,17 @@ fn checked_pixels(width: u32, height: u32, format: u32) -> Result<usize, Graphic
 }
 
 pub fn decode(job: DecodeJob) -> Result<DecodedImage, GraphicsError> {
-    let mut bytes = job.payload;
+    let mut bytes = if matches!(job.control.get("t").unwrap_or("d"), "f" | "t") {
+        let path = path_from_bytes(job.payload)?;
+        read_file_payload(
+            &path,
+            &job.control,
+            &job.file_policy,
+            job.control.get("t") == Some("t"),
+        )?
+    } else {
+        job.payload
+    };
     if job.control.get("o") == Some("z") {
         let format = job.control.number("f")?.unwrap_or(32);
         let limit = if format == 100 {
@@ -662,8 +1023,37 @@ mod tests {
     use super::*;
     use std::{
         io::Write,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
+
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "so1term-graphics-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file_policy(root: &Path) -> GraphicsFilePolicy {
+        GraphicsFilePolicy::from_roots(vec![root.to_owned()], Some(std::env::temp_dir()))
+    }
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -880,7 +1270,7 @@ mod tests {
     fn unsupported_medium_replies_with_error() {
         assert!(parse_control(b"a=t,t=f,f=100,i=7").is_ok());
         let Ingest::Reply(Some(response)) =
-            GraphicsProtocol::default().ingest(b"Gt=f,f=100,i=7;AQ==")
+            GraphicsProtocol::default().ingest(b"Gt=s,f=100,i=7;AQ==")
         else {
             panic!("expected reply")
         };
@@ -890,6 +1280,20 @@ mod tests {
                 .contains("ENOTSUP"),
             "{response:?}"
         );
+    }
+
+    #[test]
+    fn file_requests_without_opt_in_reply_permission_error() {
+        let path = std::env::temp_dir().join("so1term-file-opt-in-test");
+        let encoded = STANDARD.encode(path.as_os_str().as_encoded_bytes());
+        let Ingest::Decode(job) = GraphicsProtocol::new(GraphicsFilePolicy::default())
+            .ingest(format!("Gt=f,f=100,i=12;{encoded}").as_bytes())
+        else {
+            panic!("expected background file request")
+        };
+        let completion = decode_transfer(job);
+        let response = reply(&completion.response, completion.image.map(|_| ())).unwrap();
+        assert!(String::from_utf8(response).unwrap().contains("EPERM"));
     }
 
     #[test]
@@ -956,5 +1360,134 @@ mod tests {
             panic!("expected job")
         };
         assert_eq!(job.payload, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn file_medium_is_denied_by_default_and_reads_allowed_slice() {
+        let dir = TestDir::new();
+        let path = dir.path().join("pixels.bin");
+        std::fs::write(&path, [0, 1, 2, 3, 4, 5]).unwrap();
+        let encoded = STANDARD.encode(path.as_os_str().as_encoded_bytes());
+        let request = format!("Gt=f,f=24,s=1,v=1,S=3,O=2,i=9;{encoded}");
+        let Ingest::Decode(job) =
+            GraphicsProtocol::new(file_policy(dir.path())).ingest(request.as_bytes())
+        else {
+            panic!("file request should be decoded asynchronously")
+        };
+        assert_eq!(decode_transfer(job).image.unwrap().rgba, [2, 3, 4, 255]);
+
+        let policy = GraphicsFilePolicy::from_roots(Vec::new(), Some(std::env::temp_dir()));
+        let Ingest::Decode(job) = GraphicsProtocol::new(policy)
+            .ingest(format!("Gt=f,f=24,s=1,v=1,i=9;{encoded}").as_bytes())
+        else {
+            panic!("file requests are validated on the decode worker")
+        };
+        assert_eq!(decode_transfer(job).image.unwrap_err().code, "EPERM");
+    }
+
+    #[test]
+    fn file_guards_reject_outside_traversal_directory_bounds_and_oversize() {
+        let parent = TestDir::new();
+        let dir_path = parent.path().join("allowed");
+        std::fs::create_dir(&dir_path).unwrap();
+        let dir = TestDir(dir_path);
+        let path = parent.path().join("outside.bin");
+        std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+        let policy = file_policy(dir.path());
+        assert!(read_file_payload(&path, &ControlData::default(), &policy, false).is_err());
+        assert!(
+            read_file_payload(
+                &dir.path().join("../outside.bin"),
+                &ControlData::default(),
+                &policy,
+                false
+            )
+            .is_err()
+        );
+        assert!(read_file_payload(dir.path(), &ControlData::default(), &policy, false).is_err());
+
+        let within = dir.path().join("small.bin");
+        std::fs::write(&within, [1, 2, 3, 4]).unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("S".into(), "3".into());
+        fields.insert("O".into(), "2".into());
+        assert!(read_file_payload(&within, &ControlData(fields), &policy, false).is_err());
+        let huge = dir.path().join("huge.bin");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len((PANE_LIMIT + 1) as u64).unwrap();
+        assert!(read_file_payload(&huge, &ControlData::default(), &policy, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_policy_allows_canonical_inside_target_and_rejects_escape() {
+        let dir = TestDir::new();
+        let outside = TestDir::new();
+        let inside_file = dir.path().join("pixels.bin");
+        std::fs::write(&inside_file, [1, 2, 3, 4]).unwrap();
+        let alias = dir.path().join("alias.bin");
+        std::os::unix::fs::symlink(&inside_file, &alias).unwrap();
+        let policy = file_policy(dir.path());
+        assert_eq!(
+            read_file_payload(&alias, &ControlData::default(), &policy, false).unwrap(),
+            [1, 2, 3, 4]
+        );
+        let secret = outside.path().join("secret.bin");
+        std::fs::write(&secret, [5, 6, 7, 8]).unwrap();
+        let escape = dir.path().join("escape.bin");
+        std::os::unix::fs::symlink(secret, &escape).unwrap();
+        assert!(read_file_payload(&escape, &ControlData::default(), &policy, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_rejected_without_blocking_and_temp_file_cleanup_is_guarded() {
+        let dir = TestDir::new();
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let policy = file_policy(dir.path());
+        assert!(read_file_payload(&fifo, &ControlData::default(), &policy, false).is_err());
+
+        let temp = dir.path().join("tty-graphics-protocol-1.png");
+        std::fs::write(&temp, tiny_png(1, 1, &[10, 20, 30, 255])).unwrap();
+        let encoded = STANDARD.encode(temp.as_os_str().as_encoded_bytes());
+        let Ingest::Decode(job) = GraphicsProtocol::new(policy.clone())
+            .ingest(format!("Gt=t,f=100,i=1;{encoded}").as_bytes())
+        else {
+            panic!("expected file decode")
+        };
+        assert!(decode_transfer(job).image.is_ok());
+        assert!(!temp.exists());
+
+        let denied = dir.path().join("not-a-temp-marker.png");
+        std::fs::write(&denied, [1, 2, 3]).unwrap();
+        let encoded = STANDARD.encode(denied.as_os_str().as_encoded_bytes());
+        let Ingest::Decode(job) =
+            GraphicsProtocol::new(policy).ingest(format!("Gt=t,f=100,i=1;{encoded}").as_bytes())
+        else {
+            panic!("expected file decode")
+        };
+        assert!(decode_transfer(job).image.is_err());
+        assert!(denied.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_cleanup_does_not_delete_a_replacement_file() {
+        let dir = TestDir::new();
+        let original = dir.path().join("tty-graphics-protocol-original.png");
+        let moved = dir.path().join("original-moved.png");
+        std::fs::write(&original, [1, 2, 3]).unwrap();
+        let policy = file_policy(dir.path());
+        let root = policy.allowed_roots.first().unwrap();
+        let canonical = original.canonicalize().unwrap();
+        let opened = open_beneath(root, canonical.strip_prefix(&root.path).unwrap()).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::write(&original, [9, 8, 7]).unwrap();
+
+        assert!(unlink_opened_file(&opened).is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), [9, 8, 7]);
+        assert_eq!(std::fs::read(&moved).unwrap(), [1, 2, 3]);
     }
 }

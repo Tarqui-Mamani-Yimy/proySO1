@@ -358,10 +358,11 @@ fn response_hint(control: &[u8]) -> ResponseContext {
 
 fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsError> {
     match action {
-        "t" | "T" | "q" => {}
-        "p" | "d" => {
+        "t" | "q" => {}
+        // Display requests would otherwise report OK for images that never appear.
+        "T" | "p" | "d" => {
             return Err(GraphicsError::unsupported(
-                "placements are not implemented yet",
+                "display and placements are not implemented yet",
             ));
         }
         _ => return Err(GraphicsError::invalid("invalid action")),
@@ -889,6 +890,18 @@ mod tests {
                 .contains("ENOTSUP"),
             "{response:?}"
         );
+    }
+
+    #[test]
+    fn transmit_and_display_replies_unsupported_until_placements_exist() {
+        let Ingest::Reply(Some(response)) =
+            GraphicsProtocol::default().ingest(b"Ga=T,f=24,s=1,v=1,i=5;AAAA")
+        else {
+            panic!("expected reply")
+        };
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("i=5"), "{response:?}");
+        assert!(response.contains("ENOTSUP"), "{response:?}");
     }
 
     #[test]

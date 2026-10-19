@@ -80,7 +80,7 @@ crates/epsh/src/
   sys.rs          Thin libc wrappers
 ```
 
-Kitty graphics ingestion accepts direct RGB, RGBA, and PNG data with bounded base64/zlib decoding. Images are capped at 128 MiB per pane and 512 MiB per process, with dimensions capped at 10,000 per axis and oldest-image eviction. File, temporary-file, and shared-memory transmission are not supported yet; placements and rendering remain separate follow-up tasks.
+Kitty graphics ingestion accepts direct RGB, RGBA, and PNG data with bounded base64/zlib decoding. Images are capped at 128 MiB per pane and 512 MiB per process, with dimensions capped at 10,000 per axis and oldest-image eviction. File, temporary-file, and shared-memory transmission are not supported yet; placements and rendering remain separate follow-up tasks, so transmit-and-display (`a=T`), placement (`a=p`), and delete (`a=d`) requests reply `ENOTSUP`.
 
 ## Embedding API
 

@@ -1,3 +1,6 @@
+#[path = "graphics.rs"]
+mod graphics;
+
 use alacritty_terminal::selection::SelectionType;
 use arboard::Clipboard;
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Weight};
@@ -5,6 +8,7 @@ use glyphon::{
     Cache, Color, FontSystem, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer, Viewport,
 };
+use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest};
 use so1_terminal::{
     clamp_surface_size,
     keyboard::{
@@ -37,9 +41,9 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
-#[derive(Clone, Copy)]
 enum UserEvent {
     PtyOutput(PaneId),
+    GraphicsDecoded(PaneId, GraphicsCompletion),
 }
 struct TerminalWindow {
     window: Option<Arc<Window>>,
@@ -62,6 +66,8 @@ struct TerminalWindow {
     redraw_pending: bool,
     cursor_position: PhysicalPosition<f64>,
     clipboard: Option<Clipboard>,
+    graphics_store: GraphicsStore,
+    next_graphics_image_id: u32,
 }
 
 #[derive(Default)]
@@ -84,6 +90,7 @@ struct Pane {
     pty: so1_terminal::pty::Pty,
     model: Model,
     apc_observer: so1_terminal::apc::Observer,
+    graphics_protocol: GraphicsProtocol,
     title: String,
     explicit_title: Option<String>,
     cwd: PathBuf,
@@ -782,6 +789,8 @@ impl TerminalWindow {
             redraw_pending: false,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
             clipboard: None,
+            graphics_store: GraphicsStore::new(graphics::PANE_LIMIT, graphics::PROCESS_LIMIT),
+            next_graphics_image_id: 1,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -972,6 +981,7 @@ impl TerminalWindow {
             pty,
             model: Model::new(cols, rows),
             apc_observer: so1_terminal::apc::Observer::default(),
+            graphics_protocol: GraphicsProtocol::default(),
             title: cwd_basename_title(&cwd),
             explicit_title: None,
             cwd,
@@ -1057,6 +1067,7 @@ impl TerminalWindow {
                 .as_mut()
                 .is_none_or(|tabs| close_pane_lifecycle(tabs, pane));
             self.panes.remove(&pane);
+            self.graphics_store.remove_pane(pane);
             if close_window {
                 event_loop.exit();
                 return;
@@ -1145,10 +1156,12 @@ impl TerminalWindow {
             .is_none_or(|tabs| close_pane_lifecycle(tabs, pane_id));
         if close_window {
             self.panes.remove(&pane_id);
+            self.graphics_store.remove_pane(pane_id);
             event_loop.exit();
             return;
         }
         self.panes.remove(&pane_id);
+        self.graphics_store.remove_pane(pane_id);
         if let Some(gpu) = self.gpu.as_ref() {
             self.resize(gpu.config.width, gpu.config.height);
         }
@@ -1912,11 +1925,26 @@ impl TerminalWindow {
     }
     fn receive_output(&mut self, pane_id: PaneId, event_loop: &ActiveEventLoop) {
         let mut changed = false;
+        let proxy = self.proxy.clone();
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             for bytes in pane.pty.drain_output() {
                 changed = true;
                 for payload in pane.apc_observer.feed(&bytes) {
-                    Self::observe_apc_payload(&payload);
+                    match pane.graphics_protocol.ingest(&payload) {
+                        Ingest::Ignored | Ingest::Pending => {}
+                        Ingest::Reply(Some(reply)) => {
+                            let _ = pane.pty.write(&reply);
+                        }
+                        Ingest::Reply(None) => {}
+                        Ingest::Decode(job) => {
+                            let sender = proxy.clone();
+                            std::thread::spawn(move || {
+                                let completion = graphics::decode_transfer(job);
+                                let _ = sender
+                                    .send_event(UserEvent::GraphicsDecoded(pane_id, completion));
+                            });
+                        }
+                    }
                 }
                 for observed in pane.model.feed(&bytes) {
                     if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = observed.event
@@ -1956,8 +1984,45 @@ impl TerminalWindow {
         }
     }
 
-    fn observe_apc_payload(_payload: &[u8]) {
-        // Graphics ingestion is introduced by the following task.
+    fn finish_graphics(&mut self, pane_id: PaneId, mut completion: GraphicsCompletion) {
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        pane.graphics_protocol.finish_decode();
+        let result = match completion.image {
+            Ok(image) => {
+                if completion.action != "q" {
+                    let id = if let Some(id) = completion.response.image_id {
+                        id
+                    } else {
+                        let start = self.next_graphics_image_id;
+                        let mut id = start;
+                        while self.graphics_store.get(pane_id, id).is_some() {
+                            id = id.wrapping_add(1);
+                            if id == start {
+                                return;
+                            }
+                        }
+                        self.next_graphics_image_id = id.wrapping_add(1);
+                        id
+                    };
+                    if completion.response.image_number.is_some() {
+                        completion.response.image_id = Some(id);
+                    }
+                    if let Err(error) = self.graphics_store.insert(pane_id, id, image) {
+                        Err(error)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Some(bytes) = graphics::reply(&completion.response, result) {
+            let _ = pane.pty.write(&bytes);
+        }
     }
 }
 impl ApplicationHandler<UserEvent> for TerminalWindow {
@@ -1974,11 +2039,17 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
         self.request_redraw();
     }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::PtyOutput(pane_id) = event;
-        if let Some(pane) = self.panes.get(&pane_id) {
-            pane.wakeup.acknowledge();
+        match event {
+            UserEvent::PtyOutput(pane_id) => {
+                if let Some(pane) = self.panes.get(&pane_id) {
+                    pane.wakeup.acknowledge();
+                }
+                self.receive_output(pane_id, event_loop);
+            }
+            UserEvent::GraphicsDecoded(pane_id, completion) => {
+                self.finish_graphics(pane_id, completion)
+            }
         }
-        self.receive_output(pane_id, event_loop)
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {

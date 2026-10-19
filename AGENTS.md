@@ -55,6 +55,7 @@ crates/terminal/
   src/model.rs    alacritty_terminal adapter, snapshots, selections, and write-back events
   src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
   src/apc.rs      Bounded incremental APC payload observer over PTY bytes
+  src/graphics.rs Kitty graphics APC parsing, bounded decode, and per-pane image storage
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
   src/renderer.rs Grid/color helpers and pure block-overlay projection
   src/selection.rs Click tracking and pure mouse-selection routing
@@ -78,6 +79,8 @@ crates/epsh/src/
   encoding.rs     PUA-based byte preservation for non-UTF-8 data
   sys.rs          Thin libc wrappers
 ```
+
+Kitty graphics ingestion accepts direct RGB, RGBA, and PNG data with bounded base64/zlib decoding. Images are capped at 128 MiB per pane and 512 MiB per process, with dimensions capped at 10,000 per axis and oldest-image eviction. File, temporary-file, and shared-memory transmission are not supported yet; placements and rendering remain separate follow-up tasks.
 
 ## Embedding API
 

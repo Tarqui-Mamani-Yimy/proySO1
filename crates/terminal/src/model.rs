@@ -555,6 +555,23 @@ impl Model {
         self.stable_row_base.saturating_add(self.evicted_rows)
     }
 
+    /// Returns the cursor anchor using the same absolute-row scheme as shell blocks.
+    pub fn cursor_anchor(&self) -> crate::blocks::GridAnchor {
+        self.grid_anchor()
+    }
+
+    pub fn visible_stable_top_row(&self) -> i64 {
+        if self.alternate_screen_active() {
+            0
+        } else {
+            self.visible_top_line()
+        }
+    }
+
+    pub fn grid_dimensions(&self) -> (usize, usize) {
+        (self.term.columns(), self.term.screen_lines())
+    }
+
     pub fn block_viewport_top(&self) -> i64 {
         self.viewport_top_line.unwrap_or_else(|| {
             (self.stable_row_base + self.evicted_rows + self.term.grid().history_size() as u64)

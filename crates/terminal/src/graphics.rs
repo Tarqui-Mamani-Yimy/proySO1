@@ -1,4 +1,4 @@
-//! Bounded kitty graphics protocol ingestion (rendering and placements are separate tasks).
+//! Bounded kitty graphics protocol ingestion; rendering is deferred to T7.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -15,7 +15,12 @@ pub const PANE_LIMIT: usize = 128 * 1024 * 1024;
 pub const PROCESS_LIMIT: usize = 512 * 1024 * 1024;
 pub const DIMENSION_LIMIT: u32 = 10_000;
 const CHUNK_LIMIT: usize = PANE_LIMIT.div_ceil(3) * 4 + 8;
-const SUPPORTED_KEYS: &[&str] = &["a", "f", "i", "I", "s", "v", "t", "o", "S", "O", "m", "q"];
+/// T7 flips this only after placements are rendered for terminal clients.
+pub const GRAPHICS_DISPLAY_ENABLED: bool = false;
+const SUPPORTED_KEYS: &[&str] = &[
+    "a", "d", "f", "i", "I", "s", "v", "t", "o", "S", "O", "m", "q", "p", "x", "y", "w", "h", "c",
+    "r", "X", "Y", "z", "C",
+];
 
 /// Canonical filesystem roots captured once when the terminal starts.
 #[derive(Clone, Debug, Default)]
@@ -120,7 +125,9 @@ pub fn parse_control(bytes: &[u8]) -> Result<ControlData, GraphicsError> {
         if key.is_empty()
             || value.is_empty()
             || !key.bytes().all(|b| b.is_ascii_alphanumeric())
-            || !value.bytes().all(|b| b.is_ascii_alphanumeric())
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || !SUPPORTED_KEYS.contains(&key)
             || fields.insert(key.to_owned(), value.to_owned()).is_some()
         {
@@ -263,7 +270,15 @@ pub enum Ingest {
     Ignored,
     Pending,
     Decode(DecodeJob),
+    Delete(DeleteCommand),
     Reply(Option<Vec<u8>>),
+}
+
+#[derive(Debug)]
+pub struct DeleteCommand {
+    pub response: ResponseContext,
+    pub selector: crate::placements::DeleteSelector,
+    pub frees_data: bool,
 }
 
 pub struct GraphicsProtocol {
@@ -405,6 +420,21 @@ impl GraphicsProtocol {
             return Ingest::Reply(reply(&ctx, Err(GraphicsError::too_large())));
         }
         let action = metadata.get("a").unwrap_or("t").to_owned();
+        if action == "d" {
+            self.chunk = None;
+            if !combined.is_empty() {
+                return Ingest::Reply(reply(
+                    &ctx,
+                    Err(GraphicsError::invalid(
+                        "delete action cannot include image data",
+                    )),
+                ));
+            }
+            return match parse_delete(&metadata, ctx) {
+                Ok(command) => Ingest::Delete(command),
+                Err((response, error)) => Ingest::Reply(reply(&response, Err(error))),
+            };
+        }
         if let Err(error) = validate_request(&metadata, &action) {
             return Ingest::Reply(reply(&ctx, Err(error)));
         }
@@ -699,10 +729,8 @@ fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsE
     match action {
         "t" | "q" => {}
         // Display requests would otherwise report OK for images that never appear.
-        "T" | "p" | "d" => {
-            return Err(GraphicsError::unsupported(
-                "display and placements are not implemented yet",
-            ));
+        "T" | "p" if !GRAPHICS_DISPLAY_ENABLED => {
+            return Err(GraphicsError::unsupported("image display is not enabled"));
         }
         _ => return Err(GraphicsError::invalid("invalid action")),
     }
@@ -746,6 +774,77 @@ fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsE
         return Err(GraphicsError::invalid("compressed PNG requires S"));
     }
     Ok(())
+}
+
+fn parse_delete(
+    control: &ControlData,
+    response: ResponseContext,
+) -> Result<DeleteCommand, (ResponseContext, GraphicsError)> {
+    let invalid = |message| (response.clone(), GraphicsError::invalid(message));
+    let mode = control.get("d").unwrap_or("a");
+    let placement_id = || {
+        control
+            .number("p")
+            .map(|value| value.filter(|id| *id != 0))
+            .map_err(|_| invalid("invalid placement id"))
+    };
+    let selector = match mode {
+        "a" | "A" => crate::placements::DeleteSelector::All,
+        "i" | "I" => crate::placements::DeleteSelector::Image {
+            id: control
+                .number("i")
+                .map_err(|_| invalid("image id is required"))?
+                .ok_or_else(|| invalid("image id is required"))?,
+            placement_id: placement_id()?,
+        },
+        "n" | "N" => crate::placements::DeleteSelector::ImageNumber {
+            number: control
+                .number("I")
+                .map_err(|_| invalid("image number is required"))?
+                .ok_or_else(|| invalid("image number is required"))?,
+            placement_id: placement_id()?,
+        },
+        "c" | "C" => crate::placements::DeleteSelector::CursorCell,
+        "p" | "P" => crate::placements::DeleteSelector::Cell {
+            column: (control
+                .number("x")
+                .map_err(|_| invalid("x and y are required"))?
+                .ok_or_else(|| invalid("x and y are required"))? as usize)
+                .saturating_sub(1),
+            row: control
+                .number("y")
+                .map_err(|_| invalid("x and y are required"))?
+                .ok_or_else(|| invalid("x and y are required"))? as i64
+                - 1,
+        },
+        "x" | "X" => crate::placements::DeleteSelector::Column {
+            column: (control
+                .number("x")
+                .map_err(|_| invalid("x is required"))?
+                .ok_or_else(|| invalid("x is required"))? as usize)
+                .saturating_sub(1),
+        },
+        "y" | "Y" => crate::placements::DeleteSelector::Row {
+            row: control
+                .number("y")
+                .map_err(|_| invalid("y is required"))?
+                .ok_or_else(|| invalid("y is required"))? as i64
+                - 1,
+        },
+        "z" | "Z" => crate::placements::DeleteSelector::ZIndex {
+            z: control
+                .get("z")
+                .ok_or_else(|| invalid("z is required"))?
+                .parse()
+                .map_err(|_| invalid("invalid z-index"))?,
+        },
+        _ => return Err(invalid("unsupported delete mode")),
+    };
+    Ok(DeleteCommand {
+        response,
+        selector,
+        frees_data: mode.bytes().next().is_some_and(|c| c.is_ascii_uppercase()),
+    })
 }
 
 fn checked_pixels(width: u32, height: u32, format: u32) -> Result<usize, GraphicsError> {
@@ -923,6 +1022,7 @@ pub struct GraphicsStore {
     total_bytes: usize,
     pane_limit: usize,
     process_limit: usize,
+    evicted: Vec<(PaneId, u32)>,
 }
 
 impl GraphicsStore {
@@ -973,6 +1073,12 @@ impl GraphicsStore {
     pub fn get(&self, pane: PaneId, id: u32) -> Option<&DecodedImage> {
         self.panes.get(&pane)?.get(&id)
     }
+    pub fn remove_image(&mut self, pane: PaneId, id: u32) {
+        self.remove(pane, id);
+    }
+    pub fn take_evicted(&mut self) -> Vec<(PaneId, u32)> {
+        std::mem::take(&mut self.evicted)
+    }
     pub fn remove_pane(&mut self, pane: PaneId) {
         let ids: Vec<_> = self
             .panes
@@ -1010,6 +1116,7 @@ impl GraphicsStore {
             return false;
         };
         if let Some((candidate, id)) = self.order.remove(position) {
+            self.evicted.push((candidate, id));
             self.remove(candidate, id);
             true
         } else {
@@ -1306,6 +1413,87 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("i=5"), "{response:?}");
         assert!(response.contains("ENOTSUP"), "{response:?}");
+
+        let Ingest::Reply(Some(response)) = GraphicsProtocol::default().ingest(b"Ga=p,i=5;") else {
+            panic!("expected placement request to remain disabled")
+        };
+        assert!(String::from_utf8(response).unwrap().contains("ENOTSUP"));
+    }
+
+    #[test]
+    fn delete_requests_reach_the_placement_store_and_keep_quiet_reply_rules() {
+        let Ingest::Delete(command) = GraphicsProtocol::default().ingest(b"Ga=d,d=a,i=5;") else {
+            panic!("expected delete command")
+        };
+        assert_eq!(command.selector, crate::placements::DeleteSelector::All);
+        assert!(!command.frees_data);
+        assert_eq!(
+            reply(&command.response, Ok(())).unwrap(),
+            b"\x1b_Gi=5;OK\x1b\\"
+        );
+
+        let Ingest::Delete(command) = GraphicsProtocol::default().ingest(b"Ga=d,d=Z,z=-2,i=5,q=1;")
+        else {
+            panic!("expected uppercase z delete command")
+        };
+        assert!(command.frees_data);
+        assert_eq!(
+            command.selector,
+            crate::placements::DeleteSelector::ZIndex { z: -2 }
+        );
+        assert!(reply(&command.response, Ok(())).is_none());
+
+        let Ingest::Reply(Some(error)) = GraphicsProtocol::default().ingest(b"Ga=p,i=5,q=0;")
+        else {
+            panic!("placement remains unsupported")
+        };
+        assert!(String::from_utf8(error).unwrap().contains("ENOTSUP"));
+    }
+
+    #[test]
+    fn protocol_parses_each_supported_delete_selector() {
+        let cases = [
+            (
+                b"Ga=d,d=i,i=9;".as_slice(),
+                crate::placements::DeleteSelector::Image {
+                    id: 9,
+                    placement_id: None,
+                },
+            ),
+            (
+                b"Ga=d,d=n,I=12,p=3;".as_slice(),
+                crate::placements::DeleteSelector::ImageNumber {
+                    number: 12,
+                    placement_id: Some(3),
+                },
+            ),
+            (
+                b"Ga=d,d=c;".as_slice(),
+                crate::placements::DeleteSelector::CursorCell,
+            ),
+            (
+                b"Ga=d,d=p,x=2,y=4;".as_slice(),
+                crate::placements::DeleteSelector::Cell { column: 1, row: 3 },
+            ),
+            (
+                b"Ga=d,d=x,x=2;".as_slice(),
+                crate::placements::DeleteSelector::Column { column: 1 },
+            ),
+            (
+                b"Ga=d,d=y,y=4;".as_slice(),
+                crate::placements::DeleteSelector::Row { row: 3 },
+            ),
+            (
+                b"Ga=d,d=z,z=-2;".as_slice(),
+                crate::placements::DeleteSelector::ZIndex { z: -2 },
+            ),
+        ];
+        for (request, expected) in cases {
+            let Ingest::Delete(command) = GraphicsProtocol::default().ingest(request) else {
+                panic!("expected delete command for {request:?}")
+            };
+            assert_eq!(command.selector, expected, "request {request:?}");
+        }
     }
 
     #[test]

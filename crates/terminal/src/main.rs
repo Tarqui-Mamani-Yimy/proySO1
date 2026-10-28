@@ -1,5 +1,7 @@
 #[path = "graphics.rs"]
 mod graphics;
+#[path = "placements.rs"]
+mod placements;
 
 use alacritty_terminal::selection::SelectionType;
 use arboard::Clipboard;
@@ -9,6 +11,7 @@ use glyphon::{
     TextRenderer, Viewport,
 };
 use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest};
+use placements::PlacementStore;
 use so1_terminal::{
     clamp_surface_size,
     keyboard::{
@@ -91,6 +94,7 @@ struct Pane {
     model: Model,
     apc_observer: so1_terminal::apc::Observer,
     graphics_protocol: GraphicsProtocol,
+    placements: PlacementStore,
     title: String,
     explicit_title: Option<String>,
     cwd: PathBuf,
@@ -982,6 +986,7 @@ impl TerminalWindow {
             model: Model::new(cols, rows),
             apc_observer: so1_terminal::apc::Observer::default(),
             graphics_protocol: GraphicsProtocol::default(),
+            placements: PlacementStore::default(),
             title: cwd_basename_title(&cwd),
             explicit_title: None,
             cwd,
@@ -1010,8 +1015,15 @@ impl TerminalWindow {
         for layout in layouts {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
                 if !layout.hidden {
+                    let (old_cols, old_rows) = pane.model.grid_dimensions();
                     pane.model
                         .resize(layout.cols as usize, layout.rows as usize);
+                    pane.placements.resize(
+                        old_cols,
+                        old_rows,
+                        layout.cols as usize,
+                        layout.rows as usize,
+                    );
                     let _ = pane.pty.resize(
                         layout.cols.min(u16::MAX as u32) as u16,
                         layout.rows.min(u16::MAX as u32) as u16,
@@ -1936,6 +1948,37 @@ impl TerminalWindow {
                             let _ = pane.pty.write(&reply);
                         }
                         Ingest::Reply(None) => {}
+                        Ingest::Delete(command) => {
+                            let anchor = pane.model.cursor_anchor();
+                            let mut selector = command.selector;
+                            let stable_top = pane.model.visible_stable_top_row();
+                            let (columns, rows) = pane.model.grid_dimensions();
+                            match &mut selector {
+                                placements::DeleteSelector::Cell { row, .. }
+                                | placements::DeleteSelector::Row { row } => {
+                                    *row = row.saturating_add(stable_top);
+                                }
+                                _ => {}
+                            }
+                            let freed = pane.placements.delete(
+                                selector,
+                                command.frees_data,
+                                anchor,
+                                anchor.screen,
+                                placements::Viewport {
+                                    screen: anchor.screen,
+                                    top_row: stable_top,
+                                    rows,
+                                    columns,
+                                },
+                            );
+                            for id in freed {
+                                self.graphics_store.remove_image(pane_id, id);
+                            }
+                            if let Some(reply) = graphics::reply(&command.response, Ok(())) {
+                                let _ = pane.pty.write(&reply);
+                            }
+                        }
                         Ingest::Decode(job) => {
                             let sender = proxy.clone();
                             std::thread::spawn(move || {
@@ -1946,6 +1989,11 @@ impl TerminalWindow {
                         }
                     }
                 }
+                let old_screen = if pane.model.alternate_screen_active() {
+                    so1_terminal::blocks::GridScreen::Alternate
+                } else {
+                    so1_terminal::blocks::GridScreen::Primary
+                };
                 for observed in pane.model.feed(&bytes) {
                     if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = observed.event
                     {
@@ -1954,6 +2002,14 @@ impl TerminalWindow {
                         pane.title = pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
                     }
                 }
+                let new_screen = if pane.model.alternate_screen_active() {
+                    so1_terminal::blocks::GridScreen::Alternate
+                } else {
+                    so1_terminal::blocks::GridScreen::Primary
+                };
+                pane.placements.screen_changed(old_screen, new_screen);
+                pane.placements
+                    .prune_evicted_primary(pane.model.block_row_base());
                 for ev in pane.model.take_events() {
                     if let Some(title) = apply_title_event(&pane.cwd, &mut pane.explicit_title, &ev)
                     {
@@ -1985,43 +2041,57 @@ impl TerminalWindow {
     }
 
     fn finish_graphics(&mut self, pane_id: PaneId, mut completion: GraphicsCompletion) {
-        let Some(pane) = self.panes.get_mut(&pane_id) else {
-            return;
-        };
-        pane.graphics_protocol.finish_decode();
-        let result = match completion.image {
-            Ok(image) => {
-                if completion.action != "q" {
-                    let id = if let Some(id) = completion.response.image_id {
-                        id
-                    } else {
-                        let start = self.next_graphics_image_id;
-                        let mut id = start;
-                        while self.graphics_store.get(pane_id, id).is_some() {
-                            id = id.wrapping_add(1);
-                            if id == start {
-                                return;
+        {
+            let Some(pane) = self.panes.get_mut(&pane_id) else {
+                return;
+            };
+            pane.graphics_protocol.finish_decode();
+            let result = match completion.image {
+                Ok(image) => {
+                    if completion.action != "q" {
+                        let id = if let Some(id) = completion.response.image_id {
+                            id
+                        } else {
+                            let start = self.next_graphics_image_id;
+                            let mut id = start;
+                            while self.graphics_store.get(pane_id, id).is_some() {
+                                id = id.wrapping_add(1);
+                                if id == start {
+                                    return;
+                                }
                             }
+                            self.next_graphics_image_id = id.wrapping_add(1);
+                            id
+                        };
+                        if completion.response.image_number.is_some() {
+                            completion.response.image_id = Some(id);
                         }
-                        self.next_graphics_image_id = id.wrapping_add(1);
-                        id
-                    };
-                    if completion.response.image_number.is_some() {
-                        completion.response.image_id = Some(id);
-                    }
-                    if let Err(error) = self.graphics_store.insert(pane_id, id, image) {
-                        Err(error)
+                        if let Err(error) = self.graphics_store.insert(pane_id, id, image) {
+                            Err(error)
+                        } else {
+                            pane.placements
+                                .register_image(id, completion.response.image_number);
+                            pane.placements.retain_images(|image_id| {
+                                self.graphics_store.get(pane_id, image_id).is_some()
+                            });
+                            Ok(())
+                        }
                     } else {
                         Ok(())
                     }
-                } else {
-                    Ok(())
                 }
+                Err(error) => Err(error),
+            };
+            if let Some(bytes) = graphics::reply(&completion.response, result) {
+                let _ = pane.pty.write(&bytes);
             }
-            Err(error) => Err(error),
-        };
-        if let Some(bytes) = graphics::reply(&completion.response, result) {
-            let _ = pane.pty.write(&bytes);
+        }
+        for (evicted_pane, image_id) in self.graphics_store.take_evicted() {
+            if let Some(pane) = self.panes.get_mut(&evicted_pane) {
+                pane.placements.retain_images(|id| {
+                    id != image_id || self.graphics_store.get(evicted_pane, id).is_some()
+                });
+            }
         }
     }
 }

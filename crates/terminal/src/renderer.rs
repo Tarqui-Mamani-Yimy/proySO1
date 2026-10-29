@@ -1,4 +1,4 @@
-//! Renderer-independent grid layout and terminal color conversion.
+//! Renderer-independent grid layout, terminal color conversion, and kitty image quad projection.
 use crate::{
     blocks::{BlockList, BlockState, GridAnchor, GridScreen},
     model::{CellColor, VisibleCell},
@@ -104,6 +104,132 @@ pub fn project_block_decorations(
 
 pub fn apply_selection_highlight(cell: &mut RenderCell) {
     std::mem::swap(&mut cell.foreground, &mut cell.background);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PixelRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ImageQuadInput {
+    pub pane: PixelRect,
+    pub cell: (f32, f32),
+    pub anchor: (i32, i32),
+    pub cells: (usize, usize),
+    pub pixel_offset: (u32, u32),
+    pub source: (u32, u32, u32, u32),
+    pub image: (u32, u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageQuad {
+    pub destination: PixelRect,
+    /// Normalized (left, top, right, bottom) coordinates in the decoded image.
+    pub uv: [f32; 4],
+}
+
+/// Projects a placement into pane-clipped pixel geometry and matching source UVs.
+pub fn project_image_quad(input: ImageQuadInput) -> Option<ImageQuad> {
+    let (image_width, image_height) = input.image;
+    if image_width == 0
+        || image_height == 0
+        || input.cells.0 == 0
+        || input.cells.1 == 0
+        || input.cell.0 <= 0.0
+        || input.cell.1 <= 0.0
+        || input.source.2 == 0
+        || input.source.3 == 0
+    {
+        return None;
+    }
+    let mut width = input.cells.0 as f32 * input.cell.0;
+    let mut height = input.cells.1 as f32 * input.cell.1;
+    let aspect = input.source.2 as f32 / input.source.3 as f32;
+    if width / height > aspect {
+        width = height * aspect;
+    } else {
+        height = width / aspect;
+    }
+    let left_letterbox = (input.cells.0 as f32 * input.cell.0 - width) / 2.0;
+    let top_letterbox = (input.cells.1 as f32 * input.cell.1 - height) / 2.0;
+    let x = input.pane.x
+        + input.anchor.0 as f32 * input.cell.0
+        + input.pixel_offset.0 as f32
+        + left_letterbox;
+    let y = input.pane.y
+        + input.anchor.1 as f32 * input.cell.1
+        + input.pixel_offset.1 as f32
+        + top_letterbox;
+    let right = x + width;
+    let bottom = y + height;
+    let clipped_x = x.max(input.pane.x);
+    let clipped_y = y.max(input.pane.y);
+    let clipped_right = right.min(input.pane.x + input.pane.width);
+    let clipped_bottom = bottom.min(input.pane.y + input.pane.height);
+    if clipped_x >= clipped_right || clipped_y >= clipped_bottom {
+        return None;
+    }
+    let (source_x, source_y, source_width, source_height) = input.source;
+    let u0 = source_x as f32 / image_width as f32;
+    let v0 = source_y as f32 / image_height as f32;
+    let du = source_width as f32 / image_width as f32;
+    let dv = source_height as f32 / image_height as f32;
+    let left_fraction = (clipped_x - x) / (right - x);
+    let top_fraction = (clipped_y - y) / (bottom - y);
+    let right_fraction = (clipped_right - x) / (right - x);
+    let bottom_fraction = (clipped_bottom - y) / (bottom - y);
+    Some(ImageQuad {
+        destination: PixelRect {
+            x: clipped_x,
+            y: clipped_y,
+            width: clipped_right - clipped_x,
+            height: clipped_bottom - clipped_y,
+        },
+        uv: [
+            u0 + du * left_fraction,
+            v0 + dv * top_fraction,
+            u0 + du * right_fraction,
+            v0 + dv * bottom_fraction,
+        ],
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageLayerItem {
+    pub z: i32,
+    pub insertion: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImageLayerBuckets {
+    pub under_background: Vec<usize>,
+    pub under_text: Vec<usize>,
+    pub over_text: Vec<usize>,
+}
+
+/// Splits textured placements around the terminal cell and text passes.
+pub fn bucket_image_layers(items: &[ImageLayerItem]) -> ImageLayerBuckets {
+    let mut buckets = ImageLayerBuckets::default();
+    for (index, item) in items.iter().enumerate() {
+        if item.z < -1_073_741_824 {
+            buckets.under_background.push(index);
+        } else if item.z < 0 {
+            buckets.under_text.push(index);
+        } else {
+            buckets.over_text.push(index);
+        }
+    }
+    let sort = |indices: &mut Vec<usize>| {
+        indices.sort_by_key(|index| (items[*index].z, items[*index].insertion));
+    };
+    sort(&mut buckets.under_background);
+    sort(&mut buckets.under_text);
+    sort(&mut buckets.over_text);
+    buckets
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +548,55 @@ pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_quad_projects_cells_source_uvs_and_pane_clipping() {
+        let quad = project_image_quad(ImageQuadInput {
+            pane: PixelRect {
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 30.0,
+            },
+            cell: (10.0, 10.0),
+            anchor: (2, 1),
+            cells: (3, 2),
+            pixel_offset: (2, 3),
+            source: (4, 8, 30, 20),
+            image: (100, 50),
+        })
+        .unwrap();
+        assert_eq!(
+            quad.destination,
+            PixelRect {
+                x: 32.0,
+                y: 33.0,
+                width: 18.0,
+                height: 17.0
+            }
+        );
+        assert_eq!(quad.uv, [0.04, 0.16, 0.22, 0.5]);
+    }
+
+    #[test]
+    fn image_z_buckets_follow_text_layers_and_keep_placement_order_for_ties() {
+        let items = [
+            ImageLayerItem { z: 0, insertion: 2 },
+            ImageLayerItem {
+                z: -1,
+                insertion: 1,
+            },
+            ImageLayerItem {
+                z: -1_073_741_825,
+                insertion: 0,
+            },
+            ImageLayerItem { z: 0, insertion: 1 },
+        ];
+        let buckets = bucket_image_layers(&items);
+        assert_eq!(buckets.under_background, [2]);
+        assert_eq!(buckets.under_text, [1]);
+        assert_eq!(buckets.over_text, [3, 0]);
+    }
 
     fn mark(list: &mut BlockList, mark: crate::osc::SemanticMark, line: i64) {
         let boundary = list.blocks().len() as u64 + 1;

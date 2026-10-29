@@ -10,8 +10,8 @@ use glyphon::{
     Cache, Color, FontSystem, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer, Viewport,
 };
-use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest};
-use placements::PlacementStore;
+use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest, PlacementOptions};
+use placements::{CellSize as PlacementCellSize, Placement, PlacementStore, SourceRect};
 use so1_terminal::{
     clamp_surface_size,
     keyboard::{
@@ -30,7 +30,7 @@ use so1_terminal::{
     selection::{PointerAction, PointerButton, PointerState, SelectionGesture, SelectionRouter},
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::Instant,
@@ -46,7 +46,7 @@ use winit::{
 
 enum UserEvent {
     PtyOutput(PaneId),
-    GraphicsDecoded(PaneId, GraphicsCompletion),
+    GraphicsDecoded(PaneId, so1_terminal::blocks::GridAnchor, GraphicsCompletion),
 }
 struct TerminalWindow {
     window: Option<Arc<Window>>,
@@ -93,6 +93,8 @@ struct Pane {
     pty: so1_terminal::pty::Pty,
     model: Model,
     apc_observer: so1_terminal::apc::Observer,
+    apc_cursor_tracker: ApcCursorTracker,
+    segments: OrderedSegments,
     graphics_protocol: GraphicsProtocol,
     placements: PlacementStore,
     title: String,
@@ -104,6 +106,155 @@ struct Pane {
     glyph_buffers: Vec<Buffer>,
     glyph_keys: Vec<Option<GlyphKey>>,
     glyph_positions: Vec<(usize, usize)>,
+}
+
+#[derive(Default)]
+struct ApcCursorTracker {
+    state: ApcCursorState,
+    payload: Vec<u8>,
+    discarding: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ApcCursorState {
+    #[default]
+    Ground,
+    Escape,
+    Apc,
+    ApcEscape,
+    Discard,
+    DiscardEscape,
+}
+
+enum TerminalSegment {
+    Data(Vec<u8>),
+    Apc(Vec<u8>),
+}
+
+/// PTY segments in stream order. While an image decode is in flight, later
+/// segments wait so placement and its cursor movement apply before the text
+/// that follows them, as if the decode had been synchronous.
+#[derive(Default)]
+struct OrderedSegments {
+    pending: VecDeque<TerminalSegment>,
+    decode_in_flight: bool,
+}
+
+impl OrderedSegments {
+    fn extend(&mut self, segments: impl IntoIterator<Item = TerminalSegment>) {
+        self.pending.extend(segments);
+    }
+
+    fn next(&mut self) -> Option<TerminalSegment> {
+        if self.decode_in_flight {
+            return None;
+        }
+        self.pending.pop_front()
+    }
+
+    fn begin_decode(&mut self) {
+        self.decode_in_flight = true;
+    }
+
+    fn finish_decode(&mut self) {
+        self.decode_in_flight = false;
+    }
+}
+
+impl ApcCursorTracker {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalSegment> {
+        const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+        let mut segments = Vec::new();
+        let mut data = Vec::new();
+        for &byte in bytes {
+            match self.state {
+                ApcCursorState::Ground => {
+                    if byte == 0x1b {
+                        self.state = ApcCursorState::Escape;
+                    } else {
+                        data.push(byte);
+                    }
+                }
+                ApcCursorState::Escape => {
+                    if byte == b'_' {
+                        self.payload.clear();
+                        self.discarding = false;
+                        self.state = ApcCursorState::Apc;
+                    } else {
+                        data.extend_from_slice(&[0x1b, byte]);
+                        self.state = if byte == 0x1b {
+                            ApcCursorState::Escape
+                        } else {
+                            ApcCursorState::Ground
+                        };
+                    }
+                }
+                ApcCursorState::Apc => match byte {
+                    0x18 | 0x1a => {
+                        self.payload.clear();
+                        self.discarding = false;
+                        self.state = ApcCursorState::Ground;
+                    }
+                    0x1b => self.state = ApcCursorState::ApcEscape,
+                    byte => {
+                        if !self.discarding {
+                            self.payload.push(byte);
+                            if self.payload.len() > MAX_PAYLOAD {
+                                self.payload.clear();
+                                self.discarding = true;
+                                self.state = ApcCursorState::Discard;
+                            }
+                        }
+                    }
+                },
+                ApcCursorState::ApcEscape => {
+                    if byte == b'\\' {
+                        if !self.discarding {
+                            if !data.is_empty() {
+                                segments.push(TerminalSegment::Data(std::mem::take(&mut data)));
+                            }
+                            segments.push(TerminalSegment::Apc(std::mem::take(&mut self.payload)));
+                        }
+                        self.payload.clear();
+                        self.discarding = false;
+                        self.state = ApcCursorState::Ground;
+                    } else if byte == b'_' {
+                        self.payload.clear();
+                        self.discarding = false;
+                        self.state = ApcCursorState::Apc;
+                    } else if byte != 0x1b {
+                        self.payload.clear();
+                        self.discarding = false;
+                        self.state = ApcCursorState::Ground;
+                    }
+                }
+                ApcCursorState::Discard => {
+                    if byte == 0x18 || byte == 0x1a {
+                        self.discarding = false;
+                        self.state = ApcCursorState::Ground;
+                    } else if byte == 0x1b {
+                        self.state = ApcCursorState::DiscardEscape;
+                    }
+                }
+                ApcCursorState::DiscardEscape => {
+                    if byte == b'\\' {
+                        self.discarding = false;
+                        self.state = ApcCursorState::Ground;
+                    } else if byte == b'_' {
+                        self.payload.clear();
+                        self.discarding = false;
+                        self.state = ApcCursorState::Apc;
+                    } else if byte != 0x1b {
+                        self.state = ApcCursorState::Discard;
+                    }
+                }
+            }
+        }
+        if !data.is_empty() {
+            segments.push(TerminalSegment::Data(data));
+        }
+        segments
+    }
 }
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -122,15 +273,164 @@ struct GpuState {
     logical_cell_width: f32,
     logical_cell_height: f32,
     rect_pipeline: wgpu::RenderPipeline,
+    image_pipeline: wgpu::RenderPipeline,
+    image_bind_group_layout: wgpu::BindGroupLayout,
+    image_sampler: wgpu::Sampler,
+    textures: BTreeMap<(PaneId, u32), ImageTexture>,
     vertices: Vec<RectVertex>,
     vertex_buffer: wgpu::Buffer,
     vertex_buffer_capacity_bytes: usize,
+    image_vertices: Vec<ImageVertex>,
+    image_vertex_buffer: wgpu::Buffer,
+    image_vertex_buffer_capacity_bytes: usize,
+}
+
+struct ImageTexture {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+#[derive(Clone, Copy)]
+struct TextureDraw {
+    key: (PaneId, u32),
+    start: u32,
+}
+
+fn render_texture_draws<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    pipeline: &'a wgpu::RenderPipeline,
+    vertex_buffer: &'a wgpu::Buffer,
+    textures: &'a BTreeMap<(PaneId, u32), ImageTexture>,
+    draws: &'a [TextureDraw],
+) {
+    if draws.is_empty() {
+        return;
+    }
+    pass.set_pipeline(pipeline);
+    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+    for draw in draws {
+        if let Some(texture) = textures.get(&draw.key) {
+            pass.set_bind_group(0, &texture.bind_group, &[]);
+            pass.draw(draw.start..draw.start + 6, 0..1);
+        }
+    }
+}
+
+fn retain_live_textures<T>(
+    textures: &mut BTreeMap<(PaneId, u32), T>,
+    mut image_exists: impl FnMut(PaneId, u32) -> bool,
+) {
+    textures.retain(|(pane, id), _| image_exists(*pane, *id));
+}
+
+fn upload_image_texture(
+    gpu: &mut GpuState,
+    pane: PaneId,
+    id: u32,
+    image: &graphics::DecodedImage,
+) -> bool {
+    if image.width == 0
+        || image.height == 0
+        || image.width > gpu.device.limits().max_texture_dimension_2d
+        || image.height > gpu.device.limits().max_texture_dimension_2d
+    {
+        return false;
+    }
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("kitty decoded RGBA image"),
+        size: wgpu::Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &image.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(image.width * 4),
+            rows_per_image: Some(image.height),
+        },
+        wgpu::Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("kitty image bind group"),
+        layout: &gpu.image_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&gpu.image_sampler),
+            },
+        ],
+    });
+    gpu.textures.insert(
+        (pane, id),
+        ImageTexture {
+            _texture: texture,
+            bind_group,
+        },
+    );
+    true
+}
+
+fn append_image_quad_vertices(
+    vertices: &mut Vec<ImageVertex>,
+    quad: so1_terminal::renderer::ImageQuad,
+    width: f32,
+    height: f32,
+) {
+    let x0 = quad.destination.x / width * 2.0 - 1.0;
+    let x1 = (quad.destination.x + quad.destination.width) / width * 2.0 - 1.0;
+    let y0 = 1.0 - quad.destination.y / height * 2.0;
+    let y1 = 1.0 - (quad.destination.y + quad.destination.height) / height * 2.0;
+    let [u0, v0, u1, v1] = quad.uv;
+    for (x, y, u, v) in [
+        (x0, y0, u0, v0),
+        (x1, y0, u1, v0),
+        (x1, y1, u1, v1),
+        (x0, y0, u0, v0),
+        (x1, y1, u1, v1),
+        (x0, y1, u0, v1),
+    ] {
+        vertices.push(ImageVertex {
+            position: [x, y],
+            uv: [u, v],
+        });
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RectVertex {
     position: [f32; 2],
     color: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImageVertex {
+    position: [f32; 2],
+    uv: [f32; 2],
 }
 
 type GlyphKey = (char, [u8; 3], bool, usize);
@@ -152,6 +452,104 @@ fn block_marker_bounds(cell_width: f32, cell_height: f32) -> [f32; 4] {
         cell_width,
         (cell_height - 2.0).max(top),
     ]
+}
+
+fn placement_from_options(
+    image_id: u32,
+    options: PlacementOptions,
+    anchor: so1_terminal::blocks::GridAnchor,
+    image: (u32, u32),
+    cell: (f32, f32),
+) -> Result<Placement, graphics::GraphicsError> {
+    let (image_width, image_height) = image;
+    let x = options.source.0.min(image_width);
+    let y = options.source.1.min(image_height);
+    let width = if options.source.2 == 0 {
+        image_width.saturating_sub(x)
+    } else {
+        options.source.2.min(image_width.saturating_sub(x))
+    };
+    let height = if options.source.3 == 0 {
+        image_height.saturating_sub(y)
+    } else {
+        options.source.3.min(image_height.saturating_sub(y))
+    };
+    if width == 0 || height == 0 || cell.0 <= 0.0 || cell.1 <= 0.0 {
+        return Err(graphics::GraphicsError::invalid_placement());
+    }
+    let columns = options.cells.0.unwrap_or_else(|| {
+        ((options
+            .cells
+            .1
+            .unwrap_or_else(|| ((height as f32 / cell.1).ceil() as usize).max(1)) as f32
+            * cell.1
+            * width as f32
+            / height as f32
+            / cell.0)
+            .ceil() as usize)
+            .max(1)
+    });
+    let rows = options.cells.1.unwrap_or_else(|| {
+        ((options
+            .cells
+            .0
+            .unwrap_or_else(|| ((width as f32 / cell.0).ceil() as usize).max(1)) as f32
+            * cell.0
+            * height as f32
+            / width as f32
+            / cell.1)
+            .ceil() as usize)
+            .max(1)
+    });
+    if options.offset.0 as f32 >= cell.0 || options.offset.1 as f32 >= cell.1 {
+        return Err(graphics::GraphicsError::invalid_placement());
+    }
+    Ok(Placement {
+        image_id,
+        placement_id: options.placement_id,
+        anchor,
+        source: SourceRect {
+            x,
+            y,
+            width,
+            height,
+        },
+        cells: PlacementCellSize { columns, rows },
+        pixel_offset: options.offset,
+        z: options.z,
+        insertion: 0,
+    })
+}
+
+fn move_cursor_after_placement(model: &mut Model, cells: (usize, usize), no_cursor_move: bool) {
+    if no_cursor_move || cells.0 == 0 || cells.1 == 0 {
+        return;
+    }
+    let mut sequence = Vec::new();
+    let down = cells.1.saturating_sub(1);
+    if down > 0 {
+        sequence.extend_from_slice(format!("\x1b[{down}B").as_bytes());
+    }
+    if cells.0 > 0 {
+        sequence.extend_from_slice(format!("\x1b[{}C", cells.0).as_bytes());
+    }
+    model.feed(&sequence);
+}
+
+fn commit_placement(
+    store: &mut PlacementStore,
+    model: &mut Model,
+    image_id: u32,
+    options: PlacementOptions,
+    anchor: so1_terminal::blocks::GridAnchor,
+    image: (u32, u32),
+    cell: (f32, f32),
+) -> Result<(), graphics::GraphicsError> {
+    let placement = placement_from_options(image_id, options, anchor, image, cell)?;
+    let size = (placement.cells.columns, placement.cells.rows);
+    store.place(placement);
+    move_cursor_after_placement(model, size, options.no_cursor_move);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -900,10 +1298,84 @@ impl TerminalWindow {
             multiview_mask: None,
             cache: None,
         });
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("kitty image texture layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("kitty image sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kitty image shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("image.wgsl").into()),
+        });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("kitty image pipeline layout"),
+                bind_group_layouts: &[Some(&image_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("kitty image pipeline"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ImageVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let vertex_buffer_capacity_bytes = 1024;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terminal reusable cell vertex buffer"),
             size: vertex_buffer_capacity_bytes as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let image_vertex_buffer_capacity_bytes = 6 * std::mem::size_of::<ImageVertex>();
+        let image_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kitty image quad vertex buffer"),
+            size: image_vertex_buffer_capacity_bytes as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -955,9 +1427,16 @@ impl TerminalWindow {
             logical_cell_width: cell_width,
             logical_cell_height: cell_height,
             rect_pipeline,
+            image_pipeline,
+            image_bind_group_layout,
+            image_sampler,
+            textures: BTreeMap::new(),
             vertices: Vec::new(),
             vertex_buffer,
             vertex_buffer_capacity_bytes,
+            image_vertices: Vec::new(),
+            image_vertex_buffer,
+            image_vertex_buffer_capacity_bytes,
         });
         Ok(())
     }
@@ -985,6 +1464,8 @@ impl TerminalWindow {
             pty,
             model: Model::new(cols, rows),
             apc_observer: so1_terminal::apc::Observer::default(),
+            apc_cursor_tracker: ApcCursorTracker::default(),
+            segments: OrderedSegments::default(),
             graphics_protocol: GraphicsProtocol::default(),
             placements: PlacementStore::default(),
             title: cwd_basename_title(&cwd),
@@ -1236,11 +1717,20 @@ impl TerminalWindow {
             so1_terminal::layout::TabCloseResult::LastTab
         ) {
             self.panes.clear();
+            self.graphics_store = GraphicsStore::default();
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.textures.clear();
+            }
             event_loop.exit();
             return;
         }
         for pane in panes {
             self.panes.remove(&pane);
+            self.graphics_store.remove_pane(pane);
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.textures
+                    .retain(|(cached_pane, _), _| *cached_pane != pane);
+            }
         }
         self.refresh_window_title();
         self.request_redraw();
@@ -1436,6 +1926,10 @@ impl TerminalWindow {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut rendered_any = false;
+        let graphics_store = &self.graphics_store;
+        retain_live_textures(&mut gpu.textures, |pane, id| {
+            graphics_store.get(pane, id).is_some()
+        });
         let panes = &mut self.panes;
         for layout in layouts.iter().filter(|layout| !layout.hidden) {
             let Some(pane) = panes.get_mut(&layout.pane) else {
@@ -1635,6 +2129,103 @@ impl TerminalWindow {
                     &mut gpu.swash_cache,
                 )
                 .map_err(|error| format!("could not prepare pane text: {error}"))?;
+            let screen = if pane.model.alternate_screen_active() {
+                so1_terminal::blocks::GridScreen::Alternate
+            } else {
+                so1_terminal::blocks::GridScreen::Primary
+            };
+            let top_row = pane.model.visible_stable_top_row();
+            let (columns, viewport_rows) = pane.model.grid_dimensions();
+            let visible_placements = pane.placements.visible(placements::Viewport {
+                screen,
+                top_row,
+                rows: viewport_rows,
+                columns,
+            });
+            let layer_items: Vec<_> = visible_placements
+                .iter()
+                .map(|entry| so1_terminal::renderer::ImageLayerItem {
+                    z: entry.placement.z,
+                    insertion: entry.placement.insertion,
+                })
+                .collect();
+            let buckets = so1_terminal::renderer::bucket_image_layers(&layer_items);
+            gpu.image_vertices.clear();
+            let mut draw_layer = |indices: &[usize]| -> Vec<TextureDraw> {
+                let mut draws = Vec::new();
+                for &index in indices {
+                    let entry = &visible_placements[index];
+                    let key = (layout.pane, entry.placement.image_id);
+                    let Some(image) = graphics_store.get(key.0, key.1) else {
+                        continue;
+                    };
+                    if !gpu.textures.contains_key(&key) {
+                        continue;
+                    }
+                    let anchor_row = entry
+                        .placement
+                        .anchor
+                        .line
+                        .saturating_sub(top_row)
+                        .clamp(i32::MIN as i64, i32::MAX as i64)
+                        as i32;
+                    let quad = so1_terminal::renderer::project_image_quad(
+                        so1_terminal::renderer::ImageQuadInput {
+                            pane: so1_terminal::renderer::PixelRect {
+                                x: layout.rect.x as f32,
+                                y: layout.rect.y as f32,
+                                width: layout.rect.width as f32,
+                                height: layout.rect.height as f32,
+                            },
+                            cell: (gpu.cell_width, gpu.cell_height),
+                            anchor: (
+                                entry.placement.anchor.column.min(i32::MAX as usize) as i32,
+                                anchor_row,
+                            ),
+                            cells: (entry.placement.cells.columns, entry.placement.cells.rows),
+                            pixel_offset: entry.placement.pixel_offset,
+                            source: (
+                                entry.placement.source.x,
+                                entry.placement.source.y,
+                                entry.placement.source.width,
+                                entry.placement.source.height,
+                            ),
+                            image: (image.width, image.height),
+                        },
+                    );
+                    if let Some(quad) = quad {
+                        let start = gpu.image_vertices.len() as u32;
+                        append_image_quad_vertices(&mut gpu.image_vertices, quad, width, height);
+                        draws.push(TextureDraw { key, start });
+                    }
+                }
+                draws
+            };
+            let under_background_draws = draw_layer(&buckets.under_background);
+            let under_text_draws = draw_layer(&buckets.under_text);
+            let over_text_draws = draw_layer(&buckets.over_text);
+            drop(draw_layer);
+            let image_required = gpu.image_vertices.len() * std::mem::size_of::<ImageVertex>();
+            if image_required > gpu.image_vertex_buffer_capacity_bytes {
+                gpu.image_vertex_buffer_capacity_bytes =
+                    so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+                        gpu.image_vertex_buffer_capacity_bytes,
+                        image_required,
+                    );
+                gpu.image_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("kitty image quad vertex buffer"),
+                    size: gpu.image_vertex_buffer_capacity_bytes as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if image_required > 0 {
+                gpu.queue.write_buffer(
+                    &gpu.image_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&gpu.image_vertices),
+                );
+            }
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
             let capacity = so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
                 gpu.vertex_buffer_capacity_bytes,
@@ -1693,14 +2284,35 @@ impl TerminalWindow {
                         .height
                         .min(gpu.config.height.saturating_sub(layout.rect.y)),
                 );
+                render_texture_draws(
+                    &mut pass,
+                    &gpu.image_pipeline,
+                    &gpu.image_vertex_buffer,
+                    &gpu.textures,
+                    &under_background_draws,
+                );
                 if background_vertices > 0 {
                     pass.set_pipeline(&gpu.rect_pipeline);
                     pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
                     pass.draw(0..background_vertices as u32, 0..1);
                 }
+                render_texture_draws(
+                    &mut pass,
+                    &gpu.image_pipeline,
+                    &gpu.image_vertex_buffer,
+                    &gpu.textures,
+                    &under_text_draws,
+                );
                 gpu.text_renderer
                     .render(&gpu.atlas, &gpu.viewport, &mut pass)
                     .map_err(|error| format!("could not render pane text: {error}"))?;
+                render_texture_draws(
+                    &mut pass,
+                    &gpu.image_pipeline,
+                    &gpu.image_vertex_buffer,
+                    &gpu.textures,
+                    &over_text_draws,
+                );
                 if let Some(range) = overlay_vertex_range(background_vertices, gpu.vertices.len()) {
                     pass.set_pipeline(&gpu.rect_pipeline);
                     pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
@@ -1937,79 +2549,174 @@ impl TerminalWindow {
     }
     fn receive_output(&mut self, pane_id: PaneId, event_loop: &ActiveEventLoop) {
         let mut changed = false;
-        let proxy = self.proxy.clone();
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             for bytes in pane.pty.drain_output() {
                 changed = true;
-                for payload in pane.apc_observer.feed(&bytes) {
-                    match pane.graphics_protocol.ingest(&payload) {
-                        Ingest::Ignored | Ingest::Pending => {}
-                        Ingest::Reply(Some(reply)) => {
-                            let _ = pane.pty.write(&reply);
-                        }
-                        Ingest::Reply(None) => {}
-                        Ingest::Delete(command) => {
-                            let anchor = pane.model.cursor_anchor();
-                            let mut selector = command.selector;
-                            let stable_top = pane.model.visible_stable_top_row();
-                            let (columns, rows) = pane.model.grid_dimensions();
-                            match &mut selector {
-                                placements::DeleteSelector::Cell { row, .. }
-                                | placements::DeleteSelector::Row { row } => {
-                                    *row = row.saturating_add(stable_top);
+                let mut accepted_payloads = pane.apc_observer.feed(&bytes).into_iter();
+                let segments =
+                    pane.apc_cursor_tracker.feed(&bytes).into_iter().filter(
+                        |segment| match segment {
+                            TerminalSegment::Data(_) => true,
+                            TerminalSegment::Apc(payload) => {
+                                accepted_payloads.next().as_ref() == Some(payload)
+                            }
+                        },
+                    );
+                pane.segments.extend(segments);
+            }
+        }
+        self.apply_segments(pane_id);
+        if self.focused_pane_id() == Some(pane_id) {
+            self.refresh_window_title();
+        }
+        self.poll_child_exit(event_loop);
+        if changed
+            && self
+                .tabs
+                .as_ref()
+                .is_some_and(|tabs| pane_is_in_active_tab(tabs, pane_id))
+        {
+            self.request_redraw();
+        }
+    }
+
+    fn apply_segments(&mut self, pane_id: PaneId) {
+        let proxy = self.proxy.clone();
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            {
+                while let Some(segment) = pane.segments.next() {
+                    match segment {
+                        TerminalSegment::Data(data) => {
+                            let old_screen = if pane.model.alternate_screen_active() {
+                                so1_terminal::blocks::GridScreen::Alternate
+                            } else {
+                                so1_terminal::blocks::GridScreen::Primary
+                            };
+                            for observed in pane.model.feed(&data) {
+                                if let so1_terminal::osc::Event::CurrentDirectory { path, .. } =
+                                    observed.event
+                                {
+                                    let text = String::from_utf8_lossy(&path).into_owned();
+                                    pane.cwd = PathBuf::from(text);
+                                    pane.title =
+                                        pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
                                 }
-                                _ => {}
                             }
-                            let freed = pane.placements.delete(
-                                selector,
-                                command.frees_data,
-                                anchor,
-                                anchor.screen,
-                                placements::Viewport {
-                                    screen: anchor.screen,
-                                    top_row: stable_top,
-                                    rows,
-                                    columns,
-                                },
-                            );
-                            for id in freed {
-                                self.graphics_store.remove_image(pane_id, id);
-                            }
-                            if let Some(reply) = graphics::reply(&command.response, Ok(())) {
-                                let _ = pane.pty.write(&reply);
-                            }
+                            let new_screen = if pane.model.alternate_screen_active() {
+                                so1_terminal::blocks::GridScreen::Alternate
+                            } else {
+                                so1_terminal::blocks::GridScreen::Primary
+                            };
+                            pane.placements.screen_changed(old_screen, new_screen);
+                            pane.placements
+                                .prune_evicted_primary(pane.model.block_row_base());
                         }
-                        Ingest::Decode(job) => {
-                            let sender = proxy.clone();
-                            std::thread::spawn(move || {
-                                let completion = graphics::decode_transfer(job);
-                                let _ = sender
-                                    .send_event(UserEvent::GraphicsDecoded(pane_id, completion));
-                            });
+                        TerminalSegment::Apc(payload) => {
+                            match pane.graphics_protocol.ingest(&payload) {
+                                Ingest::Ignored | Ingest::Pending => {}
+                                Ingest::Reply(Some(reply)) => {
+                                    let _ = pane.pty.write(&reply);
+                                }
+                                Ingest::Reply(None) => {}
+                                Ingest::Delete(command) => {
+                                    let anchor = pane.model.cursor_anchor();
+                                    let mut selector = command.selector;
+                                    let stable_top = pane.model.visible_stable_top_row();
+                                    let (columns, rows) = pane.model.grid_dimensions();
+                                    match &mut selector {
+                                        placements::DeleteSelector::Cell { row, .. }
+                                        | placements::DeleteSelector::Row { row } => {
+                                            *row = row.saturating_add(stable_top);
+                                        }
+                                        _ => {}
+                                    }
+                                    let freed = pane.placements.delete(
+                                        selector,
+                                        command.frees_data,
+                                        anchor,
+                                        anchor.screen,
+                                        placements::Viewport {
+                                            screen: anchor.screen,
+                                            top_row: stable_top,
+                                            rows,
+                                            columns,
+                                        },
+                                    );
+                                    for id in freed {
+                                        self.graphics_store.remove_image(pane_id, id);
+                                        if let Some(gpu) = self.gpu.as_mut() {
+                                            gpu.textures.remove(&(pane_id, id));
+                                        }
+                                    }
+                                    if let Some(reply) = graphics::reply(&command.response, Ok(()))
+                                    {
+                                        let _ = pane.pty.write(&reply);
+                                    }
+                                }
+                                Ingest::Place(command) => {
+                                    let image_id = command.image_id.or_else(|| {
+                                        command.image_number.and_then(|number| {
+                                            pane.placements.resolve_image_number(number)
+                                        })
+                                    });
+                                    let result = image_id
+                                        .and_then(|id| {
+                                            self.graphics_store
+                                                .get(pane_id, id)
+                                                .map(|image| (id, image))
+                                        })
+                                        .ok_or_else(graphics::GraphicsError::not_found)
+                                        .and_then(|(id, image)| {
+                                            let texture_ready = if let Some(gpu) = self.gpu.as_mut()
+                                            {
+                                                gpu.textures.contains_key(&(pane_id, id))
+                                                    || upload_image_texture(gpu, pane_id, id, image)
+                                            } else {
+                                                false
+                                            };
+                                            if !texture_ready {
+                                                return Err(
+                                                    graphics::GraphicsError::invalid_placement(),
+                                                );
+                                            }
+                                            let anchor = pane.model.cursor_anchor();
+                                            commit_placement(
+                                                &mut pane.placements,
+                                                &mut pane.model,
+                                                id,
+                                                command.options,
+                                                anchor,
+                                                (image.width, image.height),
+                                                (
+                                                    self.gpu
+                                                        .as_ref()
+                                                        .map_or(8.0, |gpu| gpu.cell_width),
+                                                    self.gpu
+                                                        .as_ref()
+                                                        .map_or(16.0, |gpu| gpu.cell_height),
+                                                ),
+                                            )
+                                        });
+                                    if let Some(reply) = graphics::reply(&command.response, result)
+                                    {
+                                        let _ = pane.pty.write(&reply);
+                                    }
+                                }
+                                Ingest::Decode(job) => {
+                                    let anchor = pane.model.cursor_anchor();
+                                    pane.segments.begin_decode();
+                                    let sender = proxy.clone();
+                                    std::thread::spawn(move || {
+                                        let completion = graphics::decode_transfer(job);
+                                        let _ = sender.send_event(UserEvent::GraphicsDecoded(
+                                            pane_id, anchor, completion,
+                                        ));
+                                    });
+                                }
+                            }
                         }
                     }
                 }
-                let old_screen = if pane.model.alternate_screen_active() {
-                    so1_terminal::blocks::GridScreen::Alternate
-                } else {
-                    so1_terminal::blocks::GridScreen::Primary
-                };
-                for observed in pane.model.feed(&bytes) {
-                    if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = observed.event
-                    {
-                        let text = String::from_utf8_lossy(&path).into_owned();
-                        pane.cwd = PathBuf::from(text);
-                        pane.title = pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
-                    }
-                }
-                let new_screen = if pane.model.alternate_screen_active() {
-                    so1_terminal::blocks::GridScreen::Alternate
-                } else {
-                    so1_terminal::blocks::GridScreen::Primary
-                };
-                pane.placements.screen_changed(old_screen, new_screen);
-                pane.placements
-                    .prune_evicted_primary(pane.model.block_row_base());
                 for ev in pane.model.take_events() {
                     if let Some(title) = apply_title_event(&pane.cwd, &mut pane.explicit_title, &ev)
                     {
@@ -2026,28 +2733,23 @@ impl TerminalWindow {
                 }
             }
         }
-        if self.focused_pane_id() == Some(pane_id) {
-            self.refresh_window_title();
-        }
-        self.poll_child_exit(event_loop);
-        if changed
-            && self
-                .tabs
-                .as_ref()
-                .is_some_and(|tabs| pane_is_in_active_tab(tabs, pane_id))
-        {
-            self.request_redraw();
-        }
     }
 
-    fn finish_graphics(&mut self, pane_id: PaneId, mut completion: GraphicsCompletion) {
+    fn finish_graphics(
+        &mut self,
+        pane_id: PaneId,
+        anchor: so1_terminal::blocks::GridAnchor,
+        mut completion: GraphicsCompletion,
+    ) {
         {
             let Some(pane) = self.panes.get_mut(&pane_id) else {
                 return;
             };
             pane.graphics_protocol.finish_decode();
+            pane.segments.finish_decode();
             let result = match completion.image {
                 Ok(image) => {
+                    let dimensions = (image.width, image.height);
                     if completion.action != "q" {
                         let id = if let Some(id) = completion.response.image_id {
                             id
@@ -2069,12 +2771,42 @@ impl TerminalWindow {
                         if let Err(error) = self.graphics_store.insert(pane_id, id, image) {
                             Err(error)
                         } else {
+                            let texture_ready = if let Some(stored_image) =
+                                self.graphics_store.get(pane_id, id)
+                                && let Some(gpu) = self.gpu.as_mut()
+                            {
+                                gpu.textures.remove(&(pane_id, id));
+                                upload_image_texture(gpu, pane_id, id, stored_image)
+                            } else {
+                                false
+                            };
                             pane.placements
                                 .register_image(id, completion.response.image_number);
                             pane.placements.retain_images(|image_id| {
                                 self.graphics_store.get(pane_id, image_id).is_some()
                             });
-                            Ok(())
+                            if completion.action == "T" {
+                                if !texture_ready {
+                                    Err(graphics::GraphicsError::invalid_placement())
+                                } else if let Some(options) = completion.placement {
+                                    commit_placement(
+                                        &mut pane.placements,
+                                        &mut pane.model,
+                                        id,
+                                        options,
+                                        anchor,
+                                        dimensions,
+                                        (
+                                            self.gpu.as_ref().map_or(8.0, |gpu| gpu.cell_width),
+                                            self.gpu.as_ref().map_or(16.0, |gpu| gpu.cell_height),
+                                        ),
+                                    )
+                                } else {
+                                    Err(graphics::GraphicsError::invalid_placement())
+                                }
+                            } else {
+                                Ok(())
+                            }
                         }
                     } else {
                         Ok(())
@@ -2087,6 +2819,9 @@ impl TerminalWindow {
             }
         }
         for (evicted_pane, image_id) in self.graphics_store.take_evicted() {
+            if let Some(gpu) = self.gpu.as_mut() {
+                gpu.textures.remove(&(evicted_pane, image_id));
+            }
             if let Some(pane) = self.panes.get_mut(&evicted_pane) {
                 pane.placements.retain_images(|id| {
                     id != image_id || self.graphics_store.get(evicted_pane, id).is_some()
@@ -2116,8 +2851,13 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 }
                 self.receive_output(pane_id, event_loop);
             }
-            UserEvent::GraphicsDecoded(pane_id, completion) => {
-                self.finish_graphics(pane_id, completion)
+            UserEvent::GraphicsDecoded(pane_id, anchor, completion) => {
+                self.finish_graphics(pane_id, anchor, completion);
+                self.apply_segments(pane_id);
+                if self.focused_pane_id() == Some(pane_id) {
+                    self.refresh_window_title();
+                }
+                self.request_redraw();
             }
         }
     }
@@ -2559,20 +3299,117 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction,
-        TabAction, TerminalKey, apply_title_event, block_marker_bounds, block_shortcut,
+        ApcCursorTracker, BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags,
+        OrderedSegments, PaneAction, PlacementOptions, SourceRect, TabAction, TerminalKey,
+        TerminalSegment, apply_title_event, block_marker_bounds, block_shortcut,
         close_pane_lifecycle, create_tab_with, cwd_basename_title, encode_key_with_flags,
         glyph_key_requires_reshape, invalidate_glyph_cache, key_from_winit, modifier_event_state,
-        overlay_vertex_range, pane_action, pane_cell_at, pane_exit_needs_redraw,
-        pane_is_in_active_tab, pane_tab_title, route_block_shortcut, selection_target,
-        tab_action_changes_geometry, tab_bar_height, tab_content_rect, tab_index_at, tab_shortcut,
-        tab_style,
+        move_cursor_after_placement, overlay_vertex_range, pane_action, pane_cell_at,
+        pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title, placement_from_options,
+        retain_live_textures, route_block_shortcut, selection_target, tab_action_changes_geometry,
+        tab_bar_height, tab_content_rect, tab_index_at, tab_shortcut, tab_style,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
     use so1_terminal::model::{Model, ModelEvent};
     use so1_terminal::selection::PointerState;
     use winit::keyboard::{Key, NamedKey};
+
+    #[test]
+    fn image_cursor_policy_moves_to_after_bottom_right_only_when_requested() {
+        let mut model = Model::new(10, 5);
+        move_cursor_after_placement(&mut model, (3, 2), false);
+        assert_eq!((model.cursor().column, model.cursor().row), (3, 1));
+        move_cursor_after_placement(&mut model, (2, 2), true);
+        assert_eq!((model.cursor().column, model.cursor().row), (3, 1));
+    }
+
+    #[test]
+    fn apc_boundaries_preserve_text_order_and_cursor_anchor_across_chunk_splits() {
+        let mut tracker = ApcCursorTracker::default();
+        let first = tracker.feed(b"before\x1b_Ga=p,i=7;");
+        assert!(matches!(&first[..], [TerminalSegment::Data(bytes)] if bytes == b"before"));
+        let second = tracker.feed(b"payload\x1b\\after");
+        assert!(
+            matches!(&second[..], [TerminalSegment::Apc(payload), TerminalSegment::Data(bytes)] if payload == b"Ga=p,i=7;payload" && bytes == b"after")
+        );
+    }
+
+    #[test]
+    fn segments_after_an_in_flight_decode_wait_until_it_finishes() {
+        let mut queue = OrderedSegments::default();
+        queue.extend([
+            TerminalSegment::Data(b"before".to_vec()),
+            TerminalSegment::Apc(b"Ga=T;image".to_vec()),
+            TerminalSegment::Data(b"after".to_vec()),
+        ]);
+        assert!(matches!(queue.next(), Some(TerminalSegment::Data(bytes)) if bytes == b"before"));
+        assert!(matches!(queue.next(), Some(TerminalSegment::Apc(_))));
+        queue.begin_decode();
+        queue.extend([TerminalSegment::Data(b"later".to_vec())]);
+        assert!(queue.next().is_none());
+        queue.finish_decode();
+        assert!(matches!(queue.next(), Some(TerminalSegment::Data(bytes)) if bytes == b"after"));
+        assert!(matches!(queue.next(), Some(TerminalSegment::Data(bytes)) if bytes == b"later"));
+        assert!(queue.next().is_none());
+    }
+
+    #[test]
+    fn deleted_or_quota_evicted_images_drop_their_cached_texture_keys() {
+        let mut cached = std::collections::BTreeMap::from([
+            ((PaneId(1), 10), "deleted"),
+            ((PaneId(2), 20), "quota-evicted"),
+            ((PaneId(2), 21), "still-live"),
+        ]);
+        retain_live_textures(&mut cached, |pane, id| (pane, id) == (PaneId(2), 21));
+        assert_eq!(
+            cached,
+            std::collections::BTreeMap::from([((PaneId(2), 21), "still-live")])
+        );
+    }
+
+    #[test]
+    fn placement_geometry_clips_source_and_derives_missing_display_dimension() {
+        let placement = placement_from_options(
+            9,
+            PlacementOptions {
+                source: (10, 0, 0, 20),
+                cells: (Some(4), None),
+                ..Default::default()
+            },
+            so1_terminal::blocks::GridAnchor {
+                line: 2,
+                column: 3,
+                screen: so1_terminal::blocks::GridScreen::Primary,
+            },
+            (100, 20),
+            (8.0, 16.0),
+        )
+        .unwrap();
+        assert_eq!(
+            placement.source,
+            SourceRect {
+                x: 10,
+                y: 0,
+                width: 90,
+                height: 20
+            }
+        );
+        assert_eq!((placement.cells.columns, placement.cells.rows), (4, 1));
+        assert!(
+            placement_from_options(
+                9,
+                PlacementOptions {
+                    offset: (8, 0),
+                    ..Default::default()
+                },
+                placement.anchor,
+                (100, 20),
+                (8.0, 16.0)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn tab_bar_geometry_is_hidden_for_one_tab_and_reserves_one_cell_row_for_many() {

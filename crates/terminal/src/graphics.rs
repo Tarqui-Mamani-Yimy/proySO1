@@ -1,4 +1,4 @@
-//! Bounded kitty graphics protocol ingestion; rendering is deferred to T7.
+//! Bounded kitty graphics protocol ingestion and display-command decoding.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -15,8 +15,8 @@ pub const PANE_LIMIT: usize = 128 * 1024 * 1024;
 pub const PROCESS_LIMIT: usize = 512 * 1024 * 1024;
 pub const DIMENSION_LIMIT: u32 = 10_000;
 const CHUNK_LIMIT: usize = PANE_LIMIT.div_ceil(3) * 4 + 8;
-/// T7 flips this only after placements are rendered for terminal clients.
-pub const GRAPHICS_DISPLAY_ENABLED: bool = false;
+/// Display requests are accepted only while placement and textured rendering are enabled.
+pub const GRAPHICS_DISPLAY_ENABLED: bool = true;
 const SUPPORTED_KEYS: &[&str] = &[
     "a", "d", "f", "i", "I", "s", "v", "t", "o", "S", "O", "m", "q", "p", "x", "y", "w", "h", "c",
     "r", "X", "Y", "z", "C",
@@ -106,6 +106,14 @@ impl ControlData {
             })
             .transpose()
     }
+    fn signed_number(&self, key: &str) -> Result<Option<i32>, GraphicsError> {
+        self.get(key)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| GraphicsError::invalid("invalid numeric field"))
+            })
+            .transpose()
+    }
 }
 
 pub fn parse_control(bytes: &[u8]) -> Result<ControlData, GraphicsError> {
@@ -176,12 +184,22 @@ impl GraphicsError {
             message: "file transmission denied",
         }
     }
+    pub fn not_found() -> Self {
+        Self {
+            code: "ENOENT",
+            message: "image not found",
+        }
+    }
+    pub fn invalid_placement() -> Self {
+        Self::invalid("invalid image placement geometry")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResponseContext {
     pub image_id: Option<u32>,
     pub image_number: Option<u32>,
+    pub placement_id: Option<u32>,
     pub quiet: u8,
 }
 
@@ -199,6 +217,7 @@ impl ResponseContext {
         Ok(Self {
             image_id,
             image_number,
+            placement_id: control.number("p")?,
             quiet: quiet as u8,
         })
     }
@@ -222,6 +241,12 @@ pub fn reply(context: &ResponseContext, result: Result<(), GraphicsError>) -> Op
         }
         out.extend_from_slice(format!("I={number}").as_bytes());
     }
+    if let Some(placement_id) = context.placement_id {
+        if context.image_id.is_some() || context.image_number.is_some() {
+            out.push(b',');
+        }
+        out.extend_from_slice(format!("p={placement_id}").as_bytes());
+    }
     out.push(b';');
     match result {
         Ok(()) => out.extend_from_slice(b"OK"),
@@ -237,18 +262,21 @@ pub struct DecodeJob {
     control: ControlData,
     pub response: ResponseContext,
     pub action: String,
+    pub placement: Option<PlacementOptions>,
     file_policy: GraphicsFilePolicy,
 }
 
 pub struct GraphicsCompletion {
     pub response: ResponseContext,
     pub action: String,
+    pub placement: Option<PlacementOptions>,
     pub image: Result<DecodedImage, GraphicsError>,
 }
 
 pub fn decode_transfer(job: DecodeJob) -> GraphicsCompletion {
     let response = job.response.clone();
     let action = job.action.clone();
+    let placement = job.placement;
     let file_medium = matches!(job.control.get("t"), Some("f" | "t"));
     let image = decode(job).map_err(|error| {
         if file_medium {
@@ -261,6 +289,7 @@ pub fn decode_transfer(job: DecodeJob) -> GraphicsCompletion {
     GraphicsCompletion {
         response,
         action,
+        placement,
         image,
     }
 }
@@ -271,7 +300,26 @@ pub enum Ingest {
     Pending,
     Decode(DecodeJob),
     Delete(DeleteCommand),
+    Place(PlaceCommand),
     Reply(Option<Vec<u8>>),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlacementOptions {
+    pub placement_id: Option<u32>,
+    pub source: (u32, u32, u32, u32),
+    pub cells: (Option<usize>, Option<usize>),
+    pub offset: (u32, u32),
+    pub z: i32,
+    pub no_cursor_move: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaceCommand {
+    pub image_id: Option<u32>,
+    pub image_number: Option<u32>,
+    pub response: ResponseContext,
+    pub options: PlacementOptions,
 }
 
 #[derive(Debug)]
@@ -306,10 +354,7 @@ impl GraphicsProtocol {
         if apc.first() != Some(&b'G') {
             return Ingest::Ignored;
         }
-        let Some(separator) = apc.iter().position(|&b| b == b';') else {
-            self.chunk = None;
-            return Ingest::Reply(None);
-        };
+        let separator = apc.iter().position(|&b| b == b';').unwrap_or(apc.len());
         let control = match parse_control(&apc[1..separator]) {
             Ok(control) => control,
             Err(error) => {
@@ -338,7 +383,7 @@ impl GraphicsProtocol {
                 }),
             ));
         }
-        let encoded = &apc[separator + 1..];
+        let encoded = apc.get(separator.saturating_add(1)..).unwrap_or_default();
         let continuation = control.get("m").unwrap_or("0");
         if continuation != "0" && continuation != "1" {
             let context = self
@@ -435,6 +480,26 @@ impl GraphicsProtocol {
                 Err((response, error)) => Ingest::Reply(reply(&response, Err(error))),
             };
         }
+        if action == "p" {
+            if !combined.is_empty() {
+                return Ingest::Reply(reply(
+                    &ctx,
+                    Err(GraphicsError::invalid(
+                        "put action cannot include image data",
+                    )),
+                ));
+            }
+            let options = match placement_options(&metadata) {
+                Ok(options) => options,
+                Err(error) => return Ingest::Reply(reply(&ctx, Err(error))),
+            };
+            return Ingest::Place(PlaceCommand {
+                image_id: ctx.image_id,
+                image_number: ctx.image_number,
+                response: ctx,
+                options,
+            });
+        }
         if let Err(error) = validate_request(&metadata, &action) {
             return Ingest::Reply(reply(&ctx, Err(error)));
         }
@@ -444,11 +509,20 @@ impl GraphicsProtocol {
             Err(_) => return Ingest::Reply(reply(&ctx, Err(GraphicsError::decode()))),
         };
         self.decoding = true;
+        let placement = if action == "T" {
+            match placement_options(&metadata) {
+                Ok(options) => Some(options),
+                Err(error) => return Ingest::Reply(reply(&ctx, Err(error))),
+            }
+        } else {
+            None
+        };
         Ingest::Decode(DecodeJob {
             payload: decoded,
             control: metadata,
             response: ctx,
             action,
+            placement,
             file_policy: self.file_policy.clone(),
         })
     }
@@ -702,6 +776,7 @@ fn same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
 fn response_hint(control: &[u8]) -> ResponseContext {
     let mut image_id = None;
     let mut image_number = None;
+    let mut placement_id = None;
     let mut quiet = 0;
     if let Ok(text) = std::str::from_utf8(control) {
         for field in text.split(',') {
@@ -709,6 +784,7 @@ fn response_hint(control: &[u8]) -> ResponseContext {
                 match key {
                     "i" => image_id = value.parse().ok(),
                     "I" => image_number = value.parse().ok(),
+                    "p" => placement_id = value.parse().ok(),
                     "q" => quiet = value.parse::<u8>().ok().filter(|q| *q <= 2).unwrap_or(0),
                     _ => {}
                 }
@@ -721,6 +797,7 @@ fn response_hint(control: &[u8]) -> ResponseContext {
     ResponseContext {
         image_id,
         image_number,
+        placement_id,
         quiet,
     }
 }
@@ -728,10 +805,8 @@ fn response_hint(control: &[u8]) -> ResponseContext {
 fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsError> {
     match action {
         "t" | "q" => {}
-        // Display requests would otherwise report OK for images that never appear.
-        "T" | "p" if !GRAPHICS_DISPLAY_ENABLED => {
-            return Err(GraphicsError::unsupported("image display is not enabled"));
-        }
+        "T" | "p" if GRAPHICS_DISPLAY_ENABLED => {}
+        "T" | "p" => return Err(GraphicsError::unsupported("image display is not enabled")),
         _ => return Err(GraphicsError::invalid("invalid action")),
     }
     let medium = control.get("t").unwrap_or("d");
@@ -774,6 +849,26 @@ fn validate_request(control: &ControlData, action: &str) -> Result<(), GraphicsE
         return Err(GraphicsError::invalid("compressed PNG requires S"));
     }
     Ok(())
+}
+
+fn placement_options(control: &ControlData) -> Result<PlacementOptions, GraphicsError> {
+    let number = |key: &str| control.number(key).map(|v| v.unwrap_or(0));
+    let columns = number("c")? as usize;
+    let rows = number("r")? as usize;
+    let offset_x = number("X")?;
+    let offset_y = number("Y")?;
+    let cursor_policy = number("C")?;
+    if cursor_policy > 1 {
+        return Err(GraphicsError::invalid("C must be 0 or 1"));
+    }
+    Ok(PlacementOptions {
+        placement_id: control.number("p")?,
+        source: (number("x")?, number("y")?, number("w")?, number("h")?),
+        cells: ((columns > 0).then_some(columns), (rows > 0).then_some(rows)),
+        offset: (offset_x, offset_y),
+        z: control.signed_number("z")?.unwrap_or(0),
+        no_cursor_move: cursor_policy == 1,
+    })
 }
 
 fn parse_delete(
@@ -1350,6 +1445,7 @@ mod tests {
         let ctx = ResponseContext {
             image_id: Some(7),
             image_number: None,
+            placement_id: None,
             quiet: 0,
         };
         assert_eq!(reply(&ctx, Ok(())).unwrap(), b"\x1b_Gi=7;OK\x1b\\");
@@ -1365,6 +1461,7 @@ mod tests {
                 &ResponseContext {
                     image_id: None,
                     image_number: None,
+                    placement_id: None,
                     quiet: 0
                 },
                 Ok(())
@@ -1404,20 +1501,59 @@ mod tests {
     }
 
     #[test]
-    fn transmit_and_display_replies_unsupported_until_placements_exist() {
-        let Ingest::Reply(Some(response)) =
-            GraphicsProtocol::default().ingest(b"Ga=T,f=24,s=1,v=1,i=5;AAAA")
+    fn transmit_and_display_keeps_decode_errors_and_put_requests_are_enabled() {
+        let Ingest::Decode(job) = GraphicsProtocol::default().ingest(b"Ga=T,f=24,s=1,v=1,i=5;AQI=")
         else {
-            panic!("expected reply")
+            panic!("display transfer must enter decoding")
         };
-        let response = String::from_utf8(response).unwrap();
+        let completion = decode_transfer(job);
+        assert!(completion.image.is_err());
+        let response =
+            String::from_utf8(reply(&completion.response, completion.image.map(|_| ())).unwrap())
+                .unwrap();
         assert!(response.contains("i=5"), "{response:?}");
-        assert!(response.contains("ENOTSUP"), "{response:?}");
+        assert!(response.contains("EINVAL"), "{response:?}");
 
-        let Ingest::Reply(Some(response)) = GraphicsProtocol::default().ingest(b"Ga=p,i=5;") else {
-            panic!("expected placement request to remain disabled")
+        let Ingest::Place(command) = GraphicsProtocol::default().ingest(b"Ga=p,i=5;") else {
+            panic!("expected placement request")
         };
-        assert!(String::from_utf8(response).unwrap().contains("ENOTSUP"));
+        assert_eq!(command.image_id, Some(5));
+    }
+
+    #[test]
+    fn put_request_yields_a_placement_command_with_protocol_fields() {
+        let mut protocol = GraphicsProtocol::new(GraphicsFilePolicy::default());
+        let result = protocol.ingest(b"Ga=p,i=17,p=8,x=3,y=4,w=20,h=30,X=2,Y=1,c=4,r=5,z=-3,C=1;");
+        let Ingest::Place(command) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(command.image_id, Some(17));
+        assert_eq!(command.options.placement_id, Some(8));
+        assert_eq!(command.options.source, (3, 4, 20, 30));
+        assert_eq!(command.options.cells, (Some(4), Some(5)));
+        assert_eq!(command.options.offset, (2, 1));
+        assert_eq!(command.options.z, -3);
+        assert!(command.options.no_cursor_move);
+    }
+
+    #[test]
+    fn transmit_and_display_retains_placement_options_until_successful_decode() {
+        let Ingest::Decode(job) =
+            GraphicsProtocol::default().ingest(b"Ga=T,f=24,s=1,v=1,i=17,p=8,C=1;AQID")
+        else {
+            panic!("expected image decode job");
+        };
+        let completion = decode_transfer(job);
+        assert_eq!(completion.placement.unwrap().placement_id, Some(8));
+        assert_eq!(
+            (
+                completion.image.as_ref().unwrap().width,
+                completion.image.as_ref().unwrap().height
+            ),
+            (1, 1)
+        );
+        let reply = String::from_utf8(reply(&completion.response, Ok(())).unwrap()).unwrap();
+        assert!(reply.contains("i=17,p=8;OK"), "{reply}");
     }
 
     #[test]
@@ -1443,11 +1579,10 @@ mod tests {
         );
         assert!(reply(&command.response, Ok(())).is_none());
 
-        let Ingest::Reply(Some(error)) = GraphicsProtocol::default().ingest(b"Ga=p,i=5,q=0;")
-        else {
-            panic!("placement remains unsupported")
+        let Ingest::Place(command) = GraphicsProtocol::default().ingest(b"Ga=p,i=5,q=0;") else {
+            panic!("placement request must be enabled")
         };
-        assert!(String::from_utf8(error).unwrap().contains("ENOTSUP"));
+        assert_eq!(command.image_id, Some(5));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+//! Stable-row kitty image placements, delete selectors, and pane viewport projection.
 use so1_terminal::blocks::{GridAnchor, GridScreen};
 use std::collections::BTreeMap;
 
@@ -16,7 +17,6 @@ pub struct CellSize {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Placement creation is consumed by T7 rendering.
 pub struct Placement {
     pub image_id: u32,
     pub placement_id: Option<u32>,
@@ -25,11 +25,10 @@ pub struct Placement {
     pub cells: CellSize,
     pub pixel_offset: (u32, u32),
     pub z: i32,
-    insertion: u64,
+    pub(crate) insertion: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Renderer-facing viewport query is intentionally headless in T6.
 pub struct Viewport {
     pub screen: GridScreen,
     pub top_row: i64,
@@ -38,7 +37,6 @@ pub struct Viewport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Renderer-facing projection is intentionally headless in T6.
 pub struct VisiblePlacement {
     pub placement: Placement,
     pub row: usize,
@@ -100,7 +98,6 @@ impl PlacementStore {
         self.placements.retain(|placement| placement.image_id != id);
     }
 
-    #[allow(dead_code)] // Display actions stay disabled until T7 can render placements.
     pub fn place(&mut self, mut placement: Placement) {
         self.register_if_missing(placement.image_id);
         if placement.image_id != 0
@@ -129,14 +126,22 @@ impl PlacementStore {
         }
     }
 
-    #[allow(dead_code)] // Read-only inspection supports the renderer and tests.
+    #[allow(dead_code)]
     pub fn placements(&self) -> &[Placement] {
         &self.placements
     }
 
-    #[allow(dead_code)] // Image liveness is queried by tests and future display integration.
+    #[allow(dead_code)]
     pub fn has_image(&self, id: u32) -> bool {
         self.images.contains_key(&id)
+    }
+
+    pub fn resolve_image_number(&self, number: u32) -> Option<u32> {
+        self.images
+            .iter()
+            .filter(|(_, info)| info.number == Some(number))
+            .max_by_key(|(_, info)| info.insertion)
+            .map(|(id, _)| *id)
     }
 
     pub fn prune_evicted_primary(&mut self, boundary: u64) {
@@ -257,7 +262,6 @@ impl PlacementStore {
             })
     }
 
-    #[allow(dead_code)] // Renderer-facing query is intentionally not called before T7.
     pub fn visible(&self, viewport: Viewport) -> Vec<VisiblePlacement> {
         let end_row = viewport.top_row.saturating_add(viewport.rows as i64);
         let mut visible: Vec<_> = self
@@ -437,6 +441,89 @@ mod tests {
             );
             assert_eq!(freed, [target], "image {target} should be freed");
         }
+    }
+
+    #[test]
+    fn no_separator_apcs_delete_targeted_and_all_visible_placements() {
+        let cursor = GridAnchor {
+            line: 0,
+            column: 0,
+            screen: GridScreen::Primary,
+        };
+        let mut store = PlacementStore::default();
+        store.place(placement(9, None, GridScreen::Primary, 2, 1));
+        store.place(placement(10, None, GridScreen::Primary, 4, 1));
+        let crate::graphics::Ingest::Delete(command) =
+            crate::graphics::GraphicsProtocol::default().ingest(b"Ga=d,d=I,i=9")
+        else {
+            panic!("image-id delete without a payload separator must be parsed")
+        };
+        store.delete(
+            command.selector,
+            command.frees_data,
+            cursor,
+            GridScreen::Primary,
+            full_viewport(GridScreen::Primary),
+        );
+        assert_eq!(store.visible(full_viewport(GridScreen::Primary)).len(), 1);
+        assert_eq!(
+            store.visible(full_viewport(GridScreen::Primary))[0]
+                .placement
+                .image_id,
+            10
+        );
+
+        let mut store = PlacementStore::default();
+        store.place(placement(11, None, GridScreen::Primary, 2, 1));
+        store.place(placement(12, None, GridScreen::Primary, 4, 1));
+        store.place(placement(13, None, GridScreen::Primary, 50, 1));
+        let crate::graphics::Ingest::Delete(command) =
+            crate::graphics::GraphicsProtocol::default().ingest(b"Ga=d")
+        else {
+            panic!("delete-all without a payload separator must be parsed")
+        };
+        store.delete(
+            command.selector,
+            command.frees_data,
+            cursor,
+            GridScreen::Primary,
+            full_viewport(GridScreen::Primary),
+        );
+        let visible = store.visible(full_viewport(GridScreen::Primary));
+        assert!(visible.is_empty());
+        assert_eq!(store.placements().len(), 1);
+        assert_eq!(store.placements()[0].image_id, 13);
+    }
+
+    #[test]
+    fn semicolon_delete_command_keeps_targeted_deletion_behavior() {
+        let mut store = PlacementStore::default();
+        store.place(placement(9, None, GridScreen::Primary, 2, 1));
+        store.place(placement(10, None, GridScreen::Primary, 4, 1));
+        let cursor = GridAnchor {
+            line: 0,
+            column: 0,
+            screen: GridScreen::Primary,
+        };
+        let crate::graphics::Ingest::Delete(command) =
+            crate::graphics::GraphicsProtocol::default().ingest(b"Ga=d,d=I,i=9;")
+        else {
+            panic!("semicolon-terminated delete command must still be parsed")
+        };
+        store.delete(
+            command.selector,
+            command.frees_data,
+            cursor,
+            GridScreen::Primary,
+            full_viewport(GridScreen::Primary),
+        );
+        assert_eq!(store.visible(full_viewport(GridScreen::Primary)).len(), 1);
+        assert_eq!(
+            store.visible(full_viewport(GridScreen::Primary))[0]
+                .placement
+                .image_id,
+            10
+        );
     }
 
     #[test]

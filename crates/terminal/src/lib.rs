@@ -1,12 +1,11 @@
-pub mod apc;
-pub mod block_navigation;
-pub mod blocks;
-pub mod layout;
-pub mod model;
-pub mod osc;
+pub use so1_term_core::{
+    apc, block_navigation, blocks, graphics, keyboard, layout, model, osc, placements, renderer,
+};
 pub mod pty;
-pub mod renderer;
 pub mod selection;
+
+#[cfg(all(test, unix))]
+mod model_pty_tests;
 
 /// Default interactive-shell command candidates, in preference order.
 pub fn default_shell_candidates() -> &'static [&'static str] {
@@ -93,5 +92,11 @@ mod tests {
         assert_eq!(resolve_shell_choice(None, false, &["pwsh", "cmd"]), "pwsh");
         assert_eq!(default_shell_candidates_for(true), &["pwsh", "cmd"]);
     }
+
+    #[test]
+    fn headless_model_remains_available_through_terminal_reexport() {
+        let mut model = crate::model::Model::new(1, 1);
+        model.feed(b"x");
+        assert_eq!(model.visible_cells()[0][0].character, 'x');
+    }
 }
-pub mod keyboard;

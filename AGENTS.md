@@ -37,7 +37,19 @@ Job resume (`fg`/`bg`) and done/stopped notifications are later Phase 2 tasks.
 ## Architecture
 
 ```
-Cargo.toml        Virtual workspace: crates/epsh, crates/shell, and crates/terminal
+Cargo.toml        Virtual workspace: crates/epsh, crates/shell, crates/term-core, and crates/terminal
+crates/term-core/
+  src/lib.rs      Headless terminal state library (so1-term-core) and public module declarations
+  src/model.rs    VT model, snapshots, selection state, and OSC/block integration
+  src/blocks.rs   Shell-integration block state and stable grid anchors
+  src/block_navigation.rs Block navigation targets and retained-grid text extraction
+  src/layout.rs   Pure pane split tree, pixel/cell geometry, focus, and tab state
+  src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
+  src/apc.rs      Bounded incremental APC payload observer over PTY bytes
+  src/keyboard.rs Kitty keyboard encoding, paste helpers, and IME preedit gate
+  src/graphics.rs Kitty graphics protocol parsing, bounded decoding, and image storage
+  src/placements.rs Per-pane kitty placement state, deletion selectors, and viewport projection
+  src/renderer.rs Renderer-independent grid, color, block, and image projection helpers
 crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
@@ -47,18 +59,8 @@ crates/shell/
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/terminal/
   src/main.rs     so1term window/event loop, per-pane PTYs/models, input routing, and GPU renderer
-  src/lib.rs      Public module declarations, shell selection, and surface helpers
-  src/layout.rs   Pure pane split tree, pixel/cell geometry, focus, and tab state
-  src/blocks.rs   OSC 133 command-block state and grid anchors
-  src/block_navigation.rs Pure block navigation targets and retained-grid text extraction
-  src/keyboard.rs Xterm and kitty CSI-u key encoding, paste helpers, and IME preedit gate
-  src/model.rs    alacritty_terminal adapter, snapshots, selections, and write-back events
-  src/osc.rs      Incremental OSC 7 / OSC 133 observer over PTY bytes
-  src/apc.rs      Bounded incremental APC payload observer over PTY bytes
-  src/graphics.rs Kitty graphics APC parsing, bounded decode, and per-pane image storage
-  src/placements.rs Pure per-pane kitty placement model, stable-row anchors, delete selectors, and viewport projection
+  src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
-  src/renderer.rs Grid/color helpers and pure block-overlay projection
   src/selection.rs Click tracking and pure mouse-selection routing
 crates/epsh/src/
   lib.rs          Public API, module declarations

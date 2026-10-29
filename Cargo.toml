@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/epsh", "crates/shell", "crates/terminal"]
+members = ["crates/epsh", "crates/shell", "crates/term-core", "crates/terminal"]
 resolver = "3"
 
 [profile.dev]

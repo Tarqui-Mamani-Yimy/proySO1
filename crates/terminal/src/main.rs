@@ -1,8 +1,3 @@
-#[path = "graphics.rs"]
-mod graphics;
-#[path = "placements.rs"]
-mod placements;
-
 use alacritty_terminal::selection::SelectionType;
 use arboard::Clipboard;
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Weight};
@@ -13,7 +8,7 @@ use glyphon::{
 use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest, PlacementOptions};
 use placements::{CellSize as PlacementCellSize, Placement, PlacementStore, SourceRect};
 use so1_terminal::{
-    clamp_surface_size,
+    clamp_surface_size, graphics,
     keyboard::{
         ImePreeditGate, Key as TerminalKey, KeyEventKind, KeyInput, KeyboardFlags,
         Modifiers as KeyModifiers, encode_ime_commit_with_flags, encode_key_with_flags,
@@ -21,6 +16,7 @@ use so1_terminal::{
     },
     layout::{CellSize, Direction, FocusDirection, PaneId, PaneLayout, Rect, Tab, TabSet},
     model::{Model, ModelEvent},
+    placements,
     renderer::{
         BlockDecorationColor, BlockViewport, ExitPollBackoff, ExitPollDecision, FrameRecovery,
         SurfaceFailure, SurfaceRetryBackoff, WakeupGate, WheelAccumulator,
@@ -504,21 +500,20 @@ fn placement_from_options(
     if options.offset.0 as f32 >= cell.0 || options.offset.1 as f32 >= cell.1 {
         return Err(graphics::GraphicsError::invalid_placement());
     }
-    Ok(Placement {
+    Ok(Placement::new(
         image_id,
-        placement_id: options.placement_id,
+        options.placement_id,
         anchor,
-        source: SourceRect {
+        SourceRect {
             x,
             y,
             width,
             height,
         },
-        cells: PlacementCellSize { columns, rows },
-        pixel_offset: options.offset,
-        z: options.z,
-        insertion: 0,
-    })
+        PlacementCellSize { columns, rows },
+        options.offset,
+        options.z,
+    ))
 }
 
 fn move_cursor_after_placement(model: &mut Model, cells: (usize, usize), no_cursor_move: bool) {
@@ -2146,7 +2141,7 @@ impl TerminalWindow {
                 .iter()
                 .map(|entry| so1_terminal::renderer::ImageLayerItem {
                     z: entry.placement.z,
-                    insertion: entry.placement.insertion,
+                    insertion: entry.placement.insertion_order(),
                 })
                 .collect();
             let buckets = so1_terminal::renderer::bucket_image_layers(&layer_items);

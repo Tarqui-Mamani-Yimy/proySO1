@@ -1,8 +1,8 @@
 //! Bounded kitty graphics protocol ingestion and display-command decoding.
 
+use crate::layout::PaneId;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Decompress, FlushDecompress, Status};
-use so1_terminal::layout::PaneId;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},

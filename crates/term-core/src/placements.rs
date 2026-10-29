@@ -1,5 +1,5 @@
 //! Stable-row kitty image placements, delete selectors, and pane viewport projection.
-use so1_terminal::blocks::{GridAnchor, GridScreen};
+use crate::blocks::{GridAnchor, GridScreen};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26,6 +26,33 @@ pub struct Placement {
     pub pixel_offset: (u32, u32),
     pub z: i32,
     pub(crate) insertion: u64,
+}
+
+impl Placement {
+    pub fn new(
+        image_id: u32,
+        placement_id: Option<u32>,
+        anchor: GridAnchor,
+        source: SourceRect,
+        cells: CellSize,
+        pixel_offset: (u32, u32),
+        z: i32,
+    ) -> Self {
+        Self {
+            image_id,
+            placement_id,
+            anchor,
+            source,
+            cells,
+            pixel_offset,
+            z,
+            insertion: 0,
+        }
+    }
+
+    pub fn insertion_order(&self) -> u64 {
+        self.insertion
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,7 +411,7 @@ mod tests {
 
     #[test]
     fn cursor_anchor_reuses_the_model_absolute_row_across_scrollback_growth() {
-        let mut model = so1_terminal::model::Model::new(8, 2);
+        let mut model = crate::model::Model::new(8, 2);
         let anchor = model.cursor_anchor();
         let mut store = PlacementStore::default();
         store.place(placement(

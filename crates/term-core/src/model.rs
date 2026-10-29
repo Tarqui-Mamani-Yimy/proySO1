@@ -317,7 +317,6 @@ impl vte::ansi::Handler for EvictionTracker<'_> {
         text_area_size_pixels();
         text_area_size_chars();
         set_hyperlink(arg0: Option<vte::ansi::Hyperlink>);
-        set_mouse_cursor_icon(arg0: winit::window::CursorIcon);
         push_keyboard_mode(_mode: vte::ansi::KeyboardModes);
         pop_keyboard_modes(_to_pop: u16);
         set_keyboard_mode(_mode: vte::ansi::KeyboardModes, _behavior: vte::ansi::KeyboardModesApplyBehavior);
@@ -1033,10 +1032,6 @@ fn keyboard_flags_for_mode(
 mod tests {
     use super::*;
     use alacritty_terminal::selection::SelectionType;
-    use std::{
-        thread,
-        time::{Duration, Instant},
-    };
 
     #[test]
     fn kitty_keyboard_modes_are_reported_and_stacked_per_screen() {
@@ -1899,34 +1894,5 @@ mod tests {
         model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\one\r\ntwo\r\nthree\r\nfour\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\$ ");
         model.navigate_block(crate::block_navigation::NavigationDirection::Previous);
         assert_eq!(model.cursor().row, usize::MAX);
-    }
-    #[cfg(unix)]
-    #[test]
-    fn renders_prompt_bytes_from_built_so1sh_pty() {
-        let executable = crate::pty::test_so1sh_executable();
-        let executable = executable.expect(
-            "so1sh binary required for real PTY prompt test; run `cargo build -p so1sh` first",
-        );
-        let command = format!("SO1SH_KITTY_KEYBOARD=0 exec '{}'", executable.display());
-        let mut pty =
-            crate::pty::Pty::spawn_with_args("/bin/sh", ["-c", command.as_str()], "/", 80, 24)
-                .expect("spawn built so1sh with kitty keyboard negotiation disabled");
-        let mut model = Model::new(80, 24);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            while let Some(chunk) = pty.try_read() {
-                model.feed(&chunk);
-            }
-            let screen = text(&model);
-            if screen.contains("$ ") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "so1sh prompt not rendered; screen: {screen:?}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-        pty.write(b"exit\n").unwrap();
     }
 }

@@ -2453,20 +2453,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 
 [[package]]
+name = "so1-term-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "base64",
+ "flate2",
+ "libc",
+ "png",
+ "vte 0.15.0",
+]
+
+[[package]]
 name = "so1-terminal"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",
- "base64",
  "bytemuck",
  "cosmic-text",
- "flate2",
  "glyphon",
  "libc",
- "png",
  "pollster",
  "portable-pty",
+ "so1-term-core",
  "vte 0.15.0",
  "wgpu",
  "winit",

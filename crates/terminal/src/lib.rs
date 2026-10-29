@@ -1,6 +1,7 @@
 pub use so1_term_core::{
     apc, block_navigation, blocks, graphics, keyboard, layout, model, osc, placements, renderer,
 };
+pub mod control;
 pub mod pty;
 pub mod selection;
 

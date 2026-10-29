@@ -7,6 +7,10 @@ use glyphon::{
 };
 use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest, PlacementOptions};
 use placements::{CellSize as PlacementCellSize, Placement, PlacementStore, SourceRect};
+use so1_terminal::control::{
+    self as control, ControlCommand, ControlError, ControlErrorCode, ControlOutcome,
+    ControlRequest, ControlResponse, ControlServer, TextScope,
+};
 use so1_terminal::{
     clamp_surface_size, graphics,
     keyboard::{
@@ -43,6 +47,7 @@ use winit::{
 enum UserEvent {
     PtyOutput(PaneId),
     GraphicsDecoded(PaneId, so1_terminal::blocks::GridAnchor, GraphicsCompletion),
+    Control(ControlRequest, std::sync::mpsc::SyncSender<ControlResponse>),
 }
 struct TerminalWindow {
     window: Option<Arc<Window>>,
@@ -67,6 +72,7 @@ struct TerminalWindow {
     clipboard: Option<Clipboard>,
     graphics_store: GraphicsStore,
     next_graphics_image_id: u32,
+    _control_server: Option<ControlServer>,
 }
 
 #[derive(Default)]
@@ -1165,6 +1171,13 @@ fn invalidate_glyph_cache<T>(
 impl TerminalWindow {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let now = Instant::now();
+        let control_server = start_control_server(proxy.clone());
+        if let Some(server) = &control_server {
+            // The value is established before any pane PTY is created and is inherited by every pane shell.
+            unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path().as_os_str()) };
+        } else {
+            unsafe { std::env::remove_var("SO1TERM_SOCKET") };
+        }
         Self {
             window: None,
             gpu: None,
@@ -1188,6 +1201,7 @@ impl TerminalWindow {
             clipboard: None,
             graphics_store: GraphicsStore::new(graphics::PANE_LIMIT, graphics::PROCESS_LIMIT),
             next_graphics_image_id: 1,
+            _control_server: control_server,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -1699,6 +1713,180 @@ impl TerminalWindow {
         self.refresh_window_title();
         self.request_redraw();
         Ok(())
+    }
+
+    fn control_command(
+        &mut self,
+        request: ControlRequest,
+        event_loop: &ActiveEventLoop,
+    ) -> ControlResponse {
+        let id = Some(request.id);
+        let fail = |code, message: String| ControlResponse {
+            id,
+            outcome: ControlOutcome::Failure(ControlError::for_request(id, code, message)),
+        };
+        let result = match request.command {
+            ControlCommand::List => {
+                let Some(tabs) = self.tabs.as_ref() else {
+                    return fail(
+                        ControlErrorCode::Unavailable,
+                        "pane layout is not initialized".into(),
+                    );
+                };
+                let active = tabs.active_index().unwrap_or(0);
+                let values: Vec<_> = tabs.tabs().iter().enumerate().map(|(index, tab)| {
+                    let panes: Vec<_> = tab.layout_tree().panes().iter().map(|pane_id| {
+                        let pane = self.panes.get(pane_id);
+                        serde_json::json!({"id": pane_id.0, "cwd": pane.map(|pane| pane.cwd.to_string_lossy().into_owned()).unwrap_or_default(), "title": pane.map(|pane| pane.title.clone()).unwrap_or_default(), "focused": index == active && tab.active_pane() == *pane_id})
+                    }).collect();
+                    serde_json::json!({"index": index, "active": index == active, "panes": panes})
+                }).collect();
+                serde_json::json!({"tabs": values})
+            }
+            ControlCommand::NewTab => match self.new_tab() {
+                Ok(()) => {
+                    let index = self
+                        .tabs
+                        .as_ref()
+                        .and_then(|tabs| tabs.active_index())
+                        .unwrap_or(0);
+                    let pane = self
+                        .tabs
+                        .as_ref()
+                        .and_then(|tabs| tabs.active())
+                        .map(|tab| tab.active_pane().0)
+                        .unwrap_or(0);
+                    serde_json::json!({"index": index, "pane": pane})
+                }
+                Err(error) => return fail(ControlErrorCode::OperationRefused, error),
+            },
+            ControlCommand::Split { pane, direction } => {
+                if let Some(pane_id) = pane
+                    && !self.focus_pane_id(PaneId(pane_id))
+                {
+                    return fail(
+                        ControlErrorCode::NotFound,
+                        format!("pane {pane_id} does not exist"),
+                    );
+                }
+                let direction = match direction {
+                    control::ControlDirection::Right => Direction::Horizontal,
+                    control::ControlDirection::Down => Direction::Vertical,
+                };
+                match self.split_focused(direction) {
+                    Ok(()) => {
+                        serde_json::json!({"pane": self.focused_pane_id().map(|pane| pane.0)})
+                    }
+                    Err(error) => return fail(ControlErrorCode::OperationRefused, error),
+                }
+            }
+            ControlCommand::Focus { pane } => {
+                if !self.focus_pane_id(PaneId(pane)) {
+                    return fail(
+                        ControlErrorCode::NotFound,
+                        format!("pane {pane} does not exist"),
+                    );
+                }
+                self.request_redraw();
+                serde_json::json!({"pane": pane})
+            }
+            ControlCommand::Close { pane } => {
+                let pane_id = PaneId(pane);
+                let Some(tabs) = self.tabs.as_mut() else {
+                    return fail(
+                        ControlErrorCode::Unavailable,
+                        "pane layout is not initialized".into(),
+                    );
+                };
+                if !tabs
+                    .tabs()
+                    .iter()
+                    .any(|tab| tab.layout_tree().panes().contains(&pane_id))
+                {
+                    return fail(
+                        ControlErrorCode::NotFound,
+                        format!("pane {pane} does not exist"),
+                    );
+                }
+                let close_window = close_pane_lifecycle(tabs, pane_id);
+                self.panes.remove(&pane_id);
+                self.graphics_store.remove_pane(pane_id);
+                if close_window {
+                    self.panes.clear();
+                    self.graphics_store = GraphicsStore::default();
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.textures.clear();
+                    }
+                    event_loop.exit();
+                } else {
+                    if let Some(gpu) = self.gpu.as_ref() {
+                        self.resize(gpu.config.width, gpu.config.height);
+                    }
+                    self.refresh_window_title();
+                    self.request_redraw();
+                }
+                serde_json::json!({"closed": pane})
+            }
+            ControlCommand::SendText { pane, text } => {
+                let pane_id = pane.map(PaneId).or_else(|| self.focused_pane_id());
+                let Some(pane_id) = pane_id else {
+                    return fail(ControlErrorCode::Unavailable, "no focused pane".into());
+                };
+                let Some(target) = self.panes.get_mut(&pane_id) else {
+                    return fail(
+                        ControlErrorCode::NotFound,
+                        format!("pane {} does not exist", pane_id.0),
+                    );
+                };
+                if let Err(error) = target.pty.write(text.as_bytes()) {
+                    return fail(
+                        ControlErrorCode::Unavailable,
+                        format!("could not write to PTY: {error}"),
+                    );
+                }
+                target.model.scroll_to_bottom();
+                self.request_redraw();
+                serde_json::json!({"pane": pane_id.0, "written": text.len()})
+            }
+            ControlCommand::GetText { pane, scope } => {
+                let pane_id = pane.map(PaneId).or_else(|| self.focused_pane_id());
+                let Some(pane_id) = pane_id else {
+                    return fail(ControlErrorCode::Unavailable, "no focused pane".into());
+                };
+                let Some(target) = self.panes.get(&pane_id) else {
+                    return fail(
+                        ControlErrorCode::NotFound,
+                        format!("pane {} does not exist", pane_id.0),
+                    );
+                };
+                let text = match scope {
+                    TextScope::Screen => Some(target.model.visible_text()),
+                    TextScope::LastBlock => target.model.last_finished_block_output_text(),
+                };
+                let Some(text) = text else {
+                    return fail(
+                        ControlErrorCode::OperationRefused,
+                        "last finished block is unavailable or its anchors were evicted".into(),
+                    );
+                };
+                serde_json::json!({"pane": pane_id.0, "text": text})
+            }
+        };
+        ControlResponse {
+            id,
+            outcome: ControlOutcome::Success(result),
+        }
+    }
+
+    fn focus_pane_id(&mut self, pane: PaneId) -> bool {
+        let Some(tabs) = self.tabs.as_mut() else {
+            return false;
+        };
+        let Some(index) = tabs.tab_index_for_pane(pane) else {
+            return false;
+        };
+        tabs.select(index);
+        tabs.tab_mut(index).is_some_and(|tab| tab.focus_pane(pane))
     }
 
     fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
@@ -2854,6 +3042,10 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 }
                 self.request_redraw();
             }
+            UserEvent::Control(request, reply) => {
+                let response = self.control_command(request, event_loop);
+                let _ = reply.send(response);
+            }
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -3274,20 +3466,82 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
 }
 
 fn main() {
+    if run_terminal() != 0 {
+        std::process::exit(1);
+    }
+}
+
+fn run_terminal() -> i32 {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
             eprintln!("so1term: could not initialize the window event loop: {e}");
-            std::process::exit(1)
+            return 1;
         }
     };
     let mut app = TerminalWindow::new(event_loop.create_proxy());
-    if let Err(e) = event_loop.run_app(&mut app) {
-        eprintln!("so1term: window event loop failed: {e}");
-        std::process::exit(1);
+    if let Err(error) = event_loop.run_app(&mut app) {
+        eprintln!("so1term: window event loop failed: {error}");
+        return 1;
     }
     if app.failed {
-        std::process::exit(1);
+        return 1;
+    }
+    0
+}
+
+fn start_control_server(proxy: EventLoopProxy<UserEvent>) -> Option<ControlServer> {
+    #[cfg(unix)]
+    {
+        if std::env::var_os("SO1TERM_CONTROL").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return None;
+        }
+        let directory = match control::runtime_directory() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("so1term: unable to resolve control runtime directory: {error}");
+                return None;
+            }
+        };
+        let listener_proxy = proxy;
+        match ControlServer::start_at(&directory, std::process::id(), move |request| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let timeout = ControlResponse {
+                id: Some(request.id),
+                outcome: ControlOutcome::Failure(ControlError::for_request(
+                    Some(request.id),
+                    ControlErrorCode::Timeout,
+                    "event loop did not answer within 30 seconds",
+                )),
+            };
+            if listener_proxy
+                .send_event(UserEvent::Control(request, sender))
+                .is_err()
+            {
+                return ControlResponse {
+                    id: timeout.id,
+                    outcome: ControlOutcome::Failure(ControlError::for_request(
+                        timeout.id,
+                        ControlErrorCode::Unavailable,
+                        "terminal event loop is unavailable",
+                    )),
+                };
+            }
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or(timeout)
+        }) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("so1term: unable to start local control socket: {error}");
+                None
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = proxy;
+        None
     }
 }
 

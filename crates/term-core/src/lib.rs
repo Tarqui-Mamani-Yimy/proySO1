@@ -1,6 +1,7 @@
 pub mod apc;
 pub mod block_navigation;
 pub mod blocks;
+pub mod control;
 pub mod graphics;
 pub mod keyboard;
 pub mod layout;

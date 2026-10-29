@@ -795,6 +795,16 @@ impl Tab {
         self.active_pane
     }
 
+    /// Focus a pane already owned by this tab.
+    pub fn focus_pane(&mut self, pane: PaneId) -> bool {
+        if self.tree.panes().contains(&pane) {
+            self.active_pane = pane;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn layout_tree(&self) -> &LayoutTree {
         &self.tree
     }

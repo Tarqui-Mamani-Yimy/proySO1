@@ -2461,6 +2461,7 @@ dependencies = [
  "flate2",
  "libc",
  "png",
+ "serde_json",
  "vte 0.15.0",
 ]
 
@@ -2476,6 +2477,7 @@ dependencies = [
  "libc",
  "pollster",
  "portable-pty",
+ "serde_json",
  "so1-term-core",
  "vte 0.15.0",
  "wgpu",

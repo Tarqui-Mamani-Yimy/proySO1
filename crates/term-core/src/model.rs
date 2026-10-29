@@ -675,6 +675,32 @@ impl Model {
         self.block_range_text(block, false)
     }
 
+    /// Extracts output from the newest finished primary-screen block.
+    pub fn last_finished_block_output_text(&self) -> Option<String> {
+        let block = self
+            .blocks
+            .blocks()
+            .iter()
+            .rev()
+            .find(|block| block.state == crate::blocks::BlockState::Finished)?;
+        self.block_range_text(block, false)
+    }
+
+    /// Returns the visible viewport as newline-separated terminal cell text.
+    pub fn visible_text(&self) -> String {
+        self.visible_cells()
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn selected_block_input_text(&self) -> Option<String> {
         let id = self.selected_block_id?;
         let block = self.blocks.blocks().iter().find(|block| block.id == id)?;
@@ -1417,6 +1443,10 @@ mod tests {
         );
         assert!(model.select_block_at_viewport());
         assert_eq!(model.selected_block_output_text().as_deref(), Some("a\nb"));
+        assert_eq!(
+            model.last_finished_block_output_text().as_deref(),
+            Some("a\nb")
+        );
         assert!(model.cell_selected(0, 1));
     }
 
@@ -1427,11 +1457,13 @@ mod tests {
         let block = model.blocks().blocks().last().unwrap();
         assert_eq!(block.grid_anchors.output_start, None);
         assert_eq!(model.block_range_text(block, false), None);
+        assert_eq!(model.last_finished_block_output_text(), None);
 
         let mut alternate = Model::new(12, 2);
         alternate.feed(b"\x1b[?1049h\x1b]133;A\x1b\\\x1b]133;C\x1b\\output\x1b]133;D;0\x1b\\");
         let block = alternate.blocks().blocks().last().unwrap();
         assert_eq!(alternate.block_range_text(block, false), None);
+        assert_eq!(alternate.last_finished_block_output_text(), None);
     }
 
     #[test]

@@ -50,6 +50,7 @@ crates/term-core/
   src/graphics.rs Kitty graphics protocol parsing, bounded decoding, and image storage
   src/placements.rs Per-pane kitty placement state, deletion selectors, and viewport projection
   src/renderer.rs Renderer-independent grid, color, block, and image projection helpers
+  src/control.rs Versioned JSON-lines control request/response types and parser
 crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
@@ -60,6 +61,8 @@ crates/shell/
 crates/terminal/
   src/main.rs     so1term window/event loop, per-pane PTYs/models, input routing, and GPU renderer
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
+  src/control.rs  Unix-domain control transport, peer credentials, and so1ctl client transport
+  src/bin/so1ctl.rs Local control API CLI
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
   src/selection.rs Click tracking and pure mouse-selection routing
 crates/epsh/src/
@@ -84,6 +87,12 @@ crates/epsh/src/
 ```
 
 Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarded temporary-file data with bounded base64/zlib decoding. Images are capped at 128 MiB per pane and 512 MiB per process, with dimensions capped at 10,000 per axis and oldest-image eviction. File and temporary-file transmission are denied unless `SO1TERM_GRAPHICS_ALLOWED_ROOTS` lists one or more roots using the platform path-list separator; empty and non-existent roots are ignored, and existing roots are canonicalized once at startup. Files must be absolute regular files beneath an allowed root, with bounded size/offset; Unix opens each canonical path component relative to a retained root descriptor with `O_NOFOLLOW` and verifies opened-file identity. In-root symlinks are allowed only when their canonical target remains in an allowed root. Temporary files must additionally be beneath the canonical system temp root or an allowed root, include `tty-graphics-protocol` in the full path, and are deleted only after a guarded successful read and a matching inode check. Windows currently denies both file media because an equivalent no-follow guard is not implemented. Shared memory remains unsupported. Display actions `a=T` and `a=p` are enabled with per-pane GPU texture caching and pane-clipped placement rendering. Negative z-index images render beneath text; z below -1073741824 also renders beneath cell backgrounds; non-negative z renders above text, with placement order breaking ties. Placements use stable-row anchors, follow scrollback, are scoped to primary/alternate screens, invalidate on width reflow, and support kitty delete selectors; uppercase deletes free unreferenced image data and their GPU textures are released on the next redraw. Cursor movement follows the placement rectangle unless `C=1`. Unicode placeholders and animation remain unsupported, as does shared memory; Windows file transmission remains denied.
+
+## so1term Local Control
+
+On Unix, each running `so1term` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/so1term/so1term-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/so1term-<uid>/so1term-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
+
+`SO1TERM_SOCKET` is inherited by every pane shell and tells `so1ctl` which instance to address. Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the listener. `so1ctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, and `get-text` (screen or last finished block output); use `so1ctl --help` for argument syntax. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `so1ctl` reports that local control is unsupported there.
 
 ## Embedding API
 

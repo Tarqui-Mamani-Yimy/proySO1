@@ -7,6 +7,10 @@ edition = "2024"
 name = "so1term"
 path = "src/main.rs"
 
+[[bin]]
+name = "so1term-server"
+path = "src/server.rs"
+
 [dependencies]
 so1-term-core = { path = "../term-core" }
 winit = "0.30"

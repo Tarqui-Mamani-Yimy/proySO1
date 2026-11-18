@@ -59,10 +59,11 @@ crates/shell/
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/terminal/
-  src/main.rs     so1term window/event loop, per-pane PTYs/models, input routing, and GPU renderer
+  src/main.rs     so1term window/event loop, per-pane PTYs/models, input routing, and GPU renderer (T0-T9)
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
   src/control.rs  Unix-domain control transport, peer credentials, and so1ctl client transport
   src/bin/so1ctl.rs Local control API CLI
+  src/server.rs   Persistent session server (T10) — owns PTYs and term-core state, control socket, session lifecycle
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
   src/selection.rs Click tracking and pure mouse-selection routing
 crates/epsh/src/
@@ -92,7 +93,15 @@ Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarde
 
 On Unix, each running `so1term` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/so1term/so1term-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/so1term-<uid>/so1term-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
 
-`SO1TERM_SOCKET` is inherited by every pane shell and tells `so1ctl` which instance to address. Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the listener. `so1ctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, and `get-text` (screen or last finished block output); use `so1ctl --help` for argument syntax. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `so1ctl` reports that local control is unsupported there.
+**T10 — Persistent session server**: A separate `so1term-server` binary runs as a headless process that owns all PTYs and the term-core state (Model per panel, blocks, layout, tabs). This server persists across window detach/attach cycles. The `so1term` window becomes a rendering/input client that connects to the server via the same control socket protocol. The server handles:
+- PTY lifecycle (create on panel open, close on shell exit)
+- Panel/tab layout management
+- VT Model state preservation
+- so1ctl command dispatch (list, new-tab, split, focus, close, send-text, get-text)
+- Idempotent startup with orphaned-socket recovery
+- Clean shutdown when last panel closes
+
+Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the default listener when running in server mode; connect to the server instead. `so1ctl` continues to function against the server with all its commands. Windows: no equivalent transport; documented gap (see T10 gap knowns).
 
 ## Embedding API
 

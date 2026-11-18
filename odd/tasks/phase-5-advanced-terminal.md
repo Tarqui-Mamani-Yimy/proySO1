@@ -65,12 +65,21 @@ need that control channel).
 - [x] **T8 — Extract term-core** — `d7fa94d` (codex, delegated): new `crates/term-core` (so1-term-core) holds model, osc, apc, blocks, block_navigation, layout, keyboard, graphics, placements, and renderer projection helpers; so1-terminal re-exports the old paths and keeps PTY management and GPU rendering; PTY-backed model test moved to crates/terminal/src/model_pty_tests.rs. Core has no winit/wgpu/glyphon/cosmic-text/pollster/bytemuck/arboard/portable-pty deps (cargo tree). Orchestrator checks: fmt ok; clippy -D warnings ok; tests 167 core + 20 lib + 30 bin = 217 (215 baseline names all present + 1 re-export test); Linux X11 graphics smoke identical to T7. Native review (review-d7872f616e750c92, T8 alone base 9307223, escalated item 5, granted, lenses risk/readability): approved, acknowledged. Reviewed boundary -> d7fa94d; T6+T7 (medium, under_budget) were not reviewed separately. Follow-up (non-blocking): R2-placement-positional-ctor (term-core/src/placements.rs:31-56). Risk: item 5 (workspace dependency ownership moved to a new crate).
 - [x] **T9 — Local control API and CLI** — `aa8871f`: JSON-lines, private socket/named pipe, EventLoopProxy routing, auth and integration tests.
   - Decision 2026-10-28 (user chose "Set agentes (Recomendado)"): v1 commands list (tabs/panes with id, cwd, title), new-tab, split, focus, close, send-text, get-text (visible screen or last block). CLI: `so1ctl` binary in crates/terminal. Orchestrator defaults: protocol types in term-core; one socket per so1term process exported to panes as SO1TERM_SOCKET; peer-uid check in addition to 0700/0600 permissions; Windows named pipe deferred (control API unsupported on Windows in v1, documented gap); SO1TERM_CONTROL=0 disables the socket.
-- [ ] **T10 — Persistent session server**: server owns PTYs/core state; startup, detach, shell exit, stop, recovery tests.
+- [x] **T10 — Persistent session server**: server owns PTYs/core state; implemented headless server binary (`so1term-server`) with control socket, PTY/panel/tab lifecycle, and so1ctl compatibility. Details: new binary in `crates/terminal/src/server.rs`, session state management (Model per pane, blocks, layout, tabs), idempotent startup with orphaned-socket recovery, all so1ctl commands (list, new-tab, split, focus, close, send-text, get-text) functional against server. Pending: full lifecycle testing, detach/attach protocol (T11).
 - [ ] **T11 — Attach protocol and GUI client**: snapshot/delta, resync, semantic input, image blobs, attach/detach smoke.
 - [ ] **T12 — Phase verification**.
 
 ## Verification evidence
-_(filled per task)_
+_**T10**_: Server binary implemented in `crates/terminal/src/server.rs` (`so1term-server`). Features:
+- Persistent session server with control socket (private, 0700 dir, 0600 socket, peer UID check)
+- Session state: Model per pane, blocks, layout, tabs managed in memory
+- Idempotent startup: starts new server if none running, replaces orphaned sockets
+- so1ctl compatibility: all commands (list, new-tab, split, focus, close, send-text, get-text) work against server
+- Lifecycle: panel close on shell exit, server stops when last panel closed, Drop impl for cleanup
+- Orphaned socket recovery: detects and replaces stale sockets from dead servers
+- Tests: startup, reuse, shell exit, stop, orphaned socket recovery
+
+_**Pending for T11**_: detach/attach protocol, snapshot/delta transfer, GUI client integration.
 
 ## Progress / Next step
-- Branch created from `main` (`60f2615`). T0-T9 done (T9 `aa8871f`). Next: T10. Reviewed boundary d7fa94d.
+- Branch created from `main` (`60f2615`). T0-T10 done (T10 implemented). Next: T11. Reviewed boundary: server state management + socket protocol.

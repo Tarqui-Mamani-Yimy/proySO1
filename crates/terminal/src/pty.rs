@@ -627,11 +627,14 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let foreground_group = self
             .master
             .as_ref()
             .and_then(|master| master.process_group_leader())
             .map(|pgid| pgid as u32);
+        #[cfg(not(unix))]
+        let foreground_group = None;
         terminate_child_session(self.child.as_mut(), self.session_id, foreground_group);
         self.writer.take();
         self.master.take();

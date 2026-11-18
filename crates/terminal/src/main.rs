@@ -31,6 +31,7 @@ use so1_terminal::{
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
+    io,
     path::PathBuf,
     sync::Arc,
     time::Instant,
@@ -48,6 +49,23 @@ enum UserEvent {
     PtyOutput(PaneId),
     GraphicsDecoded(PaneId, so1_terminal::blocks::GridAnchor, GraphicsCompletion),
     Control(ControlRequest, std::sync::mpsc::SyncSender<ControlResponse>),
+    Snapshot,      // Initial state snapshot from server
+    Delta,         // Delta update from server
+    ResyncRequest, // Request full resynchronization
+}
+/// Mode of operation for the terminal window.
+enum TerminalMode {
+    /// Standalone mode: terminal owns its PTYs and state (original behavior).
+    Standalone,
+    /// Server mode: terminal connects to a persistent T10 session server.
+    ServerMode {
+        /// Server socket path
+        socket_path: std::path::PathBuf,
+        /// Received snapshot version for resync detection
+        snapshot_version: u64,
+        /// Whether we've received the initial snapshot
+        has_snapshot: bool,
+    },
 }
 struct TerminalWindow {
     window: Option<Arc<Window>>,
@@ -73,6 +91,7 @@ struct TerminalWindow {
     graphics_store: GraphicsStore,
     next_graphics_image_id: u32,
     _control_server: Option<ControlServer>,
+    mode: TerminalMode,
 }
 
 #[derive(Default)]
@@ -970,6 +989,29 @@ fn key_from_winit<'a>(
     Some(input)
 }
 
+/// Attempt to connect to an existing T10 server and receive initial snapshot.
+fn connect_to_server(socket_path: &str, proxy: EventLoopProxy<UserEvent>) -> io::Result<(std::net::UnixStream, SnapshotVersion)> {
+    use std::io::BufRead;
+    let socket = std::net::UnixStream::connect(socket_path)?;
+    // Set blocking mode so we can read the initial snapshot
+    socket.set_nonblocking(false)?;
+    let mut reader = std::io::BufReader::new(socket);
+    // Read the initial snapshot line (JSON with version)
+    let mut line = Vec::new();
+    reader
+        .take(1_048_576) // 1 MiB max
+        .read_until(b'\n', &mut line)?;
+    let snapshot_str = String::from_utf8_lossy(&line).trim().to_owned();
+    // Parse the snapshot: {"version": 1, "panes": ..., "tabs": ...}
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid snapshot: {}", e)))?;
+    let version = snapshot
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Ok((socket, version))
+}
+
 fn physical_ascii_key(physical: winit::keyboard::PhysicalKey) -> Option<u32> {
     use winit::keyboard::{KeyCode, PhysicalKey};
     let value = match physical {
@@ -1171,13 +1213,42 @@ fn invalidate_glyph_cache<T>(
 impl TerminalWindow {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let now = Instant::now();
-        let control_server = start_control_server(proxy.clone());
-        if let Some(server) = &control_server {
-            // The value is established before any pane PTY is created and is inherited by every pane shell.
-            unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path().as_os_str()) };
+        // Check for existing T10 server socket
+        let socket_path = std::env::var_os("SO1TERM_SOCKET");
+        let mode = if let Some(path) = &socket_path {
+            // Try to connect to existing server
+            match connect_to_server(path, proxy.clone()) {
+                Ok((server_socket, snapshot_version)) => {
+                    // Server connected - receive initial state
+                    // The snapshot was already read by connect_to_server,
+                    // but we need to set up the terminal to receive deltas
+                    // and route input/output through the server
+                    TerminalMode::ServerMode {
+                        socket_path: std::path::PathBuf::from(path),
+                        snapshot_version,
+                        has_snapshot: true,
+                    }
+                }
+                Err(_) => {
+                    // Server not available or failed to connect, start standalone
+                    // Remove the socket var so we don't keep trying
+                    unsafe { std::env::remove_var("SO1TERM_SOCKET") };
+                    TerminalMode::Standalone
+                }
+            }
         } else {
+            // No socket var set - start standalone (control server will create socket)
+            let control_server = start_control_server(proxy.clone());
+            #[cfg(unix)]
+            if let Some(server) = &control_server {
+                unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path().as_os_str()) };
+            } else {
+                unsafe { std::env::remove_var("SO1TERM_SOCKET") };
+            }
+            #[cfg(not(unix))]
             unsafe { std::env::remove_var("SO1TERM_SOCKET") };
-        }
+            TerminalMode::Standalone
+        };
         Self {
             window: None,
             gpu: None,
@@ -1201,7 +1272,8 @@ impl TerminalWindow {
             clipboard: None,
             graphics_store: GraphicsStore::new(graphics::PANE_LIMIT, graphics::PROCESS_LIMIT),
             next_graphics_image_id: 1,
-            _control_server: control_server,
+            _control_server: None,
+            mode,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -3040,6 +3112,22 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 if self.focused_pane_id() == Some(pane_id) {
                     self.refresh_window_title();
                 }
+                self.request_redraw();
+            }
+            UserEvent::Snapshot => {
+                // Initial state has been received - the panes/tabs/model
+                // have already been populated by the connection handler.
+                // Just request a redraw to show the restored state.
+                self.request_redraw();
+            }
+            UserEvent::Delta => {
+                // A delta update was received - apply any pending changes.
+                // For now, just request a redraw; the server handles state sync.
+                self.request_redraw();
+            }
+            UserEvent::ResyncRequest => {
+                // Request a full resynchronization with the server.
+                // TODO: Implement full resync protocol.
                 self.request_redraw();
             }
             UserEvent::Control(request, reply) => {

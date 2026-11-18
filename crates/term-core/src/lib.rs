@@ -1,4 +1,5 @@
 pub mod apc;
+pub mod attach;
 pub mod block_navigation;
 pub mod blocks;
 pub mod control;

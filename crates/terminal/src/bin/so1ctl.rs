@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block]"
+            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], shutdown (so1term-server only)"
         );
         return Ok(());
     }
@@ -93,7 +93,7 @@ fn parse_command(
 ) -> Result<so1_terminal::control::ControlCommand, String> {
     use so1_terminal::control::{ControlCommand, ControlDirection, TextScope};
     let (allow_pane, allow_direction, allow_scope, allow_text) = match command_name {
-        "list" | "new-tab" => (false, false, false, false),
+        "list" | "new-tab" | "shutdown" => (false, false, false, false),
         "split" => (true, true, false, false),
         "focus" | "close" => (true, false, false, false),
         "send-text" => (true, false, false, true),
@@ -172,6 +172,7 @@ fn parse_command(
             text: text.ok_or("send-text requires TEXT")?,
         }),
         "get-text" => Ok(ControlCommand::GetText { pane, scope }),
+        "shutdown" => Ok(ControlCommand::Shutdown),
         _ => unreachable!(),
     }
 }
@@ -186,6 +187,7 @@ mod tests {
         let cases = [
             ("list", vec![], Ok(ControlCommand::List)),
             ("new-tab", vec![], Ok(ControlCommand::NewTab)),
+            ("shutdown", vec![], Ok(ControlCommand::Shutdown)),
             (
                 "split",
                 vec!["--direction".into(), "right".into()],

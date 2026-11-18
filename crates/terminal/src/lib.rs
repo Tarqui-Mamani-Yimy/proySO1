@@ -4,6 +4,7 @@ pub use so1_term_core::{
 pub mod control;
 pub mod pty;
 pub mod selection;
+pub mod session;
 
 #[cfg(all(test, unix))]
 mod model_pty_tests;

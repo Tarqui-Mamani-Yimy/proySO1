@@ -28,6 +28,10 @@ use so1_terminal::{
         project_terminal_metrics, unicode_cell_width,
     },
     selection::{PointerAction, PointerButton, PointerState, SelectionGesture, SelectionRouter},
+    session::{
+        apply_title_event, close_pane_lifecycle, create_tab_with, cwd_basename_title,
+        pane_tab_title,
+    },
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -579,14 +583,6 @@ enum TabAction {
     Select(usize),
 }
 
-fn close_pane_lifecycle(tabs: &mut TabSet, pane: PaneId) -> bool {
-    let result = tabs.close_pane(pane);
-    matches!(
-        result,
-        so1_terminal::layout::PaneCloseResult::LastTab { .. }
-    )
-}
-
 fn tab_bar_height(tab_count: usize, cell_height: f32) -> u32 {
     if tab_count <= 1 {
         0
@@ -640,62 +636,6 @@ fn tab_shortcut(
 
 fn tab_action_changes_geometry(action: TabAction) -> bool {
     matches!(action, TabAction::New | TabAction::Close)
-}
-
-fn rollback_failed_new_tab(tabs: &mut TabSet) {
-    if tabs.tabs().len() > 1 {
-        let _ = tabs.close_active();
-    }
-}
-
-fn create_tab_with<T>(
-    tabs: &mut TabSet,
-    create_pane: impl FnOnce(PaneId, PaneLayout) -> Result<T, String>,
-) -> Result<(PaneId, T), String> {
-    tabs.add_tab();
-    let result = (|| {
-        let tab = tabs
-            .active()
-            .ok_or_else(|| "new tab was not created".to_owned())?;
-        let pane_id = tab.active_pane();
-        let layout = tab
-            .layout()
-            .into_iter()
-            .find(|layout| layout.pane == pane_id && !layout.hidden)
-            .ok_or_else(|| "new tab has no visible pane".to_owned())?;
-        create_pane(pane_id, layout).map(|pane| (pane_id, pane))
-    })();
-    if result.is_err() {
-        rollback_failed_new_tab(tabs);
-    }
-    result
-}
-
-fn cwd_basename_title(cwd: &std::path::Path) -> String {
-    cwd.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("so1sh")
-        .to_owned()
-}
-
-fn pane_tab_title(cwd: &std::path::Path, explicit_title: Option<&str>) -> String {
-    explicit_title
-        .map(str::to_owned)
-        .unwrap_or_else(|| cwd_basename_title(cwd))
-}
-
-fn apply_title_event(
-    cwd: &std::path::Path,
-    explicit_title: &mut Option<String>,
-    event: &ModelEvent,
-) -> Option<String> {
-    match event {
-        ModelEvent::Title(title) => *explicit_title = Some(title.clone()),
-        ModelEvent::ResetTitle => *explicit_title = None,
-        _ => return None,
-    }
-    Some(pane_tab_title(cwd, explicit_title.as_deref()))
 }
 
 fn tab_style(active: bool) -> ([u8; 3], [u8; 3]) {
@@ -1870,6 +1810,12 @@ impl TerminalWindow {
                     );
                 };
                 serde_json::json!({"pane": pane_id.0, "text": text})
+            }
+            ControlCommand::Shutdown => {
+                return fail(
+                    ControlErrorCode::OperationRefused,
+                    "shutdown is only supported by so1term-server".into(),
+                );
             }
         };
         ControlResponse {

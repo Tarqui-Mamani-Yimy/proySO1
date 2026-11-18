@@ -63,6 +63,8 @@ crates/terminal/
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
   src/control.rs  Unix-domain control transport, peer credentials, and so1ctl client transport
   src/bin/so1ctl.rs Local control API CLI
+  src/bin/so1term-server.rs Persistent headless session server binary
+  src/session.rs  Headless session (tabs, panes, PTY + VT model) owned by so1term-server
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
   src/selection.rs Click tracking and pure mouse-selection routing
 crates/epsh/src/
@@ -93,6 +95,10 @@ Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarde
 On Unix, each running `so1term` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/so1term/so1term-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/so1term-<uid>/so1term-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
 
 `SO1TERM_SOCKET` is inherited by every pane shell and tells `so1ctl` which instance to address. Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the listener. `so1ctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, and `get-text` (screen or last finished block output); use `so1ctl --help` for argument syntax. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `so1ctl` reports that local control is unsupported there.
+
+## so1term Persistent Sessions
+
+`so1term-server [--session NAME]` runs a headless session that owns its shell PTYs and terminal models and outlives every client. NAME defaults to `default` and must be 1-64 ASCII letters, digits, `-` or `_` (otherwise exit status 2). The server listens on `<runtime dir>/so1term-server-<NAME>.sock` with the same directory, permission, peer-uid, and stale-socket rules as the window listener, and exports that path as `SO1TERM_SOCKET` to its pane shells. Clients such as `so1ctl --socket PATH` may connect and disconnect at any time while the shells keep running (detach). Starting a second server for a live session name fails with `session NAME is already running` (exit status 1); a socket left by a killed server is detected as stale and replaced. The server exits with status 0 and removes its socket when its last shell exits or on `so1ctl shutdown`, which terminates the remaining shells; a so1term window refuses `shutdown`. It ignores SIGHUP so closing the launching terminal does not end the session, and SIGTERM unlinks the socket. Panes use a virtual 80x24 grid of 8x16 px cells until the attach client (Phase 5 T11) supplies geometry; kitty graphics are not ingested by the server yet. Windows reports that persistent sessions are unsupported.
 
 ## Embedding API
 

@@ -4,6 +4,30 @@ pub use so1_term_core::control::{
     parse_response, serialize_request, serialize_response,
 };
 
+/// Longest accepted `so1term-server --session` name.
+pub const MAX_SESSION_NAME_BYTES: usize = 64;
+
+/// Accepts 1-64 ASCII letters, digits, `-` and `_`, so the name is safe in a socket file name.
+pub fn validate_session_name(session: &str) -> Result<(), String> {
+    let valid = !session.is_empty()
+        && session.len() <= MAX_SESSION_NAME_BYTES
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid session name {session:?}: use 1-{MAX_SESSION_NAME_BYTES} ASCII letters, digits, '-' or '_'"
+        ))
+    }
+}
+
+/// Socket file name of a persistent server session inside the runtime directory.
+pub fn session_socket_name(session: &str) -> String {
+    format!("so1term-server-{session}.sock")
+}
+
 #[cfg(unix)]
 mod transport {
     use super::*;
@@ -41,11 +65,33 @@ mod transport {
     pub struct ControlServer {
         socket_path: PathBuf,
         stopping: Arc<AtomicBool>,
+        active: Arc<AtomicUsize>,
         thread: Option<thread::JoinHandle<()>>,
     }
 
     impl ControlServer {
+        /// Starts the per-window listener `so1term-<pid>.sock` in `directory`.
         pub fn start_at<F>(directory: &Path, pid: u32, dispatch: F) -> io::Result<Self>
+        where
+            F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
+        {
+            Self::start_named(directory, &format!("so1term-{pid}.sock"), dispatch)
+        }
+
+        /// Starts the persistent-server listener for `session` in `directory`.
+        ///
+        /// A live listener on the same session name fails with `AddrInUse`; a stale
+        /// socket left by a killed server is removed and replaced.
+        pub fn start_session_at<F>(directory: &Path, session: &str, dispatch: F) -> io::Result<Self>
+        where
+            F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
+        {
+            super::validate_session_name(session)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            Self::start_named(directory, &super::session_socket_name(session), dispatch)
+        }
+
+        fn start_named<F>(directory: &Path, file_name: &str, dispatch: F) -> io::Result<Self>
         where
             F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
         {
@@ -75,7 +121,7 @@ mod transport {
                 }
                 Err(error) => return Err(error),
             }
-            let socket_path = directory.join(format!("so1term-{pid}.sock"));
+            let socket_path = directory.join(file_name);
             if socket_path.exists() || fs::symlink_metadata(&socket_path).is_ok() {
                 let metadata = fs::symlink_metadata(&socket_path)?;
                 if !metadata.file_type().is_socket() {
@@ -124,6 +170,7 @@ mod transport {
             let stop = stopping.clone();
             let dispatch = Arc::new(dispatch);
             let active = Arc::new(AtomicUsize::new(0));
+            let active_for_listener = active.clone();
             let thread = thread::Builder::new()
                 .name("so1term-control-listener".into())
                 .spawn(move || {
@@ -167,11 +214,25 @@ mod transport {
             Ok(Self {
                 socket_path,
                 stopping,
+                active: active_for_listener,
                 thread: Some(thread),
             })
         }
         pub fn socket_path(&self) -> &Path {
             &self.socket_path
+        }
+
+        /// Waits up to `timeout` for connected clients to finish, so a final reply
+        /// is written before the process exits. Returns true when none remain.
+        pub fn wait_for_clients(&self, timeout: Duration) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            while self.active.load(Ordering::Acquire) > 0 {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            true
         }
     }
 

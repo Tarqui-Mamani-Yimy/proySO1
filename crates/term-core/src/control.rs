@@ -38,6 +38,8 @@ pub enum ControlCommand {
         pane: Option<u64>,
         scope: TextScope,
     },
+    /// Stops a persistent `so1term-server` session; windows refuse it.
+    Shutdown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +184,7 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
     match command {
         "list" if allowed_fields(object, &base) => Ok(ControlCommand::List),
         "new-tab" if allowed_fields(object, &base) => Ok(ControlCommand::NewTab),
+        "shutdown" if allowed_fields(object, &base) => Ok(ControlCommand::Shutdown),
         "split" => {
             if !allowed_fields(object, &["v", "id", "cmd", "pane", "direction"]) {
                 return Err(ControlErrorCode::InvalidArguments);
@@ -239,7 +242,7 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
                 scope,
             })
         }
-        "list" | "new-tab" => Err(ControlErrorCode::InvalidArguments),
+        "list" | "new-tab" | "shutdown" => Err(ControlErrorCode::InvalidArguments),
         _ => Err(ControlErrorCode::UnknownCommand),
     }
 }
@@ -317,6 +320,7 @@ pub fn serialize_request(request: &ControlRequest) -> Result<Vec<u8>, serde_json
     let (name, args) = match &request.command {
         ControlCommand::List => ("list", Vec::new()),
         ControlCommand::NewTab => ("new-tab", Vec::new()),
+        ControlCommand::Shutdown => ("shutdown", Vec::new()),
         ControlCommand::Split { pane, direction } => {
             let mut args = Vec::new();
             if let Some(pane) = pane {
@@ -462,6 +466,10 @@ mod tests {
             (r#"{"v":1,"id":1,"cmd":"list"}"#, ControlCommand::List),
             (r#"{"v":1,"id":2,"cmd":"new-tab"}"#, ControlCommand::NewTab),
             (
+                r#"{"v":1,"id":9,"cmd":"shutdown"}"#,
+                ControlCommand::Shutdown,
+            ),
+            (
                 r#"{"v":1,"id":3,"cmd":"split","direction":"right"}"#,
                 ControlCommand::Split {
                     pane: None,
@@ -573,6 +581,10 @@ mod tests {
             ),
             (
                 r#"{"v":1,"id":1,"cmd":"list","extra":true}"#,
+                ControlErrorCode::InvalidArguments,
+            ),
+            (
+                r#"{"v":1,"id":1,"cmd":"shutdown","pane":1}"#,
                 ControlErrorCode::InvalidArguments,
             ),
         ];

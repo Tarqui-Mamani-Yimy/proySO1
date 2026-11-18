@@ -7,26 +7,52 @@
 //! no client is connected, which is what makes detach possible.
 //!
 //! Panes use a virtual grid of [`VIRTUAL_CELL_WIDTH`] x [`VIRTUAL_CELL_HEIGHT`]
-//! pixel cells until an attached client provides real geometry (Phase 5 T11).
-//! Kitty graphics ingestion is not performed by the server yet; APC sequences are
-//! passed to the VT model, which ignores them.
+//! pixel cells until an attached client provides real geometry with
+//! [`Session::set_client_geometry`]. From then on the client's window and cell
+//! metrics stay authoritative (also after it detaches), and pane rects are laid
+//! out below a one-cell-high tab bar whenever more than one tab exists, the same
+//! rule as the window's `tab_content_rect`. Kitty graphics ingestion is not
+//! performed by the server yet; APC sequences are passed to the VT model, which
+//! ignores them.
+//!
+//! Attach support (Phase 5 T11b) is split into pure pieces the server loop
+//! combines: [`Session::handle_client`] runs client view and layout actions on
+//! the models, [`AttachFrames`] turns model state into layout revisions and
+//! per-pane full or delta [`PaneFrame`]s, and [`Outbox`] is the bounded
+//! outgoing queue between the server loop and a client's writer thread.
+//!
+//! Threading model: a `Session` is owned by exactly one thread (the
+//! `so1term-server` loop) and is never shared. PTY reader threads only call the
+//! [`OutputNotifier`]; control and attach threads talk to the loop through its
+//! event channel. The only state shared with another thread is the [`Outbox`],
+//! which the caller wraps in a mutex: the loop pushes without ever blocking on
+//! the client, and the writer thread pops and performs the socket writes.
 //!
 //! The title and tab helpers here are also used by the `so1term` window so both
 //! frontends name panes and roll back failed tabs the same way.
 
+use crate::attach::{
+    self, BlockOp, ClientMessage, CopySource, LayoutAction, LayoutFrame, LayoutPane, LayoutTab,
+    PaneFrame, PaneModes, SelectionSpan, ServerMessage, SplitDirection, StyledRun,
+};
 use crate::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
     ControlRequest, ControlResponse, TextScope,
 };
-use crate::layout::{CellSize, Direction, PaneCloseResult, PaneId, PaneLayout, Rect, Tab, TabSet};
-use crate::model::{Model, ModelEvent};
+use crate::layout::{
+    CellSize, Direction, FocusDirection, PaneCloseResult, PaneId, PaneLayout, Rect, Tab,
+    TabCloseResult, TabSet,
+};
+use crate::model::{Cursor, Model, ModelEvent};
 use crate::pty::Pty;
 use crate::renderer::WakeupGate;
+use crate::renderer::{BlockDecoration, BlockViewport, project_block_decorations};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
+use vte::ansi::CursorShape;
 
 /// Width in pixels of one virtual server cell.
 pub const VIRTUAL_CELL_WIDTH: u32 = 8;
@@ -36,6 +62,11 @@ pub const VIRTUAL_CELL_HEIGHT: u32 = 16;
 pub const DEFAULT_COLS: u32 = 80;
 /// Initial server grid rows.
 pub const DEFAULT_ROWS: u32 = 24;
+
+/// Largest client window an attached client may request, in cells per row.
+pub const MAX_CLIENT_COLS: u32 = 1000;
+/// Largest client window an attached client may request, in cell rows.
+pub const MAX_CLIENT_ROWS: u32 = 500;
 
 // Same layout limits as the so1term window.
 const DIVIDER_WIDTH: u32 = 4;
@@ -58,6 +89,8 @@ struct SessionPane {
     title: String,
     explicit_title: Option<String>,
     cwd: PathBuf,
+    /// True once the shell reported its directory with OSC 7.
+    cwd_reported: bool,
     wakeup: Arc<WakeupGate>,
 }
 
@@ -65,6 +98,8 @@ pub struct Session {
     tabs: TabSet,
     window: Rect,
     cell: CellSize,
+    /// True once an attached client supplied the window and cell metrics.
+    client_geometry: bool,
     panes: BTreeMap<PaneId, SessionPane>,
     start_cwd: PathBuf,
     notify: OutputNotifier,
@@ -94,6 +129,7 @@ impl Session {
             tabs,
             window,
             cell,
+            client_geometry: false,
             panes: BTreeMap::from([(pane_id, pane)]),
             start_cwd: cwd,
             notify,
@@ -124,6 +160,7 @@ impl Session {
             for observed in pane.model.feed(&bytes) {
                 if let crate::osc::Event::CurrentDirectory { path, .. } = observed.event {
                     pane.cwd = PathBuf::from(String::from_utf8_lossy(&path).into_owned());
+                    pane.cwd_reported = true;
                     pane.title = pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
                 }
             }
@@ -256,11 +293,12 @@ impl Session {
                 effect = ControlEffect::Shutdown;
                 serde_json::json!({"stopping": true})
             }
-            // Placeholder until T11b implements the attach upgrade in the server.
+            // so1term-server intercepts attach in its listener hook; reaching the
+            // dispatcher means the listener has no attach support.
             ControlCommand::Attach => {
                 return fail(
                     ControlErrorCode::OperationRefused,
-                    "attach is not implemented yet".into(),
+                    "attach is not supported on this listener".into(),
                 );
             }
         };
@@ -329,7 +367,29 @@ impl Session {
             spawn_pane(pane_id, &layout, cwd, &notify)
         })?;
         self.panes.insert(pane_id, pane);
+        // A second tab can add the tab bar, which shrinks every pane.
+        self.apply_layout();
         Ok(pane_id)
+    }
+
+    /// Closes the active tab and its panes; the session ends with the last tab.
+    fn close_active_tab(&mut self) -> Result<(), String> {
+        let panes = self
+            .tabs
+            .active()
+            .ok_or_else(|| "no active tab".to_owned())?
+            .layout_tree()
+            .panes();
+        match self.tabs.close_active() {
+            TabCloseResult::LastTab => self.panes.clear(),
+            TabCloseResult::Closed(_) => {
+                for pane in panes {
+                    self.panes.remove(&pane);
+                }
+                self.apply_layout();
+            }
+        }
+        Ok(())
     }
 
     fn split_focused(&mut self, direction: Direction) -> Result<PaneId, String> {
@@ -370,9 +430,18 @@ impl Session {
         }
     }
 
+    /// Pane area: the window, minus a one-cell tab bar for client geometry with several tabs.
+    fn content_rect(&self) -> Rect {
+        if self.client_geometry {
+            tab_content_rect(self.window, self.tabs.tabs().len(), self.cell.height)
+        } else {
+            self.window
+        }
+    }
+
     /// Resizes visible pane models and PTYs to the current layout.
     fn apply_layout(&mut self) {
-        self.tabs.resize_all(self.window, self.cell);
+        self.tabs.resize_all(self.content_rect(), self.cell);
         let layouts: Vec<_> = self.tabs.tabs().iter().flat_map(Tab::layout).collect();
         for layout in layouts.into_iter().filter(|layout| !layout.hidden) {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
@@ -386,6 +455,561 @@ impl Session {
                 );
             }
         }
+    }
+}
+
+/// Everything a [`PaneFrame`] reports about one pane, computed from its model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneSnapshot {
+    pub cols: usize,
+    pub rows: Vec<Vec<StyledRun>>,
+    pub meta: FrameMeta,
+}
+
+/// Frame fields that are always sent complete, compared to detect changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameMeta {
+    pub cursor: Cursor,
+    pub selection: Vec<SelectionSpan>,
+    pub modes: PaneModes,
+    pub decorations: Vec<BlockDecoration>,
+    pub title: String,
+    pub cwd: String,
+}
+
+/// Attach error code for unknown pane ids.
+pub const ERROR_NOT_FOUND: &str = "NOT_FOUND";
+/// Attach error code for a refused or failed action.
+pub const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
+/// Attach error code for invalid client window metrics.
+pub const ERROR_INVALID_GEOMETRY: &str = "INVALID_GEOMETRY";
+
+/// Builds a [`ServerMessage::Error`].
+pub fn attach_error(code: &str, message: impl Into<String>) -> ServerMessage {
+    ServerMessage::Error {
+        code: code.to_owned(),
+        message: message.into(),
+    }
+}
+
+impl Session {
+    /// Adopts an attached client's window size and cell metrics (pixels) and
+    /// resizes every visible pane model and PTY. Metrics that would produce
+    /// an empty cell or a grid beyond [`MAX_CLIENT_COLS`] x [`MAX_CLIENT_ROWS`]
+    /// are refused and leave the geometry unchanged.
+    pub fn set_client_geometry(
+        &mut self,
+        width: u32,
+        height: u32,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> Result<(), String> {
+        if cell_width == 0 || cell_height == 0 {
+            return Err("cell size must be at least 1x1 pixels".into());
+        }
+        if width / cell_width > MAX_CLIENT_COLS || height / cell_height > MAX_CLIENT_ROWS {
+            return Err(format!(
+                "window exceeds {MAX_CLIENT_COLS}x{MAX_CLIENT_ROWS} cells"
+            ));
+        }
+        self.window = Rect::new(0, 0, width, height);
+        self.cell = CellSize::new(cell_width, cell_height);
+        self.client_geometry = true;
+        self.apply_layout();
+        Ok(())
+    }
+
+    /// True when `pane` exists in the session.
+    pub fn has_pane(&self, pane: PaneId) -> bool {
+        self.panes.contains_key(&pane)
+    }
+
+    /// Visible panes of the active tab, in layout order.
+    pub fn visible_panes(&self) -> Vec<PaneId> {
+        self.tabs
+            .active()
+            .map(|tab| {
+                tab.layout()
+                    .into_iter()
+                    .filter(|layout| !layout.hidden)
+                    .map(|layout| layout.pane)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Active tab index and every tab's geometry; pane rects are window pixels.
+    pub fn layout_tabs(&self) -> (usize, Vec<LayoutTab>) {
+        let tabs = self
+            .tabs
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let focused = tab.active_pane();
+                LayoutTab {
+                    title: self
+                        .panes
+                        .get(&focused)
+                        .map(|pane| pane.title.clone())
+                        .unwrap_or_default(),
+                    panes: tab
+                        .layout()
+                        .into_iter()
+                        .map(|layout| LayoutPane {
+                            pane: layout.pane.0,
+                            x: layout.rect.x,
+                            y: layout.rect.y,
+                            width: layout.rect.width,
+                            height: layout.rect.height,
+                            cols: layout.cols as usize,
+                            rows: layout.rows as usize,
+                            hidden: layout.hidden,
+                            focused: layout.pane == focused,
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        (self.tabs.active_index().unwrap_or(0), tabs)
+    }
+
+    /// Projects one pane's model the same way the window renders it.
+    pub fn pane_snapshot(&self, pane: PaneId) -> Option<PaneSnapshot> {
+        let pane = self.panes.get(&pane)?;
+        let model = &pane.model;
+        let cells = model.visible_cells();
+        let (cols, rows) = model.grid_dimensions();
+        let cursor = model.cursor();
+        // The model reports a cursor outside the viewport (scrolled history) as row usize::MAX.
+        let cursor = if cursor.row >= rows || cursor.column >= cols {
+            Cursor {
+                column: 0,
+                row: 0,
+                shape: CursorShape::Hidden,
+            }
+        } else {
+            cursor
+        };
+        let viewport = BlockViewport {
+            evicted_rows: model.block_row_base(),
+            history_size: model.history_size(),
+            display_offset: model.display_offset(),
+            first_visible_line: Some(model.visible_top_line()),
+            screen_lines: cells.len(),
+            alternate_screen: model.alternate_screen_active(),
+        };
+        Some(PaneSnapshot {
+            cols,
+            rows: cells.iter().map(|row| attach::line_runs(row)).collect(),
+            meta: FrameMeta {
+                cursor,
+                selection: attach::selection_spans(&model.selected_cells()),
+                modes: PaneModes {
+                    keyboard_flags: model.keyboard_flags().bits(),
+                    app_cursor: model.application_cursor_keys(),
+                    bracketed_paste: model.bracketed_paste_enabled(),
+                    mouse_or_alternate: model.mouse_or_alternate_screen_active(),
+                    alternate_screen: model.alternate_screen_active(),
+                },
+                decorations: project_block_decorations(model.blocks(), viewport),
+                title: pane.title.clone(),
+                cwd: if pane.cwd_reported {
+                    pane.cwd.to_string_lossy().into_owned()
+                } else {
+                    String::new()
+                },
+            },
+        })
+    }
+
+    /// Runs one attached-client view or layout action and returns its reply.
+    ///
+    /// `Hello`, `Resync` and `Detach` concern the stream itself and are handled
+    /// by the server loop; they return `None` here. Unknown pane ids return an
+    /// `Error` with code [`ERROR_NOT_FOUND`].
+    pub fn handle_client(&mut self, message: ClientMessage) -> Option<ServerMessage> {
+        let missing =
+            |pane: u64| attach_error(ERROR_NOT_FOUND, format!("pane {pane} does not exist"));
+        match message {
+            ClientMessage::Hello { .. } | ClientMessage::Resync { .. } | ClientMessage::Detach => {
+                None
+            }
+            ClientMessage::Resize {
+                width,
+                height,
+                cell_width,
+                cell_height,
+            } => self
+                .set_client_geometry(width, height, cell_width, cell_height)
+                .err()
+                .map(|error| attach_error(ERROR_INVALID_GEOMETRY, error)),
+            ClientMessage::Input { pane, data } => {
+                let Some(target) = self.panes.get_mut(&PaneId(pane)) else {
+                    return Some(missing(pane));
+                };
+                if let Err(error) = target.pty.write(&data) {
+                    return Some(attach_error(
+                        ERROR_UNAVAILABLE,
+                        format!("could not write to PTY: {error}"),
+                    ));
+                }
+                target.model.scroll_to_bottom();
+                None
+            }
+            ClientMessage::Scroll { pane, lines } => {
+                let Some(target) = self.panes.get_mut(&PaneId(pane)) else {
+                    return Some(missing(pane));
+                };
+                if lines >= 0 {
+                    target.model.scroll_up(lines as usize);
+                } else {
+                    target.model.scroll_down(lines.unsigned_abs() as usize);
+                }
+                None
+            }
+            ClientMessage::ScrollToBottom { pane } => {
+                let Some(target) = self.panes.get_mut(&PaneId(pane)) else {
+                    return Some(missing(pane));
+                };
+                target.model.scroll_to_bottom();
+                None
+            }
+            ClientMessage::Selection { pane, op } => {
+                let Some(target) = self.panes.get_mut(&PaneId(pane)) else {
+                    return Some(missing(pane));
+                };
+                let (cols, rows) = target.model.grid_dimensions();
+                // Clamp so client coordinates can never index outside the grid.
+                let clamp = |column: usize, row: usize| {
+                    (
+                        column.min(cols.saturating_sub(1)),
+                        row.min(rows.saturating_sub(1)),
+                    )
+                };
+                match op {
+                    attach::SelectionOp::Begin { column, row, kind } => {
+                        let (column, row) = clamp(column, row);
+                        target.model.begin_selection(column, row, kind);
+                    }
+                    attach::SelectionOp::Extend { column, row } => {
+                        let (column, row) = clamp(column, row);
+                        target.model.extend_selection(column, row);
+                    }
+                    attach::SelectionOp::Clear => target.model.clear_selection(),
+                }
+                None
+            }
+            ClientMessage::Block { pane, op } => {
+                let Some(target) = self.panes.get_mut(&PaneId(pane)) else {
+                    return Some(missing(pane));
+                };
+                use crate::block_navigation::NavigationDirection;
+                match op {
+                    BlockOp::Previous => target.model.navigate_block(NavigationDirection::Previous),
+                    BlockOp::Next => target.model.navigate_block(NavigationDirection::Next),
+                    BlockOp::Select => {
+                        target.model.select_block_at_viewport();
+                    }
+                }
+                None
+            }
+            ClientMessage::Copy {
+                request,
+                pane,
+                source,
+            } => {
+                let Some(target) = self.panes.get(&PaneId(pane)) else {
+                    return Some(missing(pane));
+                };
+                let text = match source {
+                    CopySource::Selection => target.model.selection_text(),
+                    CopySource::BlockInput => target.model.selected_block_input_text(),
+                    CopySource::BlockOutput => target.model.selected_block_output_text(),
+                };
+                Some(ServerMessage::CopyText { request, text })
+            }
+            ClientMessage::Layout { request, action } => Some(ServerMessage::LayoutResult {
+                request,
+                error: self.apply_layout_action(action).err(),
+            }),
+        }
+    }
+
+    /// Performs a client tab/pane action with the same helpers as control requests.
+    fn apply_layout_action(&mut self, action: LayoutAction) -> Result<(), String> {
+        match action {
+            LayoutAction::NewTab => self.new_tab().map(drop),
+            LayoutAction::CloseTab => self.close_active_tab(),
+            LayoutAction::NextTab => {
+                self.tabs.next();
+                Ok(())
+            }
+            LayoutAction::PreviousTab => {
+                self.tabs.prev();
+                Ok(())
+            }
+            LayoutAction::SelectTab { index } => {
+                if self.tabs.select(index) {
+                    Ok(())
+                } else {
+                    Err(format!("tab {index} does not exist"))
+                }
+            }
+            LayoutAction::Split { direction } => self
+                .split_focused(match direction {
+                    SplitDirection::Right => Direction::Horizontal,
+                    SplitDirection::Down => Direction::Vertical,
+                })
+                .map(drop),
+            LayoutAction::ClosePane => {
+                let pane = self
+                    .focused_pane_id()
+                    .ok_or_else(|| "no focused pane".to_owned())?;
+                self.close(pane);
+                Ok(())
+            }
+            LayoutAction::FocusDirection { direction } => {
+                let direction = match direction {
+                    attach::FocusDirection::Left => FocusDirection::Left,
+                    attach::FocusDirection::Right => FocusDirection::Right,
+                    attach::FocusDirection::Up => FocusDirection::Up,
+                    attach::FocusDirection::Down => FocusDirection::Down,
+                };
+                if let Some(tab) = self.tabs.active_mut() {
+                    tab.move_focus(direction);
+                }
+                Ok(())
+            }
+            LayoutAction::FocusPane { pane } => {
+                if self.focus(PaneId(pane)) {
+                    Ok(())
+                } else {
+                    Err(format!("pane {pane} does not exist"))
+                }
+            }
+        }
+    }
+}
+
+/// Window area left for panes below the tab bar, as in the so1term window:
+/// a bar of one cell height is reserved only while more than one tab exists.
+pub fn tab_content_rect(window: Rect, tab_count: usize, cell_height: u32) -> Rect {
+    let bar = if tab_count <= 1 {
+        0
+    } else {
+        cell_height.max(1)
+    };
+    let bar = bar.min(window.height);
+    Rect::new(
+        window.x,
+        window.y.saturating_add(bar),
+        window.width,
+        window.height.saturating_sub(bar),
+    )
+}
+
+#[derive(Debug)]
+struct PaneTrack {
+    seq: u64,
+    cols: usize,
+    rows: Vec<Vec<StyledRun>>,
+    meta: Option<FrameMeta>,
+    needs_full: bool,
+}
+
+impl Default for PaneTrack {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            cols: 0,
+            rows: Vec::new(),
+            meta: None,
+            needs_full: true,
+        }
+    }
+}
+
+/// Per-client frame state: the last layout and per-pane rows sent to one client.
+///
+/// A new attach starts a new `AttachFrames`, so pane sequence numbers restart
+/// at 1 for every client. Frames are only produced for visible panes of the
+/// active tab; a pane that becomes visible (tab switch, split, resize) gets a
+/// full frame, and so does every pane marked with [`Self::mark_full`].
+#[derive(Debug, Default)]
+pub struct AttachFrames {
+    panes: BTreeMap<PaneId, PaneTrack>,
+    visible: Vec<PaneId>,
+    layout: Option<(usize, Vec<LayoutTab>)>,
+    revision: u64,
+}
+
+impl AttachFrames {
+    /// Forces the next frame of `pane` (or of every pane when `None`) to be full.
+    pub fn mark_full(&mut self, pane: Option<PaneId>) {
+        match pane {
+            Some(pane) => self.panes.entry(pane).or_default().needs_full = true,
+            None => {
+                for track in self.panes.values_mut() {
+                    track.needs_full = true;
+                }
+            }
+        }
+    }
+
+    /// A new `Layout` message when tabs, panes, focus, titles or geometry changed.
+    pub fn layout_message(&mut self, session: &Session) -> Option<ServerMessage> {
+        let current = session.layout_tabs();
+        if self.layout.as_ref() == Some(&current) {
+            return None;
+        }
+        self.revision += 1;
+        let (active_tab, tabs) = current.clone();
+        self.layout = Some(current);
+        Some(ServerMessage::Layout(LayoutFrame {
+            revision: self.revision,
+            active_tab,
+            tabs,
+        }))
+    }
+
+    /// One frame per visible pane of the active tab whose view changed.
+    pub fn frames(&mut self, session: &Session) -> Vec<PaneFrame> {
+        self.panes.retain(|pane, _| session.has_pane(*pane));
+        let visible = session.visible_panes();
+        let mut frames = Vec::new();
+        for pane in &visible {
+            let Some(snapshot) = session.pane_snapshot(*pane) else {
+                continue;
+            };
+            let newly_visible = !self.visible.contains(pane);
+            let track = self.panes.entry(*pane).or_default();
+            let full = track.needs_full
+                || newly_visible
+                || track.cols != snapshot.cols
+                || track.rows.len() != snapshot.rows.len();
+            let lines: Vec<attach::FrameLine> = snapshot
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(row, runs)| full || track.rows.get(*row) != Some(*runs))
+                .map(|(row, runs)| attach::FrameLine {
+                    row,
+                    runs: runs.clone(),
+                })
+                .collect();
+            if !full && lines.is_empty() && track.meta.as_ref() == Some(&snapshot.meta) {
+                continue;
+            }
+            track.seq += 1;
+            track.needs_full = false;
+            track.cols = snapshot.cols;
+            let rows = snapshot.rows.len();
+            track.rows = snapshot.rows;
+            track.meta = Some(snapshot.meta.clone());
+            let meta = snapshot.meta;
+            frames.push(PaneFrame {
+                pane: pane.0,
+                seq: track.seq,
+                full,
+                cols: snapshot.cols,
+                rows,
+                lines,
+                cursor: meta.cursor,
+                selection: meta.selection,
+                modes: meta.modes,
+                decorations: meta.decorations,
+                title: meta.title,
+                cwd: meta.cwd,
+            });
+        }
+        self.visible = visible;
+        frames
+    }
+}
+
+/// Most frames an [`Outbox`] holds before it discards queued frames.
+pub const OUTBOX_MAX_FRAMES: usize = 64;
+/// Most encoded frame bytes an [`Outbox`] holds before it discards queued frames.
+pub const OUTBOX_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Most queued non-frame messages; beyond this the client is considered stuck.
+pub const OUTBOX_MAX_MESSAGES: usize = 1024;
+
+enum Outgoing {
+    Frame(u64),
+    Message,
+}
+
+/// Bounded queue of encoded attach lines from the server loop to one client.
+///
+/// Frames are disposable: when adding a frame would exceed
+/// [`OUTBOX_MAX_FRAMES`] or [`OUTBOX_MAX_FRAME_BYTES`], every queued frame is
+/// dropped together with the new one, and their panes are returned so their
+/// next frame is full. Layout, copy, layout-result, error, welcome and exit
+/// messages are never dropped; more than [`OUTBOX_MAX_MESSAGES`] of them
+/// queued means the client stopped reading and must be detached.
+#[derive(Default)]
+pub struct Outbox {
+    queue: VecDeque<(Outgoing, Vec<u8>)>,
+    frames: usize,
+    frame_bytes: usize,
+    messages: usize,
+    /// Set when frames were dropped; the writer wakes the loop once the queue drains.
+    pub wake_wanted: bool,
+    /// Set when the client is gone or the session ends; the writer stops once empty.
+    pub closed: bool,
+}
+
+impl Outbox {
+    /// Queues a frame line; returns the panes whose queued frames were dropped
+    /// (including `pane` itself) when the frame did not fit.
+    pub fn push_frame(&mut self, pane: u64, line: Vec<u8>) -> Vec<u64> {
+        let over = self.frames >= OUTBOX_MAX_FRAMES
+            || (self.frames > 0 && self.frame_bytes + line.len() > OUTBOX_MAX_FRAME_BYTES);
+        if !over {
+            self.frames += 1;
+            self.frame_bytes += line.len();
+            self.queue.push_back((Outgoing::Frame(pane), line));
+            return Vec::new();
+        }
+        let mut dropped = BTreeSet::from([pane]);
+        self.queue.retain(|(kind, _)| match kind {
+            Outgoing::Frame(pane) => {
+                dropped.insert(*pane);
+                false
+            }
+            Outgoing::Message => true,
+        });
+        self.frames = 0;
+        self.frame_bytes = 0;
+        self.wake_wanted = true;
+        dropped.into_iter().collect()
+    }
+
+    /// Queues a message that is never dropped; `false` means the client is stuck.
+    pub fn push_message(&mut self, line: Vec<u8>) -> bool {
+        if self.messages >= OUTBOX_MAX_MESSAGES {
+            return false;
+        }
+        self.messages += 1;
+        self.queue.push_back((Outgoing::Message, line));
+        true
+    }
+
+    /// Next line for the writer, in queue order.
+    pub fn pop(&mut self) -> Option<Vec<u8>> {
+        let (kind, line) = self.queue.pop_front()?;
+        match kind {
+            Outgoing::Frame(_) => {
+                self.frames -= 1;
+                self.frame_bytes -= line.len();
+            }
+            Outgoing::Message => self.messages -= 1,
+        }
+        Some(line)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 }
 
@@ -421,6 +1045,7 @@ fn spawn_pane(
         title: cwd_basename_title(&cwd),
         explicit_title: None,
         cwd,
+        cwd_reported: false,
         wakeup,
     })
 }
@@ -490,6 +1115,67 @@ pub fn apply_title_event(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        OUTBOX_MAX_FRAME_BYTES, OUTBOX_MAX_FRAMES, OUTBOX_MAX_MESSAGES, Outbox, tab_content_rect,
+    };
+    use crate::layout::Rect;
+
+    #[test]
+    fn tab_content_rect_reserves_one_cell_row_only_with_several_tabs() {
+        let window = Rect::new(0, 0, 800, 480);
+        assert_eq!(tab_content_rect(window, 1, 16), window);
+        assert_eq!(tab_content_rect(window, 2, 16), Rect::new(0, 16, 800, 464));
+        assert_eq!(
+            tab_content_rect(Rect::new(0, 0, 800, 10), 3, 16),
+            Rect::new(0, 10, 800, 0)
+        );
+    }
+
+    #[test]
+    fn outbox_keeps_messages_in_order_and_drops_frames_when_full() {
+        let mut outbox = Outbox::default();
+        assert!(outbox.push_message(b"welcome".to_vec()));
+        for index in 0..OUTBOX_MAX_FRAMES {
+            let pane = (index % 2) as u64;
+            assert!(outbox.push_frame(pane, vec![b'f'; 8]).is_empty());
+        }
+        assert!(outbox.push_message(b"layout".to_vec()));
+        assert!(!outbox.wake_wanted);
+        // The next frame overflows: every queued frame is dropped with it.
+        assert_eq!(outbox.push_frame(7, b"late".to_vec()), vec![0, 1, 7]);
+        assert!(outbox.wake_wanted);
+        assert_eq!(outbox.pop(), Some(b"welcome".to_vec()));
+        assert_eq!(outbox.pop(), Some(b"layout".to_vec()));
+        assert_eq!(outbox.pop(), None);
+        assert!(outbox.is_empty());
+        // Accounting was reset, so frames fit again.
+        assert!(outbox.push_frame(1, b"again".to_vec()).is_empty());
+        assert_eq!(outbox.pop(), Some(b"again".to_vec()));
+    }
+
+    #[test]
+    fn outbox_accepts_one_oversized_frame_but_bounds_frame_bytes() {
+        let mut outbox = Outbox::default();
+        assert!(
+            outbox
+                .push_frame(1, vec![0; OUTBOX_MAX_FRAME_BYTES + 1])
+                .is_empty()
+        );
+        assert_eq!(outbox.push_frame(2, vec![0; 1]), vec![1, 2]);
+        assert!(outbox.is_empty());
+    }
+
+    #[test]
+    fn outbox_reports_a_stuck_client_after_too_many_messages() {
+        let mut outbox = Outbox::default();
+        for _ in 0..OUTBOX_MAX_MESSAGES {
+            assert!(outbox.push_message(b"m".to_vec()));
+        }
+        assert!(!outbox.push_message(b"m".to_vec()));
+        outbox.pop();
+        assert!(outbox.push_message(b"m".to_vec()));
+    }
+
     #[test]
     fn session_socket_names_accept_only_safe_session_names() {
         use crate::control::{session_socket_name, validate_session_name};

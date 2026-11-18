@@ -62,6 +62,22 @@ mod transport {
         unsafe { libc::_exit(128 + signal) };
     }
 
+    /// A control connection whose first unanswered request was `attach`.
+    ///
+    /// The listener hands it to the session's [`AttachHook`] instead of the
+    /// request dispatcher. `buffered` holds bytes the client already sent after
+    /// the attach request line (for example a pipelined `Hello`); they belong to
+    /// the attach stream and must be read before `stream`. The stream has no
+    /// read timeout; its 30 s write timeout is left for the hook to adjust.
+    pub struct AttachConnection {
+        pub id: u64,
+        pub stream: UnixStream,
+        pub buffered: Vec<u8>,
+    }
+
+    /// Takes over an attach connection; runs on the connection's client thread.
+    pub type AttachHook = Arc<dyn Fn(AttachConnection) + Send + Sync>;
+
     pub struct ControlServer {
         socket_path: PathBuf,
         stopping: Arc<AtomicBool>,
@@ -75,7 +91,7 @@ mod transport {
         where
             F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
         {
-            Self::start_named(directory, &format!("so1term-{pid}.sock"), dispatch)
+            Self::start_named(directory, &format!("so1term-{pid}.sock"), dispatch, None)
         }
 
         /// Starts the persistent-server listener for `session` in `directory`.
@@ -88,10 +104,42 @@ mod transport {
         {
             super::validate_session_name(session)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            Self::start_named(directory, &super::session_socket_name(session), dispatch)
+            Self::start_named(
+                directory,
+                &super::session_socket_name(session),
+                dispatch,
+                None,
+            )
         }
 
-        fn start_named<F>(directory: &Path, file_name: &str, dispatch: F) -> io::Result<Self>
+        /// Like [`Self::start_session_at`], but `attach` requests upgrade the
+        /// connection: the client thread passes it to `attach` and stops reading
+        /// control requests from it. Every other request is dispatched as usual.
+        pub fn start_session_with_attach<F>(
+            directory: &Path,
+            session: &str,
+            dispatch: F,
+            attach: AttachHook,
+        ) -> io::Result<Self>
+        where
+            F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
+        {
+            super::validate_session_name(session)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            Self::start_named(
+                directory,
+                &super::session_socket_name(session),
+                dispatch,
+                Some(attach),
+            )
+        }
+
+        fn start_named<F>(
+            directory: &Path,
+            file_name: &str,
+            dispatch: F,
+            attach: Option<AttachHook>,
+        ) -> io::Result<Self>
         where
             F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
         {
@@ -192,11 +240,16 @@ mod transport {
                                     continue;
                                 }
                                 let dispatch = dispatch.clone();
+                                let attach = attach.clone();
                                 let active_for_client = active.clone();
                                 if thread::Builder::new()
                                     .name("so1term-control-client".into())
                                     .spawn(move || {
-                                        handle_connection(stream, move |request| dispatch(request));
+                                        handle_connection(
+                                            stream,
+                                            move |request| dispatch(request),
+                                            attach.as_ref(),
+                                        );
                                         active_for_client.fetch_sub(1, Ordering::AcqRel);
                                     })
                                     .is_err()
@@ -249,6 +302,7 @@ mod transport {
     fn handle_connection<F: Fn(ControlRequest) -> ControlResponse>(
         stream: UnixStream,
         dispatch: F,
+        attach: Option<&AttachHook>,
     ) {
         let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
         let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
@@ -313,6 +367,20 @@ mod transport {
                     return;
                 }
             };
+            if let (ControlCommand::Attach, Some(attach)) = (&request.command, attach) {
+                // The connection becomes an attach stream: no more control requests.
+                let buffered = reader.buffer().to_vec();
+                let stream = reader.into_inner();
+                if stream.set_read_timeout(None).is_err() {
+                    return;
+                }
+                attach(AttachConnection {
+                    id: request.id,
+                    stream,
+                    buffered,
+                });
+                return;
+            }
             let response = dispatch(request);
             if write_response(reader.get_mut(), &response).is_err() {
                 return;
@@ -421,7 +489,8 @@ mod transport {
 
 #[cfg(unix)]
 pub use transport::{
-    ControlServer, peer_uid_matches, runtime_directory, send_request, validate_directory_metadata,
+    AttachConnection, AttachHook, ControlServer, peer_uid_matches, runtime_directory, send_request,
+    validate_directory_metadata,
 };
 
 #[cfg(not(unix))]
@@ -430,8 +499,8 @@ pub struct ControlServer;
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        ControlCommand, ControlOutcome, ControlRequest, ControlResponse, ControlServer,
-        MAX_REQUEST_LINE_BYTES, peer_uid_matches, send_request,
+        AttachConnection, ControlCommand, ControlOutcome, ControlRequest, ControlResponse,
+        ControlServer, MAX_REQUEST_LINE_BYTES, peer_uid_matches, send_request, serialize_request,
     };
     use serde_json::json;
     use std::{
@@ -592,6 +661,98 @@ mod tests {
         assert_eq!(
             response.outcome,
             ControlOutcome::Success(json!({"tabs": []}))
+        );
+    }
+
+    #[test]
+    fn attach_requests_are_handed_to_the_hook_with_buffered_bytes() {
+        use std::io::{Read, Write};
+        let root = test_root();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = ControlServer::start_session_with_attach(
+            &root.join("attach"),
+            "hook",
+            |request| ControlResponse {
+                id: Some(request.id),
+                outcome: ControlOutcome::Success(json!({"dispatched": true})),
+            },
+            std::sync::Arc::new(move |connection: AttachConnection| {
+                let _ = sender.send(connection);
+            }),
+        )
+        .unwrap();
+        // Other requests still go through the dispatcher.
+        let response = send_request(
+            server.socket_path(),
+            &ControlRequest {
+                id: 1,
+                command: ControlCommand::List,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Success(json!({"dispatched": true}))
+        );
+
+        let mut client = std::os::unix::net::UnixStream::connect(server.socket_path()).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = serialize_request(&ControlRequest {
+            id: 5,
+            command: ControlCommand::Attach,
+        })
+        .unwrap();
+        bytes.extend_from_slice(b"after-attach\n");
+        client.write_all(&bytes).unwrap();
+        let mut connection = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(connection.id, 5);
+        assert_eq!(connection.stream.read_timeout().unwrap(), None);
+        // Bytes after the attach line arrive either pre-buffered or on the stream.
+        let mut received = connection.buffered.clone();
+        connection
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        while !received.ends_with(b"\n") {
+            let mut chunk = [0; 64];
+            let read = connection.stream.read(&mut chunk).unwrap();
+            assert!(read > 0);
+            received.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(received, b"after-attach\n");
+        connection.stream.write_all(b"pong\n").unwrap();
+        let mut reply = [0; 5];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"pong\n");
+    }
+
+    #[test]
+    fn window_listeners_dispatch_attach_requests() {
+        let root = test_root();
+        let server = ControlServer::start_at(&root.join("window"), 1240, |request| {
+            assert_eq!(request.command, ControlCommand::Attach);
+            ControlResponse {
+                id: Some(request.id),
+                outcome: ControlOutcome::Success(json!({"refused": true})),
+            }
+        })
+        .unwrap();
+        let response = send_request(
+            server.socket_path(),
+            &ControlRequest {
+                id: 3,
+                command: ControlCommand::Attach,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.id, Some(3));
+        assert_eq!(
+            response.outcome,
+            ControlOutcome::Success(json!({"refused": true}))
         );
     }
 

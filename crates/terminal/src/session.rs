@@ -11,9 +11,16 @@
 //! [`Session::set_client_geometry`]. From then on the client's window and cell
 //! metrics stay authoritative (also after it detaches), and pane rects are laid
 //! out below a one-cell-high tab bar whenever more than one tab exists, the same
-//! rule as the window's `tab_content_rect`. Kitty graphics ingestion is not
-//! performed by the server yet; APC sequences are passed to the VT model, which
-//! ignores them.
+//! rule as the window's `tab_content_rect`.
+//!
+//! Kitty graphics (Phase 5 T11d): every pane runs the shared
+//! [`crate::graphics_pipeline`], exactly like a standalone window pane. Replies
+//! go to the pane PTY, `SO1TERM_GRAPHICS_ALLOWED_ROOTS` guards file media in
+//! this process, and decoding runs on a worker thread whose result comes back
+//! through the [`DecodeNotifier`] and [`Session::finish_graphics`]. The
+//! session records which images were stored or freed ([`ImageEvent`]) so the
+//! server can announce image data to an attached client before frames place
+//! it, and frames carry the projected placements.
 //!
 //! Attach support (Phase 5 T11b) is split into pure pieces the server loop
 //! combines: [`Session::handle_client`] runs client view and layout actions on
@@ -32,13 +39,17 @@
 //! frontends name panes and roll back failed tabs the same way.
 
 use crate::attach::{
-    self, BlockOp, ClientMessage, CopySource, LayoutAction, LayoutFrame, LayoutPane, LayoutTab,
-    PaneFrame, PaneModes, SelectionSpan, ServerMessage, SplitDirection, StyledRun,
+    self, BlockOp, ClientMessage, CopySource, FramePlacement, LayoutAction, LayoutFrame,
+    LayoutPane, LayoutTab, PaneFrame, PaneModes, SelectionSpan, ServerMessage, SplitDirection,
+    StyledRun,
 };
+use crate::blocks::GridAnchor;
 use crate::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
     ControlRequest, ControlResponse, TextScope,
 };
+use crate::graphics::{self, DecodeJob, DecodedImage, GraphicsCompletion};
+use crate::graphics_pipeline::{GraphicsHost, PaneGraphics, SharedGraphics, frame_placements};
 use crate::layout::{
     CellSize, Direction, FocusDirection, PaneCloseResult, PaneId, PaneLayout, Rect, Tab,
     TabCloseResult, TabSet,
@@ -76,6 +87,51 @@ const MIN_PANE_ROWS: u32 = 5;
 /// Called from a PTY reader thread when a pane has new output to receive.
 pub type OutputNotifier = Arc<dyn Fn(PaneId) + Send + Sync>;
 
+/// Called from a decode worker thread with a finished kitty image decode; the
+/// owner of the session passes it to [`Session::finish_graphics`].
+pub type DecodeNotifier = Arc<dyn Fn(PaneId, GridAnchor, GraphicsCompletion) + Send + Sync>;
+
+/// Image data change recorded for attached clients.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageEvent {
+    /// New or replaced data for the image.
+    Stored(PaneId, u32),
+    /// The image data was freed (delete with data, or quota eviction).
+    Freed(PaneId, u32),
+}
+
+/// The server side of the graphics pipeline: no GPU, so every image is
+/// displayable; changes are recorded for the attached client.
+struct SessionGraphicsHost<'a> {
+    cell: (f32, f32),
+    decode: &'a DecodeNotifier,
+    events: &'a mut Vec<ImageEvent>,
+}
+
+impl GraphicsHost for SessionGraphicsHost<'_> {
+    fn cell_size(&self) -> (f32, f32) {
+        self.cell
+    }
+
+    fn image_stored(&mut self, pane: PaneId, id: u32, _image: &DecodedImage) -> bool {
+        self.events.push(ImageEvent::Stored(pane, id));
+        true
+    }
+
+    fn image_displayable(&mut self, _pane: PaneId, _id: u32, _image: &DecodedImage) -> bool {
+        true
+    }
+
+    fn image_freed(&mut self, pane: PaneId, id: u32) {
+        self.events.push(ImageEvent::Freed(pane, id));
+    }
+
+    fn start_decode(&mut self, pane: PaneId, anchor: GridAnchor, job: DecodeJob) {
+        let decode = Arc::clone(self.decode);
+        std::thread::spawn(move || decode(pane, anchor, graphics::decode_transfer(job)));
+    }
+}
+
 /// What the server should do after a control request was answered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlEffect {
@@ -92,6 +148,48 @@ struct SessionPane {
     /// True once the shell reported its directory with OSC 7.
     cwd_reported: bool,
     wakeup: Arc<WakeupGate>,
+    graphics: PaneGraphics,
+}
+
+impl SessionPane {
+    /// Applies queued PTY segments and answers terminal queries.
+    fn apply(&mut self, id: PaneId, shared: &mut SharedGraphics, host: &mut dyn GraphicsHost) {
+        let Self {
+            pty,
+            model,
+            graphics,
+            title,
+            explicit_title,
+            cwd,
+            cwd_reported,
+            ..
+        } = self;
+        graphics.apply(
+            id,
+            model,
+            shared,
+            host,
+            &mut |reply| {
+                let _ = pty.write(reply);
+            },
+            &mut |event| {
+                if let crate::osc::Event::CurrentDirectory { path, .. } = event {
+                    *cwd = PathBuf::from(String::from_utf8_lossy(&path).into_owned());
+                    *cwd_reported = true;
+                    *title = pane_tab_title(cwd, explicit_title.as_deref());
+                }
+            },
+        );
+        for event in model.take_events() {
+            if let Some(new_title) = apply_title_event(cwd, explicit_title, &event) {
+                *title = new_title;
+                continue;
+            }
+            if let ModelEvent::PtyWrite(bytes) = event {
+                let _ = pty.write(&bytes);
+            }
+        }
+    }
 }
 
 pub struct Session {
@@ -103,6 +201,9 @@ pub struct Session {
     panes: BTreeMap<PaneId, SessionPane>,
     start_cwd: PathBuf,
     notify: OutputNotifier,
+    decode: DecodeNotifier,
+    graphics: SharedGraphics,
+    image_events: Vec<ImageEvent>,
 }
 
 impl Session {
@@ -112,6 +213,7 @@ impl Session {
         rows: u32,
         cwd: PathBuf,
         notify: OutputNotifier,
+        decode: DecodeNotifier,
     ) -> Result<Self, String> {
         let cell = CellSize::new(VIRTUAL_CELL_WIDTH, VIRTUAL_CELL_HEIGHT);
         let window = Rect::new(
@@ -133,6 +235,9 @@ impl Session {
             panes: BTreeMap::from([(pane_id, pane)]),
             start_cwd: cwd,
             notify,
+            decode,
+            graphics: SharedGraphics::default(),
+            image_events: Vec::new(),
         })
     }
 
@@ -157,23 +262,68 @@ impl Session {
         // Acknowledge before draining so output that arrives meanwhile notifies again.
         pane.wakeup.acknowledge();
         for bytes in pane.pty.drain_output() {
-            for observed in pane.model.feed(&bytes) {
-                if let crate::osc::Event::CurrentDirectory { path, .. } = observed.event {
-                    pane.cwd = PathBuf::from(String::from_utf8_lossy(&path).into_owned());
-                    pane.cwd_reported = true;
-                    pane.title = pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
-                }
+            pane.graphics.receive(&bytes);
+        }
+        let mut host = SessionGraphicsHost {
+            cell: cell_pixels(self.cell),
+            decode: &self.decode,
+            events: &mut self.image_events,
+        };
+        pane.apply(pane_id, &mut self.graphics, &mut host);
+    }
+
+    /// Completes a kitty image decode reported through the [`DecodeNotifier`]
+    /// and resumes the pane output that waited for it.
+    pub fn finish_graphics(
+        &mut self,
+        pane_id: PaneId,
+        anchor: GridAnchor,
+        completion: GraphicsCompletion,
+    ) {
+        let mut host = SessionGraphicsHost {
+            cell: cell_pixels(self.cell),
+            decode: &self.decode,
+            events: &mut self.image_events,
+        };
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        let SessionPane {
+            pty,
+            model,
+            graphics,
+            ..
+        } = pane;
+        graphics.finish_decode(
+            pane_id,
+            anchor,
+            completion,
+            model,
+            &mut self.graphics,
+            &mut host,
+            &mut |reply| {
+                let _ = pty.write(reply);
+            },
+        );
+        for (evicted_pane, image) in self.graphics.take_evicted(&mut host) {
+            if let Some(pane) = self.panes.get_mut(&evicted_pane) {
+                pane.graphics
+                    .forget_evicted(evicted_pane, image, &self.graphics.store);
             }
         }
-        for event in pane.model.take_events() {
-            if let Some(title) = apply_title_event(&pane.cwd, &mut pane.explicit_title, &event) {
-                pane.title = title;
-                continue;
-            }
-            if let ModelEvent::PtyWrite(bytes) = event {
-                let _ = pane.pty.write(&bytes);
-            }
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.apply(pane_id, &mut self.graphics, &mut host);
         }
+    }
+
+    /// Stored RGBA data of a pane's kitty image.
+    pub fn image(&self, pane: PaneId, id: u32) -> Option<&DecodedImage> {
+        self.graphics.store.get(pane, id)
+    }
+
+    /// Image data changes since the last call, in order.
+    pub fn take_image_events(&mut self) -> Vec<ImageEvent> {
+        std::mem::take(&mut self.image_events)
     }
 
     /// Closes every pane whose shell has exited. Returns how many closed.
@@ -385,6 +535,7 @@ impl Session {
             TabCloseResult::Closed(_) => {
                 for pane in panes {
                     self.panes.remove(&pane);
+                    self.graphics.store.remove_pane(pane);
                 }
                 self.apply_layout();
             }
@@ -423,6 +574,7 @@ impl Session {
     fn close(&mut self, pane: PaneId) {
         let last = close_pane_lifecycle(&mut self.tabs, pane);
         self.panes.remove(&pane);
+        self.graphics.store.remove_pane(pane);
         if last {
             self.panes.clear();
         } else {
@@ -445,8 +597,11 @@ impl Session {
         let layouts: Vec<_> = self.tabs.tabs().iter().flat_map(Tab::layout).collect();
         for layout in layouts.into_iter().filter(|layout| !layout.hidden) {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
-                pane.model
-                    .resize(layout.cols as usize, layout.rows as usize);
+                pane.graphics.resize_model(
+                    &mut pane.model,
+                    layout.cols as usize,
+                    layout.rows as usize,
+                );
                 let _ = pane.pty.resize(
                     layout.cols.min(u16::MAX as u32) as u16,
                     layout.rows.min(u16::MAX as u32) as u16,
@@ -475,6 +630,7 @@ pub struct FrameMeta {
     pub decorations: Vec<BlockDecoration>,
     pub title: String,
     pub cwd: String,
+    pub placements: Vec<FramePlacement>,
 }
 
 /// Attach error code for unknown pane ids.
@@ -483,6 +639,9 @@ pub const ERROR_NOT_FOUND: &str = "NOT_FOUND";
 pub const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
 /// Attach error code for invalid client window metrics.
 pub const ERROR_INVALID_GEOMETRY: &str = "INVALID_GEOMETRY";
+/// Attach error code sent before detaching a client whose queued image data
+/// exceeded [`OUTBOX_MAX_IMAGE_BYTES`].
+pub const ERROR_IMAGE_BACKLOG: &str = "IMAGE_BACKLOG";
 
 /// Builds a [`ServerMessage::Error`].
 pub fn attach_error(code: &str, message: impl Into<String>) -> ServerMessage {
@@ -618,6 +777,7 @@ impl Session {
                 } else {
                     String::new()
                 },
+                placements: frame_placements(&pane.graphics.placements, model),
             },
         })
     }
@@ -791,6 +951,11 @@ impl Session {
     }
 }
 
+/// Pixel cell size the graphics pipeline sizes placements with.
+fn cell_pixels(cell: CellSize) -> (f32, f32) {
+    (cell.width as f32, cell.height as f32)
+}
+
 /// Window area left for panes below the tab bar, as in the so1term window:
 /// a bar of one cell height is reserved only while more than one tab exists.
 pub fn tab_content_rect(window: Rect, tab_count: usize, cell_height: u32) -> Rect {
@@ -920,6 +1085,7 @@ impl AttachFrames {
                 decorations: meta.decorations,
                 title: meta.title,
                 cwd: meta.cwd,
+                placements: meta.placements,
             });
         }
         self.visible = visible;
@@ -933,10 +1099,14 @@ pub const OUTBOX_MAX_FRAMES: usize = 64;
 pub const OUTBOX_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Most queued non-frame messages; beyond this the client is considered stuck.
 pub const OUTBOX_MAX_MESSAGES: usize = 1024;
+/// Most encoded image lines (announcements and chunks) queued for one client;
+/// beyond this the client gets an error and is detached.
+pub const OUTBOX_MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 
 enum Outgoing {
     Frame(u64),
     Message,
+    Image,
 }
 
 /// Bounded queue of encoded attach lines from the server loop to one client.
@@ -946,13 +1116,16 @@ enum Outgoing {
 /// dropped together with the new one, and their panes are returned so their
 /// next frame is full. Layout, copy, layout-result, error, welcome and exit
 /// messages are never dropped; more than [`OUTBOX_MAX_MESSAGES`] of them
-/// queued means the client stopped reading and must be detached.
+/// queued means the client stopped reading and must be detached. Image lines
+/// are never dropped either; they have their own byte budget,
+/// [`OUTBOX_MAX_IMAGE_BYTES`], so frames referencing them stay behind them.
 #[derive(Default)]
 pub struct Outbox {
     queue: VecDeque<(Outgoing, Vec<u8>)>,
     frames: usize,
     frame_bytes: usize,
     messages: usize,
+    image_bytes: usize,
     /// Set when frames were dropped; the writer wakes the loop once the queue drains.
     pub wake_wanted: bool,
     /// Set when the client is gone or the session ends; the writer stops once empty.
@@ -977,7 +1150,7 @@ impl Outbox {
                 dropped.insert(*pane);
                 false
             }
-            Outgoing::Message => true,
+            Outgoing::Message | Outgoing::Image => true,
         });
         self.frames = 0;
         self.frame_bytes = 0;
@@ -995,6 +1168,27 @@ impl Outbox {
         true
     }
 
+    /// Queues an image announcement or chunk that is never dropped; `false`
+    /// means the client already has [`OUTBOX_MAX_IMAGE_BYTES`] of image lines
+    /// queued and must be detached.
+    pub fn push_image(&mut self, line: Vec<u8>) -> bool {
+        if self.image_bytes.saturating_add(line.len()) > OUTBOX_MAX_IMAGE_BYTES {
+            return false;
+        }
+        self.image_bytes += line.len();
+        self.queue.push_back((Outgoing::Image, line));
+        true
+    }
+
+    /// Drops everything queued, e.g. before a final error to a detached client.
+    pub fn discard_all(&mut self) {
+        self.queue.clear();
+        self.frames = 0;
+        self.frame_bytes = 0;
+        self.messages = 0;
+        self.image_bytes = 0;
+    }
+
     /// Next line for the writer, in queue order.
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         let (kind, line) = self.queue.pop_front()?;
@@ -1004,6 +1198,7 @@ impl Outbox {
                 self.frame_bytes -= line.len();
             }
             Outgoing::Message => self.messages -= 1,
+            Outgoing::Image => self.image_bytes -= line.len(),
         }
         Some(line)
     }
@@ -1047,6 +1242,7 @@ fn spawn_pane(
         cwd,
         cwd_reported: false,
         wakeup,
+        graphics: PaneGraphics::default(),
     })
 }
 
@@ -1116,7 +1312,8 @@ pub fn apply_title_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        OUTBOX_MAX_FRAME_BYTES, OUTBOX_MAX_FRAMES, OUTBOX_MAX_MESSAGES, Outbox, tab_content_rect,
+        OUTBOX_MAX_FRAME_BYTES, OUTBOX_MAX_FRAMES, OUTBOX_MAX_IMAGE_BYTES, OUTBOX_MAX_MESSAGES,
+        Outbox, tab_content_rect,
     };
     use crate::layout::Rect;
 
@@ -1163,6 +1360,33 @@ mod tests {
         );
         assert_eq!(outbox.push_frame(2, vec![0; 1]), vec![1, 2]);
         assert!(outbox.is_empty());
+    }
+
+    #[test]
+    fn outbox_never_drops_images_and_bounds_their_queued_bytes() {
+        let mut outbox = Outbox::default();
+        assert!(outbox.push_image(b"image".to_vec()));
+        for _ in 0..OUTBOX_MAX_FRAMES {
+            assert!(outbox.push_frame(1, b"f".to_vec()).is_empty());
+        }
+        assert!(outbox.push_image(b"chunk".to_vec()));
+        // A frame overflow drops frames only; image lines keep their order.
+        assert_eq!(outbox.push_frame(2, b"late".to_vec()), vec![1, 2]);
+        assert_eq!(outbox.pop(), Some(b"image".to_vec()));
+        assert_eq!(outbox.pop(), Some(b"chunk".to_vec()));
+        assert!(outbox.is_empty());
+        // Image lines do not count against the message limit.
+        for _ in 0..OUTBOX_MAX_MESSAGES {
+            assert!(outbox.push_message(b"m".to_vec()));
+        }
+        assert!(outbox.push_image(vec![0; OUTBOX_MAX_IMAGE_BYTES - 1]));
+        assert!(outbox.push_image(vec![0; 1]));
+        assert!(!outbox.push_image(vec![0; 1]), "the 256 MiB budget is full");
+        while outbox.pop().is_some_and(|line| line.len() < 2) {}
+        assert!(outbox.push_image(vec![0; 1]), "popping frees the budget");
+        outbox.discard_all();
+        assert!(outbox.is_empty());
+        assert!(outbox.push_image(vec![0; OUTBOX_MAX_IMAGE_BYTES]));
     }
 
     #[test]

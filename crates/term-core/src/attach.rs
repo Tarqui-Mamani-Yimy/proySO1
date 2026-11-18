@@ -15,7 +15,9 @@
 //! - [`ServerMessage::Layout`] with tab and pane geometry,
 //! - [`ServerMessage::Frame`] with per-pane content (see [`PaneFrame`] for the
 //!   sequence and resync rule),
-//! - replies to copy and layout requests, errors, and the final exit reason.
+//! - replies to copy and layout requests, errors, and the final exit reason,
+//! - kitty graphics image data the frames' placements reference (see
+//!   [`ServerMessage::Image`]).
 //!
 //! The client sends its window metrics first ([`ClientMessage::Hello`]), then
 //! input bytes it already encoded with the frame's keyboard modes, view and
@@ -39,6 +41,8 @@ use vte::ansi::CursorShape;
 pub const ATTACH_PROTOCOL_VERSION: u64 = 1;
 /// Maximum attach line length in bytes, including the trailing newline.
 pub const MAX_ATTACH_LINE_BYTES: usize = 16 * 1024 * 1024;
+/// Most raw image bytes one [`ServerMessage::ImageData`] chunk carries.
+pub const MAX_IMAGE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachErrorCode {
@@ -272,6 +276,33 @@ pub struct PaneFrame {
     pub title: String,
     /// Empty when the pane has not reported a working directory.
     pub cwd: String,
+    /// Visible kitty image placements in drawing order; always complete.
+    pub placements: Vec<FramePlacement>,
+}
+
+/// One kitty image placement projected onto the pane viewport.
+///
+/// `column`/`row` are the anchor cell relative to the top-left visible cell;
+/// `row` is negative when the anchor scrolled above the viewport. The image is
+/// drawn into `columns` x `rows` cells shifted by the pixel offsets, showing
+/// the `source_*` rectangle of the image (in image pixels). Frames list
+/// placements sorted by `z` and then by placement order, so a client breaks z
+/// ties by list position. A placement may reference an image whose data is
+/// still in flight; the client skips it until the image is complete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FramePlacement {
+    pub image: u32,
+    pub column: usize,
+    pub row: i32,
+    pub columns: usize,
+    pub rows: usize,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub z: i32,
 }
 
 /// Pane geometry inside the window, in pixels plus the grid size in cells.
@@ -327,6 +358,65 @@ pub enum ServerMessage {
     Exit {
         reason: String,
     },
+    /// Announces an RGBA image of `pane` (`bytes` = `width * height * 4`). Its
+    /// data follows in [`ServerMessage::ImageData`] chunks; a new announcement
+    /// for the same pane and image replaces the previous data.
+    Image {
+        pane: u64,
+        image: u32,
+        width: u32,
+        height: u32,
+        bytes: u64,
+    },
+    /// Non-empty chunk of at most [`MAX_IMAGE_CHUNK_BYTES`] raw bytes (base64 on
+    /// the wire). Chunks of one image are contiguous and in order: each
+    /// `offset` is the number of bytes sent before it.
+    ImageData {
+        pane: u64,
+        image: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// The server freed the image data; the client drops its copy.
+    ImageRemoved {
+        pane: u64,
+        image: u32,
+    },
+}
+
+/// RGBA byte length of a `width` x `height` image, when it fits in `u64`.
+pub fn rgba_len(width: u32, height: u32) -> Option<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)
+}
+
+/// The [`ServerMessage::Image`] announcement of an RGBA image.
+pub fn image_announcement(pane: u64, image: u32, width: u32, height: u32) -> ServerMessage {
+    ServerMessage::Image {
+        pane,
+        image,
+        width,
+        height,
+        bytes: rgba_len(width, height).unwrap_or(u64::MAX),
+    }
+}
+
+/// Splits `rgba` into contiguous [`ServerMessage::ImageData`] chunks of at most
+/// [`MAX_IMAGE_CHUNK_BYTES`] bytes, built one at a time.
+pub fn image_data_messages(
+    pane: u64,
+    image: u32,
+    rgba: &[u8],
+) -> impl Iterator<Item = ServerMessage> + '_ {
+    rgba.chunks(MAX_IMAGE_CHUNK_BYTES)
+        .enumerate()
+        .map(move |(index, chunk)| ServerMessage::ImageData {
+            pane,
+            image,
+            offset: (index * MAX_IMAGE_CHUNK_BYTES) as u64,
+            data: chunk.to_vec(),
+        })
 }
 
 /// Merges neighbouring cells with equal style into runs.
@@ -1056,7 +1146,68 @@ fn frame_fields(frame: &PaneFrame) -> Vec<(&'static str, Value)> {
         ("decorations", Value::Array(decorations)),
         ("title", json!(frame.title)),
         ("cwd", json!(frame.cwd)),
+        (
+            "placements",
+            Value::Array(frame.placements.iter().map(placement_value).collect()),
+        ),
     ]
+}
+
+fn placement_value(placement: &FramePlacement) -> Value {
+    json!({
+        "image": placement.image,
+        "column": placement.column,
+        "row": placement.row,
+        "columns": placement.columns,
+        "rows": placement.rows,
+        "x_offset": placement.x_offset,
+        "y_offset": placement.y_offset,
+        "source_x": placement.source_x,
+        "source_y": placement.source_y,
+        "source_width": placement.source_width,
+        "source_height": placement.source_height,
+        "z": placement.z,
+    })
+}
+
+fn parse_placement(fields: Fields<'_>) -> AttachResult<FramePlacement> {
+    fields.only(&[
+        "image",
+        "column",
+        "row",
+        "columns",
+        "rows",
+        "x_offset",
+        "y_offset",
+        "source_x",
+        "source_y",
+        "source_width",
+        "source_height",
+        "z",
+    ])?;
+    let positive = |key: &str| -> AttachResult<u64> {
+        let value = fields.u64(key)?;
+        if value == 0 {
+            return Err(invalid(key));
+        }
+        Ok(value)
+    };
+    Ok(FramePlacement {
+        image: fields.u32("image")?,
+        column: fields.usize("column")?,
+        row: fields.i32("row")?,
+        columns: usize::try_from(positive("columns")?).map_err(|_| invalid("columns"))?,
+        rows: usize::try_from(positive("rows")?).map_err(|_| invalid("rows"))?,
+        x_offset: fields.u32("x_offset")?,
+        y_offset: fields.u32("y_offset")?,
+        source_x: fields.u32("source_x")?,
+        source_y: fields.u32("source_y")?,
+        source_width: u32::try_from(positive("source_width")?)
+            .map_err(|_| invalid("source_width"))?,
+        source_height: u32::try_from(positive("source_height")?)
+            .map_err(|_| invalid("source_height"))?,
+        z: fields.i32("z")?,
+    })
 }
 
 fn parse_frame(fields: &Fields<'_>) -> AttachResult<PaneFrame> {
@@ -1075,6 +1226,7 @@ fn parse_frame(fields: &Fields<'_>) -> AttachResult<PaneFrame> {
         "decorations",
         "title",
         "cwd",
+        "placements",
     ])?;
     let lines = fields.objects("lines", |line| {
         line.only(&["row", "runs"])?;
@@ -1143,6 +1295,7 @@ fn parse_frame(fields: &Fields<'_>) -> AttachResult<PaneFrame> {
         decorations,
         title: fields.string("title")?,
         cwd: fields.string("cwd")?,
+        placements: fields.objects("placements", parse_placement)?,
     })
 }
 
@@ -1230,6 +1383,48 @@ pub fn encode_server(message: &ServerMessage) -> AttachResult<Vec<u8>> {
             vec![("code", json!(code)), ("message", json!(message))],
         ),
         ServerMessage::Exit { reason } => ("exit", vec![("reason", json!(reason))]),
+        ServerMessage::Image {
+            pane,
+            image,
+            width,
+            height,
+            bytes,
+        } => (
+            "image",
+            vec![
+                ("pane", json!(pane)),
+                ("image", json!(image)),
+                ("width", json!(width)),
+                ("height", json!(height)),
+                ("bytes", json!(bytes)),
+            ],
+        ),
+        ServerMessage::ImageData {
+            pane,
+            image,
+            offset,
+            data,
+        } => {
+            if data.len() > MAX_IMAGE_CHUNK_BYTES {
+                return Err(AttachError::new(
+                    AttachErrorCode::InvalidField,
+                    "image chunk exceeds 4 MiB",
+                ));
+            }
+            (
+                "image-data",
+                vec![
+                    ("pane", json!(pane)),
+                    ("image", json!(image)),
+                    ("offset", json!(offset)),
+                    ("data", json!(STANDARD.encode(data))),
+                ],
+            )
+        }
+        ServerMessage::ImageRemoved { pane, image } => (
+            "image-removed",
+            vec![("pane", json!(pane)), ("image", json!(image))],
+        ),
     };
     encode_line(kind, fields)
 }
@@ -1276,6 +1471,49 @@ pub fn parse_server(line: &[u8]) -> AttachResult<ServerMessage> {
             only(&["reason"])?;
             Ok(ServerMessage::Exit {
                 reason: fields.string("reason")?,
+            })
+        }
+        "image" => {
+            only(&["pane", "image", "width", "height", "bytes"])?;
+            let (width, height) = (fields.u32("width")?, fields.u32("height")?);
+            if width == 0 {
+                return Err(invalid("width"));
+            }
+            if height == 0 {
+                return Err(invalid("height"));
+            }
+            let bytes = fields.u64("bytes")?;
+            if rgba_len(width, height) != Some(bytes) {
+                return Err(invalid("bytes"));
+            }
+            Ok(ServerMessage::Image {
+                pane: fields.u64("pane")?,
+                image: fields.u32("image")?,
+                width,
+                height,
+                bytes,
+            })
+        }
+        "image-data" => {
+            only(&["pane", "image", "offset", "data"])?;
+            let data = STANDARD
+                .decode(fields.str("data")?)
+                .map_err(|_| invalid("data"))?;
+            if data.is_empty() || data.len() > MAX_IMAGE_CHUNK_BYTES {
+                return Err(invalid("data"));
+            }
+            Ok(ServerMessage::ImageData {
+                pane: fields.u64("pane")?,
+                image: fields.u32("image")?,
+                offset: fields.u64("offset")?,
+                data,
+            })
+        }
+        "image-removed" => {
+            only(&["pane", "image"])?;
+            Ok(ServerMessage::ImageRemoved {
+                pane: fields.u64("pane")?,
+                image: fields.u32("image")?,
             })
         }
         _ => Err(unknown_type(&kind)),
@@ -1485,6 +1723,36 @@ mod tests {
             ],
             title: "vim".into(),
             cwd: "/home/user".into(),
+            placements: vec![
+                FramePlacement {
+                    image: 9,
+                    column: 2,
+                    row: -3,
+                    columns: 4,
+                    rows: 5,
+                    x_offset: 1,
+                    y_offset: 2,
+                    source_x: 0,
+                    source_y: 4,
+                    source_width: 30,
+                    source_height: 40,
+                    z: -1_073_741_825,
+                },
+                FramePlacement {
+                    image: u32::MAX,
+                    column: 0,
+                    row: 7,
+                    columns: 1,
+                    rows: 1,
+                    x_offset: 0,
+                    y_offset: 0,
+                    source_x: 0,
+                    source_y: 0,
+                    source_width: 1,
+                    source_height: 1,
+                    z: 3,
+                },
+            ],
         }
     }
 
@@ -1559,6 +1827,24 @@ mod tests {
             ServerMessage::Exit {
                 reason: "last pane exited".into(),
             },
+            ServerMessage::Image {
+                pane: 2,
+                image: 9,
+                width: 3,
+                height: 2,
+                bytes: 24,
+            },
+            ServerMessage::ImageData {
+                pane: 2,
+                image: 9,
+                offset: 16,
+                data: vec![0, 1, 2, 255, 7, 8, 9, 10],
+            },
+            ServerMessage::ImageRemoved { pane: 2, image: 9 },
+            ServerMessage::Frame(PaneFrame {
+                placements: Vec::new(),
+                ..sample_frame(CursorShape::Beam)
+            }),
         ];
         for shape in [
             CursorShape::Block,
@@ -1663,6 +1949,43 @@ mod tests {
                 .unwrap()
             ),
             json!({"v":1,"type":"copy-text","request":1})
+        );
+        assert_eq!(
+            frame["placements"][0],
+            json!({
+                "image": 9, "column": 2, "row": -3, "columns": 4, "rows": 5,
+                "x_offset": 1, "y_offset": 2, "source_x": 0, "source_y": 4,
+                "source_width": 30, "source_height": 40, "z": -1_073_741_825
+            })
+        );
+        assert_eq!(
+            wire(
+                encode_server(&ServerMessage::Image {
+                    pane: 1,
+                    image: 5,
+                    width: 2,
+                    height: 1,
+                    bytes: 8
+                })
+                .unwrap()
+            ),
+            json!({"v":1,"type":"image","pane":1,"image":5,"width":2,"height":1,"bytes":8})
+        );
+        assert_eq!(
+            wire(
+                encode_server(&ServerMessage::ImageData {
+                    pane: 1,
+                    image: 5,
+                    offset: 4,
+                    data: b"hi".to_vec()
+                })
+                .unwrap()
+            ),
+            json!({"v":1,"type":"image-data","pane":1,"image":5,"offset":4,"data":"aGk="})
+        );
+        assert_eq!(
+            wire(encode_server(&ServerMessage::ImageRemoved { pane: 1, image: 5 }).unwrap()),
+            json!({"v":1,"type":"image-removed","pane":1,"image":5})
         );
     }
 
@@ -1913,6 +2236,33 @@ mod tests {
             (mutate(&["title"], Some(Value::Null)), InvalidField),
             (mutate(&["full"], None), MissingField),
             (mutate(&["extra"], Some(json!(1))), InvalidField),
+            (mutate(&["placements"], None), MissingField),
+            (mutate(&["placements"], Some(json!({}))), InvalidField),
+            (mutate(&["placements", "0", "image"], None), MissingField),
+            (
+                mutate(&["placements", "0", "image"], Some(json!(4_294_967_296u64))),
+                InvalidField,
+            ),
+            (
+                mutate(&["placements", "0", "row"], Some(json!("1"))),
+                InvalidField,
+            ),
+            (
+                mutate(&["placements", "0", "z"], Some(Value::Null)),
+                InvalidField,
+            ),
+            (
+                mutate(&["placements", "0", "columns"], Some(json!(0))),
+                InvalidField,
+            ),
+            (
+                mutate(&["placements", "0", "source_width"], Some(json!(0))),
+                InvalidField,
+            ),
+            (
+                mutate(&["placements", "0", "alpha"], Some(json!(1))),
+                InvalidField,
+            ),
         ];
         for (source, code) in cases {
             assert_eq!(
@@ -1958,6 +2308,47 @@ mod tests {
                 r#"{"v":1,"type":"hello","width":1,"height":1,"cell_width":1,"cell_height":1}"#,
                 UnknownType,
             ),
+            (
+                r#"{"v":1,"type":"image","pane":1,"image":2,"width":2}"#,
+                MissingField,
+            ),
+            (
+                r#"{"v":1,"type":"image","pane":1,"image":2,"width":2,"height":2,"bytes":15}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image","pane":1,"image":2,"width":0,"height":2,"bytes":0}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image","pane":1,"image":-2,"width":1,"height":1,"bytes":4}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image","pane":1,"image":2,"width":1,"height":1,"bytes":4,"format":"rgba"}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image-data","pane":1,"image":2,"offset":0,"data":""}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image-data","pane":1,"image":2,"offset":0,"data":"%%%"}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image-data","pane":1,"image":2,"offset":null,"data":"AA=="}"#,
+                InvalidField,
+            ),
+            (
+                r#"{"v":1,"type":"image-data","pane":1,"image":2,"data":"AA=="}"#,
+                MissingField,
+            ),
+            (r#"{"v":1,"type":"image-removed","pane":1}"#, MissingField),
+            (
+                r#"{"v":1,"type":"image-removed","pane":1,"image":2,"bytes":4}"#,
+                InvalidField,
+            ),
         ];
         for (source, code) in cases {
             assert_eq!(
@@ -1987,6 +2378,63 @@ mod tests {
         assert_eq!(
             encode_client(&oversized).unwrap_err().code,
             AttachErrorCode::LineTooLarge
+        );
+    }
+
+    #[test]
+    fn image_chunks_are_bounded_contiguous_and_rejected_when_oversized() {
+        let oversized = ServerMessage::ImageData {
+            pane: 1,
+            image: 1,
+            offset: 0,
+            data: vec![7; MAX_IMAGE_CHUNK_BYTES + 1],
+        };
+        assert_eq!(
+            encode_server(&oversized).unwrap_err().code,
+            AttachErrorCode::InvalidField
+        );
+        let line = format!(
+            r#"{{"v":1,"type":"image-data","pane":1,"image":1,"offset":0,"data":"{}"}}"#,
+            STANDARD.encode(vec![7; MAX_IMAGE_CHUNK_BYTES + 1])
+        );
+        assert_eq!(
+            parse_server(line.as_bytes()).unwrap_err().code,
+            AttachErrorCode::InvalidField
+        );
+        let rgba: Vec<u8> = (0..MAX_IMAGE_CHUNK_BYTES * 2 + 12)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let chunks: Vec<ServerMessage> = image_data_messages(3, 4, &rgba).collect();
+        assert_eq!(chunks.len(), 3);
+        let mut joined = Vec::new();
+        for message in &chunks {
+            let ServerMessage::ImageData {
+                pane,
+                image,
+                offset,
+                data,
+            } = message
+            else {
+                panic!("expected image data, got {message:?}");
+            };
+            assert_eq!((*pane, *image), (3, 4));
+            assert_eq!(*offset, joined.len() as u64);
+            assert!(!data.is_empty() && data.len() <= MAX_IMAGE_CHUNK_BYTES);
+            let line = encode_server(message).unwrap();
+            assert_eq!(&parse_server(&line).unwrap(), message);
+            joined.extend_from_slice(data);
+        }
+        assert_eq!(joined, rgba);
+        assert_eq!(image_data_messages(3, 4, &[]).count(), 0);
+        assert_eq!(
+            image_announcement(3, 4, 2, 1),
+            ServerMessage::Image {
+                pane: 3,
+                image: 4,
+                width: 2,
+                height: 1,
+                bytes: 8
+            }
         );
     }
 

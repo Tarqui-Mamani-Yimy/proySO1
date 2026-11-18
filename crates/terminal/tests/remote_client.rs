@@ -9,8 +9,8 @@ use so1_terminal::{
     attach::{ClientMessage, ServerMessage},
     control::{ControlCommand, ControlOutcome, ControlRequest, send_request},
     remote::{
-        AttachConnection, FrameOutcome, RemoteEvent, RemoteView, ViewChange, WindowMetrics,
-        ensure_server,
+        AttachConnection, FrameOutcome, ImageChange, RemoteEvent, RemoteView, ViewChange,
+        WindowMetrics, ensure_server,
     },
 };
 use std::{
@@ -184,6 +184,40 @@ fn ensure_server_attach_input_and_detach_keep_the_session_running() {
         }
     }
     assert!(later_seq > first_seq, "output arrived in a later frame");
+
+    // A kitty image printed in the pane reaches the view as complete RGBA data
+    // that the pane's placements reference.
+    connection
+        .send(&ClientMessage::Input {
+            pane: focused,
+            data: b"printf '\\033_Ga=T,f=32,s=1,v=1,i=6,q=2;/wAA/w==\\033\\\\'\n".to_vec(),
+        })
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    let mut ready = false;
+    while !(ready
+        && view
+            .pane(focused)
+            .is_some_and(|pane| pane.placements.iter().any(|p| p.image == 6)))
+    {
+        assert!(Instant::now() < deadline, "image never reached the view");
+        let Ok(event) = events.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        let RemoteEvent::Message(message) = event else {
+            panic!("stream closed early: {event:?}");
+        };
+        if view.apply(message)
+            == (ViewChange::Image {
+                pane: focused,
+                image: 6,
+                change: ImageChange::Ready,
+            })
+        {
+            ready = true;
+        }
+    }
+    assert_eq!(view.image(focused, 6).unwrap().rgba, vec![255, 0, 0, 255]);
 
     connection.detach().unwrap();
     let deadline = Instant::now() + WAIT;

@@ -9,15 +9,24 @@
 //! `Resync`. Each pane yields the same [`PaneRenderInput`] the standalone
 //! window builds from its local model, so both modes share the GPU renderer.
 //!
+//! Kitty images (Phase 5 T11d): the view also reassembles the RGBA images the
+//! server announces ([`ServerMessage::Image`]) from their chunks, checking the
+//! announced size, chunk contiguity, the kitty dimension limit and a total of
+//! [`MAX_CLIENT_IMAGE_BYTES`]. Only complete images are returned by
+//! [`RemoteView::image`]; frame placements that reference an incomplete image
+//! are skipped by the renderer until it completes. Images are dropped on
+//! `ImageRemoved` and when their pane disappears from the layout.
+//!
 //! The view store is platform-independent; the transport needs Unix-domain
 //! sockets, and on other platforms [`ensure_server`] and
 //! [`AttachConnection::attach`] report that persistent sessions are unsupported.
 
 use crate::PaneRenderInput;
 use crate::attach::{
-    ClientMessage, LayoutFrame, LayoutTab, PaneFrame, PaneModes, ServerMessage, cells_from_runs,
-    selection_cells,
+    ClientMessage, FramePlacement, LayoutFrame, LayoutTab, PaneFrame, PaneModes, ServerMessage,
+    cells_from_runs, rgba_len, selection_cells,
 };
+use crate::graphics::{self, DecodedImage};
 use crate::keyboard::KeyboardFlags;
 use crate::layout::{PaneId, PaneLayout, Rect};
 use crate::model::{CellColor, Cursor, VisibleCell};
@@ -25,6 +34,9 @@ use crate::renderer::BlockDecoration;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use vte::ansi::{CursorShape, NamedColor};
+
+/// Most announced image bytes the client keeps at once, like the process image limit.
+pub const MAX_CLIENT_IMAGE_BYTES: u64 = graphics::PROCESS_LIMIT as u64;
 
 /// How long [`ensure_server`] waits for a freshly spawned server to listen.
 pub const SERVER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -52,6 +64,52 @@ pub fn keyboard_flags_from_bits(bits: u8) -> KeyboardFlags {
     .into_iter()
     .filter(|flag| bits & flag.bits() != 0)
     .fold(KeyboardFlags::empty(), |flags, flag| flags | flag)
+}
+
+/// How long the window size must stay unchanged before the client attaches.
+pub const ATTACH_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Delays the attach until the window size has settled.
+///
+/// A new X11 window reports its requested size first, and the window manager
+/// may resize it right after mapping. `Hello` geometry is authoritative: the
+/// server reflows every visible pane to it, and a width reflow drops kitty
+/// placements for good. Attaching with the provisional size would therefore
+/// lose a session's images on re-attach even when the final size matches the
+/// previous one, so the client sends `Hello` only once no resize happened for
+/// [`ATTACH_SETTLE`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachSettle {
+    deadline: Option<std::time::Instant>,
+}
+
+impl AttachSettle {
+    pub fn new(now: std::time::Instant) -> Self {
+        Self {
+            deadline: Some(now + ATTACH_SETTLE),
+        }
+    }
+
+    /// A window resize before attaching restarts the wait.
+    pub fn resized(&mut self, now: std::time::Instant) {
+        if self.deadline.is_some() {
+            self.deadline = Some(now + ATTACH_SETTLE);
+        }
+    }
+
+    /// True once the size was stable for [`ATTACH_SETTLE`] and no attach happened yet.
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// When to check again; `None` after attaching.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
+    pub fn attached(&mut self) {
+        self.deadline = None;
+    }
 }
 
 /// Window pixel size and whole-pixel cell metrics sent in `Hello` and `Resize`.
@@ -107,6 +165,8 @@ pub struct RemotePane {
     pub decorations: Vec<BlockDecoration>,
     pub title: String,
     pub cwd: String,
+    /// Kitty image placements of the latest frame, in drawing order.
+    pub placements: Vec<FramePlacement>,
     seq: u64,
     awaiting_full: bool,
 }
@@ -127,6 +187,7 @@ impl RemotePane {
             decorations: Vec::new(),
             title: String::new(),
             cwd: String::new(),
+            placements: Vec::new(),
             seq,
             awaiting_full: true,
         }
@@ -168,6 +229,7 @@ impl RemotePane {
         self.decorations = frame.decorations;
         self.title = frame.title;
         self.cwd = frame.cwd;
+        self.placements = frame.placements;
         self.seq = frame.seq;
     }
 }
@@ -196,19 +258,87 @@ pub enum ViewChange {
         pane: u64,
         outcome: FrameOutcome,
     },
+    /// An image completed, was removed, or was rejected.
+    Image {
+        pane: u64,
+        image: u32,
+        change: ImageChange,
+    },
 }
 
-/// Pure client-side store of the server's layout and pane frames.
+/// What happened to one image of the view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImageChange {
+    /// Every byte arrived; [`RemoteView::image`] now returns it.
+    Ready,
+    /// The image was removed.
+    Removed,
+    /// The image was dropped because its data broke the protocol bounds.
+    Rejected(String),
+}
+
+/// One image being received, or complete.
+#[derive(Clone, Debug)]
+enum RemoteImage {
+    Receiving {
+        width: u32,
+        height: u32,
+        bytes: u64,
+        data: Vec<u8>,
+    },
+    Ready(DecodedImage),
+}
+
+impl RemoteImage {
+    fn announced_bytes(&self) -> u64 {
+        match self {
+            Self::Receiving { bytes, .. } => *bytes,
+            Self::Ready(image) => image.rgba.len() as u64,
+        }
+    }
+}
+
+/// Pure client-side store of the server's layout, pane frames and images.
 #[derive(Clone, Debug, Default)]
 pub struct RemoteView {
     layout: Option<LayoutFrame>,
     panes: BTreeMap<u64, RemotePane>,
+    images: BTreeMap<(u64, u32), RemoteImage>,
+    /// Sum of announced bytes of every kept image.
+    image_bytes: u64,
+    /// Images dropped for a protocol violation; their remaining chunks are ignored.
+    rejected: std::collections::BTreeSet<(u64, u32)>,
 }
 
 impl RemoteView {
-    /// Applies a layout or frame message; other messages are not view state.
+    /// Applies a layout, frame or image message; other messages are not view state.
     pub fn apply(&mut self, message: ServerMessage) -> ViewChange {
         match message {
+            ServerMessage::Image {
+                pane,
+                image,
+                width,
+                height,
+                bytes,
+            } => self.announce_image(pane, image, width, height, bytes),
+            ServerMessage::ImageData {
+                pane,
+                image,
+                offset,
+                data,
+            } => self.receive_image_data(pane, image, offset, data),
+            ServerMessage::ImageRemoved { pane, image } => {
+                self.rejected.remove(&(pane, image));
+                if self.remove_image(pane, image) {
+                    ViewChange::Image {
+                        pane,
+                        image,
+                        change: ImageChange::Removed,
+                    }
+                } else {
+                    ViewChange::None
+                }
+            }
             ServerMessage::Layout(layout) => ViewChange::Layout {
                 removed: self.apply_layout(layout),
             },
@@ -239,8 +369,151 @@ impl RemoteView {
         for pane in &removed {
             self.panes.remove(pane);
         }
+        let gone: Vec<(u64, u32)> = self
+            .images
+            .keys()
+            .chain(self.rejected.iter())
+            .copied()
+            .filter(|(pane, _)| !live.contains(pane))
+            .collect();
+        for (pane, image) in gone {
+            self.remove_image(pane, image);
+            self.rejected.remove(&(pane, image));
+        }
         self.layout = Some(layout);
         removed
+    }
+
+    /// Complete RGBA data of a pane's image; `None` while chunks are in flight.
+    pub fn image(&self, pane: u64, image: u32) -> Option<&DecodedImage> {
+        match self.images.get(&(pane, image))? {
+            RemoteImage::Ready(decoded) => Some(decoded),
+            RemoteImage::Receiving { .. } => None,
+        }
+    }
+
+    fn remove_image(&mut self, pane: u64, image: u32) -> bool {
+        match self.images.remove(&(pane, image)) {
+            Some(removed) => {
+                self.image_bytes -= removed.announced_bytes();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn reject(&mut self, pane: u64, image: u32, reason: String) -> ViewChange {
+        self.remove_image(pane, image);
+        self.rejected.insert((pane, image));
+        ViewChange::Image {
+            pane,
+            image,
+            change: ImageChange::Rejected(reason),
+        }
+    }
+
+    /// Starts (or restarts) receiving an image; the previous data is replaced.
+    fn announce_image(
+        &mut self,
+        pane: u64,
+        image: u32,
+        width: u32,
+        height: u32,
+        bytes: u64,
+    ) -> ViewChange {
+        self.remove_image(pane, image);
+        self.rejected.remove(&(pane, image));
+        if width == 0
+            || height == 0
+            || width > graphics::DIMENSION_LIMIT
+            || height > graphics::DIMENSION_LIMIT
+            || rgba_len(width, height) != Some(bytes)
+        {
+            return self.reject(
+                pane,
+                image,
+                format!("image {image} of pane {pane} has invalid dimensions {width}x{height}"),
+            );
+        }
+        if self.image_bytes.saturating_add(bytes) > MAX_CLIENT_IMAGE_BYTES {
+            return self.reject(
+                pane,
+                image,
+                format!("image {image} of pane {pane} exceeds the 512 MiB client image limit"),
+            );
+        }
+        self.image_bytes += bytes;
+        self.images.insert(
+            (pane, image),
+            RemoteImage::Receiving {
+                width,
+                height,
+                bytes,
+                data: Vec::new(),
+            },
+        );
+        ViewChange::None
+    }
+
+    /// Appends one chunk; completes the image after its last byte.
+    fn receive_image_data(
+        &mut self,
+        pane: u64,
+        image: u32,
+        offset: u64,
+        chunk: Vec<u8>,
+    ) -> ViewChange {
+        if self.rejected.contains(&(pane, image)) {
+            return ViewChange::None;
+        }
+        let Some(RemoteImage::Receiving {
+            width,
+            height,
+            bytes,
+            data,
+        }) = self.images.get_mut(&(pane, image))
+        else {
+            return self.reject(
+                pane,
+                image,
+                format!("image data for unannounced image {image} of pane {pane}"),
+            );
+        };
+        if offset != data.len() as u64 {
+            return self.reject(
+                pane,
+                image,
+                format!("image {image} of pane {pane}: chunk at {offset} is not contiguous"),
+            );
+        }
+        if offset.saturating_add(chunk.len() as u64) > *bytes {
+            return self.reject(
+                pane,
+                image,
+                format!("image {image} of pane {pane}: chunk exceeds the announced size"),
+            );
+        }
+        data.extend_from_slice(&chunk);
+        if (data.len() as u64) < *bytes {
+            return ViewChange::None;
+        }
+        let (width, height, rgba) = (*width, *height, std::mem::take(data));
+        match DecodedImage::new(width, height, rgba) {
+            Ok(decoded) => {
+                self.images
+                    .insert((pane, image), RemoteImage::Ready(decoded));
+                ViewChange::Image {
+                    pane,
+                    image,
+                    change: ImageChange::Ready,
+                }
+            }
+            Err(_) => self.reject(
+                pane,
+                image,
+                format!("image {image} of pane {pane} is not valid RGBA data"),
+            ),
+        }
     }
 
     /// Applies one frame following the [`PaneFrame`] sequence rule.
@@ -753,6 +1026,7 @@ mod tests {
             decorations: Vec::new(),
             title: "title".into(),
             cwd: "/tmp".into(),
+            placements: Vec::new(),
         }
     }
 
@@ -1066,6 +1340,258 @@ mod tests {
             }),
             ViewChange::None
         );
+    }
+
+    fn placement(image: u32, z: i32) -> FramePlacement {
+        FramePlacement {
+            image,
+            column: 1,
+            row: -1,
+            columns: 2,
+            rows: 3,
+            x_offset: 0,
+            y_offset: 1,
+            source_x: 0,
+            source_y: 0,
+            source_width: 4,
+            source_height: 4,
+            z,
+        }
+    }
+
+    /// Sends `messages` through the wire codec into `view`, returning each change.
+    fn deliver(view: &mut RemoteView, messages: Vec<ServerMessage>) -> Vec<ViewChange> {
+        messages
+            .into_iter()
+            .map(|message| {
+                let line = crate::attach::encode_server(&message).unwrap();
+                view.apply(crate::attach::parse_server(&line).unwrap())
+            })
+            .collect()
+    }
+
+    fn rejected(change: &ViewChange) -> bool {
+        matches!(
+            change,
+            ViewChange::Image {
+                change: ImageChange::Rejected(_),
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn frames_carry_their_placements_into_the_pane_view() {
+        let mut view = RemoteView::default();
+        let mut full = frame(1, 1, true, Vec::new());
+        full.placements = vec![placement(4, -1), placement(5, 2)];
+        view.apply_frame(full);
+        assert_eq!(
+            view.pane(1).unwrap().placements,
+            vec![placement(4, -1), placement(5, 2)]
+        );
+        // Placements are always complete: a delta replaces them.
+        view.apply_frame(frame(1, 2, false, Vec::new()));
+        assert!(view.pane(1).unwrap().placements.is_empty());
+    }
+
+    #[test]
+    fn images_larger_than_one_chunk_reassemble_exactly_through_the_encoder() {
+        use crate::attach::{MAX_IMAGE_CHUNK_BYTES, image_announcement, image_data_messages};
+        let (width, height) = (1100u32, 1000u32);
+        let rgba: Vec<u8> = (0..(width * height * 4) as usize)
+            .map(|index| (index * 7 % 256) as u8)
+            .collect();
+        assert!(rgba.len() > MAX_IMAGE_CHUNK_BYTES);
+        let mut messages = vec![image_announcement(3, 9, width, height)];
+        messages.extend(image_data_messages(3, 9, &rgba));
+        assert_eq!(messages.len(), 3, "announcement plus two chunks");
+        let mut view = RemoteView::default();
+        let changes = deliver(&mut view, messages);
+        assert_eq!(
+            changes,
+            vec![
+                ViewChange::None,
+                ViewChange::None,
+                ViewChange::Image {
+                    pane: 3,
+                    image: 9,
+                    change: ImageChange::Ready
+                }
+            ]
+        );
+        let image = view.image(3, 9).unwrap();
+        assert_eq!((image.width, image.height), (width, height));
+        assert!(image.rgba == rgba, "reassembled bytes differ");
+        assert!(view.image(3, 8).is_none());
+    }
+
+    #[test]
+    fn incomplete_images_are_not_available_for_rendering() {
+        use crate::attach::image_announcement;
+        let mut view = RemoteView::default();
+        deliver(&mut view, vec![image_announcement(1, 1, 2, 1)]);
+        assert!(view.image(1, 1).is_none());
+        let change = view.apply(ServerMessage::ImageData {
+            pane: 1,
+            image: 1,
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+        });
+        assert_eq!(change, ViewChange::None);
+        assert!(view.image(1, 1).is_none(), "half of the bytes arrived");
+        view.apply(ServerMessage::ImageData {
+            pane: 1,
+            image: 1,
+            offset: 4,
+            data: vec![5, 6, 7, 8],
+        });
+        assert_eq!(view.image(1, 1).unwrap().rgba, (1..=8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn image_chunks_are_bounds_checked_against_the_announcement() {
+        use crate::attach::image_announcement;
+        let chunk = |offset: u64, data: Vec<u8>| ServerMessage::ImageData {
+            pane: 1,
+            image: 1,
+            offset,
+            data,
+        };
+        // Data without an announcement.
+        let mut view = RemoteView::default();
+        assert!(rejected(&view.apply(chunk(0, vec![1; 4]))));
+        // A gap in the offsets drops the image; later chunks are ignored quietly.
+        view.apply(image_announcement(1, 1, 2, 1));
+        assert!(rejected(&view.apply(chunk(4, vec![1; 4]))));
+        assert_eq!(view.apply(chunk(0, vec![1; 4])), ViewChange::None);
+        assert!(view.image(1, 1).is_none());
+        // More bytes than announced.
+        view.apply(image_announcement(1, 1, 2, 1));
+        assert!(rejected(&view.apply(chunk(0, vec![1; 12]))));
+        assert!(view.image(1, 1).is_none());
+        // A new announcement starts over and can complete.
+        view.apply(image_announcement(1, 1, 1, 1));
+        assert_eq!(
+            view.apply(chunk(0, vec![9; 4])),
+            ViewChange::Image {
+                pane: 1,
+                image: 1,
+                change: ImageChange::Ready
+            }
+        );
+        // Dimensions beyond the kitty limit are refused at announcement.
+        assert!(rejected(&view.apply(image_announcement(1, 2, 10_001, 1))));
+    }
+
+    #[test]
+    fn announced_image_bytes_are_capped_like_the_process_image_limit() {
+        use crate::attach::image_announcement;
+        let mut view = RemoteView::default();
+        // 300 MB each: the first fits under 512 MiB, the second does not.
+        assert_eq!(
+            view.apply(image_announcement(1, 1, 10_000, 7_500)),
+            ViewChange::None
+        );
+        assert!(rejected(
+            &view.apply(image_announcement(1, 2, 10_000, 7_500))
+        ));
+        // Replacing an image releases its share first.
+        assert_eq!(
+            view.apply(image_announcement(1, 1, 10_000, 7_500)),
+            ViewChange::None
+        );
+        view.apply(ServerMessage::ImageRemoved { pane: 1, image: 1 });
+        assert_eq!(
+            view.apply(image_announcement(1, 2, 10_000, 7_500)),
+            ViewChange::None
+        );
+        assert_eq!(MAX_CLIENT_IMAGE_BYTES, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn removal_messages_and_vanished_panes_drop_their_images() {
+        use crate::attach::image_announcement;
+        let mut view = RemoteView::default();
+        view.apply(ServerMessage::Layout(two_tab_layout(1)));
+        for (pane, image) in [(1, 1), (2, 1), (2, 2)] {
+            view.apply(image_announcement(pane, image, 1, 1));
+            view.apply(ServerMessage::ImageData {
+                pane,
+                image,
+                offset: 0,
+                data: vec![0; 4],
+            });
+            assert!(view.image(pane, image).is_some());
+        }
+        assert_eq!(
+            view.apply(ServerMessage::ImageRemoved { pane: 2, image: 2 }),
+            ViewChange::Image {
+                pane: 2,
+                image: 2,
+                change: ImageChange::Removed
+            }
+        );
+        assert!(view.image(2, 2).is_none());
+        // Removing an image the client never had is not a view change.
+        assert_eq!(
+            view.apply(ServerMessage::ImageRemoved { pane: 2, image: 2 }),
+            ViewChange::None
+        );
+        let mut layout = two_tab_layout(2);
+        layout.tabs.remove(0);
+        layout.active_tab = 0;
+        view.apply(ServerMessage::Layout(layout));
+        assert!(view.image(1, 1).is_none(), "pane 1 is gone");
+        assert!(view.image(2, 1).is_some());
+    }
+
+    #[test]
+    fn reattach_order_resolves_placements_to_the_complete_image() {
+        use crate::attach::{image_announcement, image_data_messages};
+        // A fresh view after re-attach: layout, then image data, then the full frame.
+        let mut view = RemoteView::default();
+        let rgba: Vec<u8> = (0..48 * 48 * 4).map(|index| (index % 256) as u8).collect();
+        let mut full = frame(2, 1, true, Vec::new());
+        full.placements = vec![placement(3, 0)];
+        let mut messages = vec![
+            ServerMessage::Layout(two_tab_layout(1)),
+            image_announcement(2, 3, 48, 48),
+        ];
+        messages.extend(image_data_messages(2, 3, &rgba));
+        messages.push(ServerMessage::Frame(full));
+        let changes = deliver(&mut view, messages);
+        assert!(changes.contains(&ViewChange::Image {
+            pane: 2,
+            image: 3,
+            change: ImageChange::Ready
+        }));
+        let pane = view.pane(2).unwrap();
+        assert_eq!(pane.placements, vec![placement(3, 0)]);
+        let image = view.image(2, pane.placements[0].image).unwrap();
+        assert_eq!((image.width, image.height), (48, 48));
+        assert!(image.rgba == rgba);
+    }
+
+    #[test]
+    fn attach_waits_until_the_window_size_settles() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut settle = AttachSettle::new(start);
+        assert_eq!(settle.deadline(), Some(start + ATTACH_SETTLE));
+        assert!(!settle.due(start));
+        // A window-manager resize restarts the wait, so `Hello` never carries the provisional size.
+        let resized = start + ATTACH_SETTLE - Duration::from_millis(1);
+        settle.resized(resized);
+        assert!(!settle.due(start + ATTACH_SETTLE));
+        assert!(settle.due(resized + ATTACH_SETTLE));
+        settle.attached();
+        assert_eq!(settle.deadline(), None);
+        assert!(!settle.due(resized + ATTACH_SETTLE * 10));
+        // Resizes after attaching are ordinary `Resize` messages, not new waits.
+        settle.resized(resized + ATTACH_SETTLE * 11);
+        assert_eq!(settle.deadline(), None);
+        assert!(ATTACH_SETTLE <= Duration::from_millis(250));
     }
 
     #[test]

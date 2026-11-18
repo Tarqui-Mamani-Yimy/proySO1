@@ -5,8 +5,7 @@ use glyphon::{
     Cache, Color, FontSystem, Resolution, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer, Viewport,
 };
-use graphics::{GraphicsCompletion, GraphicsProtocol, GraphicsStore, Ingest, PlacementOptions};
-use placements::{CellSize as PlacementCellSize, Placement, PlacementStore, SourceRect};
+use graphics::{DecodeJob, DecodedImage, GraphicsCompletion, GraphicsStore};
 use so1_terminal::control::{
     self as control, ControlCommand, ControlError, ControlErrorCode, ControlOutcome,
     ControlRequest, ControlResponse, ControlServer, TextScope,
@@ -18,6 +17,7 @@ use so1_terminal::{
         SelectionOp, ServerMessage, SplitDirection,
     },
     clamp_surface_size, graphics,
+    graphics_pipeline::{GraphicsHost, PaneGraphics, SharedGraphics, frame_placements},
     keyboard::{
         ImePreeditGate, Key as TerminalKey, KeyEventKind, KeyInput, KeyboardFlags,
         Modifiers as KeyModifiers, encode_ime_commit_with_flags, encode_key_with_flags,
@@ -25,8 +25,10 @@ use so1_terminal::{
     },
     layout::{CellSize, Direction, FocusDirection, PaneId, PaneLayout, Rect, Tab, TabSet},
     model::{Model, ModelEvent},
-    placements,
-    remote::{AttachConnection, FrameOutcome, RemoteEvent, RemoteView, ViewChange, WindowMetrics},
+    remote::{
+        AttachConnection, AttachSettle, FrameOutcome, ImageChange, RemoteEvent, RemoteView,
+        ViewChange, WindowMetrics,
+    },
     renderer::{
         BlockDecorationColor, ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure,
         SurfaceRetryBackoff, WakeupGate, WheelAccumulator, collect_glyph_positions, grid_size,
@@ -39,7 +41,7 @@ use so1_terminal::{
     },
 };
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet},
     ffi::OsString,
     path::PathBuf,
     sync::Arc,
@@ -81,8 +83,8 @@ struct TerminalWindow {
     redraw_pending: bool,
     cursor_position: PhysicalPosition<f64>,
     clipboard: Option<Clipboard>,
-    graphics_store: GraphicsStore,
-    next_graphics_image_id: u32,
+    /// Process-wide kitty image storage of the standalone window's panes.
+    graphics: SharedGraphics,
     _control_server: Option<ControlServer>,
     /// Attached-client state; `None` for the standalone window.
     remote: Option<RemoteClient>,
@@ -98,6 +100,8 @@ struct RemoteClient {
     panes: BTreeMap<PaneId, RemotePaneState>,
     next_request: u64,
     copy_requests: HashSet<u64>,
+    /// Holds the attach back until the window size settled (see [`AttachSettle`]).
+    settle: AttachSettle,
     /// Set once the window detaches or the server reports `Exit`, so the
     /// following end of stream is not reported as a broken connection.
     closing: bool,
@@ -119,8 +123,29 @@ impl RemoteClient {
             panes: BTreeMap::new(),
             next_request: 1,
             copy_requests: HashSet::new(),
+            settle: AttachSettle::new(Instant::now()),
             closing: false,
         }
+    }
+
+    /// Attaches with the settled window metrics; `Hello` is sent by the connection.
+    fn attach(
+        &mut self,
+        metrics: WindowMetrics,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Result<(), String> {
+        self.settle.attached();
+        let connection = AttachConnection::attach(&self.socket, metrics, move |event| {
+            let _ = proxy.send_event(UserEvent::Remote(event));
+        })
+        .map_err(|error| {
+            format!(
+                "could not attach to session socket {}: {error}",
+                self.socket.display()
+            )
+        })?;
+        self.connection = Some(connection);
+        Ok(())
     }
 
     /// Send failures are not reported here: the reader thread observes the
@@ -199,11 +224,7 @@ impl ConsumedKeyPresses {
 struct Pane {
     pty: so1_terminal::pty::Pty,
     model: Model,
-    apc_observer: so1_terminal::apc::Observer,
-    apc_cursor_tracker: ApcCursorTracker,
-    segments: OrderedSegments,
-    graphics_protocol: GraphicsProtocol,
-    placements: PlacementStore,
+    graphics: PaneGraphics,
     title: String,
     explicit_title: Option<String>,
     cwd: PathBuf,
@@ -213,154 +234,119 @@ struct Pane {
     glyphs: GlyphCache,
 }
 
-#[derive(Default)]
-struct ApcCursorTracker {
-    state: ApcCursorState,
-    payload: Vec<u8>,
-    discarding: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ApcCursorState {
-    #[default]
-    Ground,
-    Escape,
-    Apc,
-    ApcEscape,
-    Discard,
-    DiscardEscape,
-}
-
-enum TerminalSegment {
-    Data(Vec<u8>),
-    Apc(Vec<u8>),
-}
-
-/// PTY segments in stream order. While an image decode is in flight, later
-/// segments wait so placement and its cursor movement apply before the text
-/// that follows them, as if the decode had been synchronous.
-#[derive(Default)]
-struct OrderedSegments {
-    pending: VecDeque<TerminalSegment>,
-    decode_in_flight: bool,
-}
-
-impl OrderedSegments {
-    fn extend(&mut self, segments: impl IntoIterator<Item = TerminalSegment>) {
-        self.pending.extend(segments);
-    }
-
-    fn next(&mut self) -> Option<TerminalSegment> {
-        if self.decode_in_flight {
-            return None;
-        }
-        self.pending.pop_front()
-    }
-
-    fn begin_decode(&mut self) {
-        self.decode_in_flight = true;
-    }
-
-    fn finish_decode(&mut self) {
-        self.decode_in_flight = false;
-    }
-}
-
-impl ApcCursorTracker {
-    fn feed(&mut self, bytes: &[u8]) -> Vec<TerminalSegment> {
-        const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
-        let mut segments = Vec::new();
-        let mut data = Vec::new();
-        for &byte in bytes {
-            match self.state {
-                ApcCursorState::Ground => {
-                    if byte == 0x1b {
-                        self.state = ApcCursorState::Escape;
-                    } else {
-                        data.push(byte);
-                    }
+impl Pane {
+    /// Runs queued PTY output through the shared graphics pipeline and the
+    /// model, writing replies and terminal query answers to the PTY.
+    fn apply_output(
+        &mut self,
+        id: PaneId,
+        shared: &mut SharedGraphics,
+        host: &mut dyn GraphicsHost,
+    ) {
+        let Pane {
+            pty,
+            model,
+            graphics,
+            title,
+            explicit_title,
+            cwd,
+            ..
+        } = self;
+        graphics.apply(
+            id,
+            model,
+            shared,
+            host,
+            &mut |reply| {
+                let _ = pty.write(reply);
+            },
+            &mut |event| {
+                if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = event {
+                    let text = String::from_utf8_lossy(&path).into_owned();
+                    *cwd = PathBuf::from(text);
+                    *title = pane_tab_title(cwd, explicit_title.as_deref());
                 }
-                ApcCursorState::Escape => {
-                    if byte == b'_' {
-                        self.payload.clear();
-                        self.discarding = false;
-                        self.state = ApcCursorState::Apc;
-                    } else {
-                        data.extend_from_slice(&[0x1b, byte]);
-                        self.state = if byte == 0x1b {
-                            ApcCursorState::Escape
-                        } else {
-                            ApcCursorState::Ground
-                        };
-                    }
+            },
+        );
+        for ev in model.take_events() {
+            if let Some(new_title) = apply_title_event(cwd, explicit_title, &ev) {
+                *title = new_title;
+                continue;
+            }
+            match ev {
+                ModelEvent::PtyWrite(bytes) => {
+                    let _ = pty.write(&bytes);
                 }
-                ApcCursorState::Apc => match byte {
-                    0x18 | 0x1a => {
-                        self.payload.clear();
-                        self.discarding = false;
-                        self.state = ApcCursorState::Ground;
-                    }
-                    0x1b => self.state = ApcCursorState::ApcEscape,
-                    byte => {
-                        if !self.discarding {
-                            self.payload.push(byte);
-                            if self.payload.len() > MAX_PAYLOAD {
-                                self.payload.clear();
-                                self.discarding = true;
-                                self.state = ApcCursorState::Discard;
-                            }
-                        }
-                    }
-                },
-                ApcCursorState::ApcEscape => {
-                    if byte == b'\\' {
-                        if !self.discarding {
-                            if !data.is_empty() {
-                                segments.push(TerminalSegment::Data(std::mem::take(&mut data)));
-                            }
-                            segments.push(TerminalSegment::Apc(std::mem::take(&mut self.payload)));
-                        }
-                        self.payload.clear();
-                        self.discarding = false;
-                        self.state = ApcCursorState::Ground;
-                    } else if byte == b'_' {
-                        self.payload.clear();
-                        self.discarding = false;
-                        self.state = ApcCursorState::Apc;
-                    } else if byte != 0x1b {
-                        self.payload.clear();
-                        self.discarding = false;
-                        self.state = ApcCursorState::Ground;
-                    }
-                }
-                ApcCursorState::Discard => {
-                    if byte == 0x18 || byte == 0x1a {
-                        self.discarding = false;
-                        self.state = ApcCursorState::Ground;
-                    } else if byte == 0x1b {
-                        self.state = ApcCursorState::DiscardEscape;
-                    }
-                }
-                ApcCursorState::DiscardEscape => {
-                    if byte == b'\\' {
-                        self.discarding = false;
-                        self.state = ApcCursorState::Ground;
-                    } else if byte == b'_' {
-                        self.payload.clear();
-                        self.discarding = false;
-                        self.state = ApcCursorState::Apc;
-                    } else if byte != 0x1b {
-                        self.state = ApcCursorState::Discard;
-                    }
-                }
+                ModelEvent::Title(_) | ModelEvent::ResetTitle => unreachable!(),
+                ModelEvent::Bell | ModelEvent::Other(_) => {}
             }
         }
-        if !data.is_empty() {
-            segments.push(TerminalSegment::Data(data));
-        }
-        segments
     }
 }
+
+/// The window side of the graphics pipeline: images become GPU textures and
+/// decodes report back through the event loop.
+struct WindowGraphicsHost<'a> {
+    gpu: Option<&'a mut GpuState>,
+    proxy: &'a EventLoopProxy<UserEvent>,
+}
+
+impl GraphicsHost for WindowGraphicsHost<'_> {
+    fn cell_size(&self) -> (f32, f32) {
+        self.gpu
+            .as_ref()
+            .map_or((8.0, 16.0), |gpu| (gpu.cell_width, gpu.cell_height))
+    }
+
+    fn image_stored(&mut self, pane: PaneId, id: u32, image: &DecodedImage) -> bool {
+        let Some(gpu) = self.gpu.as_deref_mut() else {
+            return false;
+        };
+        gpu.textures.remove(&(pane, id));
+        upload_image_texture(gpu, pane, id, image)
+    }
+
+    fn image_displayable(&mut self, pane: PaneId, id: u32, image: &DecodedImage) -> bool {
+        let Some(gpu) = self.gpu.as_deref_mut() else {
+            return false;
+        };
+        gpu.textures.contains_key(&(pane, id)) || upload_image_texture(gpu, pane, id, image)
+    }
+
+    fn image_freed(&mut self, pane: PaneId, id: u32) {
+        if let Some(gpu) = self.gpu.as_deref_mut() {
+            gpu.textures.remove(&(pane, id));
+        }
+    }
+
+    fn start_decode(
+        &mut self,
+        pane: PaneId,
+        anchor: so1_terminal::blocks::GridAnchor,
+        job: DecodeJob,
+    ) {
+        let sender = self.proxy.clone();
+        std::thread::spawn(move || {
+            let completion = graphics::decode_transfer(job);
+            let _ = sender.send_event(UserEvent::GraphicsDecoded(pane, anchor, completion));
+        });
+    }
+}
+
+/// Kitty image data shown in a pane: the server's copy in client mode,
+/// otherwise the window's own store.
+fn pane_image<'a>(
+    remote: Option<&'a RemoteView>,
+    store: &'a GraphicsStore,
+    pane: PaneId,
+    id: u32,
+) -> Option<&'a DecodedImage> {
+    match remote {
+        Some(view) => view.image(pane.0, id),
+        None => store.get(pane, id),
+    }
+}
+
 struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -557,103 +543,6 @@ fn block_marker_bounds(cell_width: f32, cell_height: f32) -> [f32; 4] {
         cell_width,
         (cell_height - 2.0).max(top),
     ]
-}
-
-fn placement_from_options(
-    image_id: u32,
-    options: PlacementOptions,
-    anchor: so1_terminal::blocks::GridAnchor,
-    image: (u32, u32),
-    cell: (f32, f32),
-) -> Result<Placement, graphics::GraphicsError> {
-    let (image_width, image_height) = image;
-    let x = options.source.0.min(image_width);
-    let y = options.source.1.min(image_height);
-    let width = if options.source.2 == 0 {
-        image_width.saturating_sub(x)
-    } else {
-        options.source.2.min(image_width.saturating_sub(x))
-    };
-    let height = if options.source.3 == 0 {
-        image_height.saturating_sub(y)
-    } else {
-        options.source.3.min(image_height.saturating_sub(y))
-    };
-    if width == 0 || height == 0 || cell.0 <= 0.0 || cell.1 <= 0.0 {
-        return Err(graphics::GraphicsError::invalid_placement());
-    }
-    let columns = options.cells.0.unwrap_or_else(|| {
-        ((options
-            .cells
-            .1
-            .unwrap_or_else(|| ((height as f32 / cell.1).ceil() as usize).max(1)) as f32
-            * cell.1
-            * width as f32
-            / height as f32
-            / cell.0)
-            .ceil() as usize)
-            .max(1)
-    });
-    let rows = options.cells.1.unwrap_or_else(|| {
-        ((options
-            .cells
-            .0
-            .unwrap_or_else(|| ((width as f32 / cell.0).ceil() as usize).max(1)) as f32
-            * cell.0
-            * height as f32
-            / width as f32
-            / cell.1)
-            .ceil() as usize)
-            .max(1)
-    });
-    if options.offset.0 as f32 >= cell.0 || options.offset.1 as f32 >= cell.1 {
-        return Err(graphics::GraphicsError::invalid_placement());
-    }
-    Ok(Placement::new(
-        image_id,
-        options.placement_id,
-        anchor,
-        SourceRect {
-            x,
-            y,
-            width,
-            height,
-        },
-        PlacementCellSize { columns, rows },
-        options.offset,
-        options.z,
-    ))
-}
-
-fn move_cursor_after_placement(model: &mut Model, cells: (usize, usize), no_cursor_move: bool) {
-    if no_cursor_move || cells.0 == 0 || cells.1 == 0 {
-        return;
-    }
-    let mut sequence = Vec::new();
-    let down = cells.1.saturating_sub(1);
-    if down > 0 {
-        sequence.extend_from_slice(format!("\x1b[{down}B").as_bytes());
-    }
-    if cells.0 > 0 {
-        sequence.extend_from_slice(format!("\x1b[{}C", cells.0).as_bytes());
-    }
-    model.feed(&sequence);
-}
-
-fn commit_placement(
-    store: &mut PlacementStore,
-    model: &mut Model,
-    image_id: u32,
-    options: PlacementOptions,
-    anchor: so1_terminal::blocks::GridAnchor,
-    image: (u32, u32),
-    cell: (f32, f32),
-) -> Result<(), graphics::GraphicsError> {
-    let placement = placement_from_options(image_id, options, anchor, image, cell)?;
-    let size = (placement.cells.columns, placement.cells.rows);
-    store.place(placement);
-    move_cursor_after_placement(model, size, options.no_cursor_move);
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1245,8 +1134,7 @@ impl TerminalWindow {
             redraw_pending: false,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
             clipboard: None,
-            graphics_store: GraphicsStore::new(graphics::PANE_LIMIT, graphics::PROCESS_LIMIT),
-            next_graphics_image_id: 1,
+            graphics: SharedGraphics::default(),
             _control_server: control_server,
             remote: session_socket.map(RemoteClient::new),
         }
@@ -1437,19 +1325,8 @@ impl TerminalWindow {
         });
         self.window = Some(Arc::clone(&window));
         if let Some(remote) = self.remote.as_mut() {
-            let metrics =
-                WindowMetrics::new(width, height, physical_cell_width, physical_cell_height);
-            let proxy = self.proxy.clone();
-            let connection = AttachConnection::attach(&remote.socket, metrics, move |event| {
-                let _ = proxy.send_event(UserEvent::Remote(event));
-            })
-            .map_err(|error| {
-                format!(
-                    "could not attach to session socket {}: {error}",
-                    remote.socket.display()
-                )
-            })?;
-            remote.connection = Some(connection);
+            // The attach itself waits in about_to_wait until the size settled.
+            remote.settle = AttachSettle::new(Instant::now());
         } else {
             self.create_initial_tab(width, height, physical_cell_width, physical_cell_height)?;
         }
@@ -1546,11 +1423,7 @@ impl TerminalWindow {
         Ok(Pane {
             pty,
             model: Model::new(cols, rows),
-            apc_observer: so1_terminal::apc::Observer::default(),
-            apc_cursor_tracker: ApcCursorTracker::default(),
-            segments: OrderedSegments::default(),
-            graphics_protocol: GraphicsProtocol::default(),
-            placements: PlacementStore::default(),
+            graphics: PaneGraphics::default(),
             title: cwd_basename_title(&cwd),
             explicit_title: None,
             cwd,
@@ -1568,6 +1441,11 @@ impl TerminalWindow {
         gpu.config.height = h;
         gpu.surface.configure(&gpu.device, &gpu.config);
         if let Some(remote) = self.remote.as_mut() {
+            if remote.connection.is_none() {
+                // Not attached yet: the settled size goes into `Hello` instead.
+                remote.settle.resized(Instant::now());
+                return;
+            }
             // The server adopts the window metrics and answers with layout and full frames.
             for state in remote.panes.values_mut() {
                 state.glyphs.invalidate();
@@ -1585,12 +1463,8 @@ impl TerminalWindow {
         for layout in layouts {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
                 if !layout.hidden {
-                    let (old_cols, old_rows) = pane.model.grid_dimensions();
-                    pane.model
-                        .resize(layout.cols as usize, layout.rows as usize);
-                    pane.placements.resize(
-                        old_cols,
-                        old_rows,
+                    pane.graphics.resize_model(
+                        &mut pane.model,
                         layout.cols as usize,
                         layout.rows as usize,
                     );
@@ -1738,7 +1612,7 @@ impl TerminalWindow {
                 .as_mut()
                 .is_none_or(|tabs| close_pane_lifecycle(tabs, pane));
             self.panes.remove(&pane);
-            self.graphics_store.remove_pane(pane);
+            self.graphics.store.remove_pane(pane);
             if close_window {
                 event_loop.exit();
                 return;
@@ -1842,12 +1716,12 @@ impl TerminalWindow {
             .is_none_or(|tabs| close_pane_lifecycle(tabs, pane_id));
         if close_window {
             self.panes.remove(&pane_id);
-            self.graphics_store.remove_pane(pane_id);
+            self.graphics.store.remove_pane(pane_id);
             event_loop.exit();
             return;
         }
         self.panes.remove(&pane_id);
-        self.graphics_store.remove_pane(pane_id);
+        self.graphics.store.remove_pane(pane_id);
         if let Some(gpu) = self.gpu.as_ref() {
             self.resize(gpu.config.width, gpu.config.height);
         }
@@ -2009,10 +1883,10 @@ impl TerminalWindow {
                 }
                 let close_window = close_pane_lifecycle(tabs, pane_id);
                 self.panes.remove(&pane_id);
-                self.graphics_store.remove_pane(pane_id);
+                self.graphics.store.remove_pane(pane_id);
                 if close_window {
                     self.panes.clear();
-                    self.graphics_store = GraphicsStore::default();
+                    self.graphics.store = GraphicsStore::default();
                     if let Some(gpu) = self.gpu.as_mut() {
                         gpu.textures.clear();
                     }
@@ -2111,7 +1985,7 @@ impl TerminalWindow {
             so1_terminal::layout::TabCloseResult::LastTab
         ) {
             self.panes.clear();
-            self.graphics_store = GraphicsStore::default();
+            self.graphics.store = GraphicsStore::default();
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.textures.clear();
             }
@@ -2120,7 +1994,7 @@ impl TerminalWindow {
         }
         for pane in panes {
             self.panes.remove(&pane);
-            self.graphics_store.remove_pane(pane);
+            self.graphics.store.remove_pane(pane);
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.textures
                     .retain(|(cached_pane, _), _| *cached_pane != pane);
@@ -2341,6 +2215,26 @@ impl TerminalWindow {
                     }
                     FrameOutcome::Ignored => {}
                 },
+                ViewChange::Image {
+                    pane,
+                    image,
+                    change,
+                } => {
+                    let key = (PaneId(pane), image);
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        // A replaced or removed image never keeps its old texture.
+                        gpu.textures.remove(&key);
+                        if change == ImageChange::Ready
+                            && let Some(decoded) = remote.view.image(pane, image)
+                        {
+                            upload_image_texture(gpu, key.0, key.1, decoded);
+                        }
+                    }
+                    if let ImageChange::Rejected(reason) = change {
+                        eprintln!("so1term: dropped kitty image from session server: {reason}");
+                    }
+                    self.request_redraw();
+                }
                 ViewChange::None => {}
             },
             RemoteEvent::Closed(diagnostic) => {
@@ -2473,34 +2367,36 @@ impl TerminalWindow {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut rendered_any = false;
-        let graphics_store = &self.graphics_store;
+        let graphics_store = &self.graphics.store;
+        let (remote_view, mut remote_panes) = match self.remote.as_mut() {
+            Some(remote) => (Some(&remote.view), Some(&mut remote.panes)),
+            None => (None, None),
+        };
         retain_live_textures(&mut gpu.textures, |pane, id| {
-            graphics_store.get(pane, id).is_some()
+            pane_image(remote_view, graphics_store, pane, id).is_some()
         });
         let panes = &mut self.panes;
-        let mut remote = self.remote.as_mut();
         for layout in layouts.iter().filter(|layout| !layout.hidden) {
-            // Both window modes reduce a pane to the same render input; only the
-            // standalone window has local kitty placements to draw.
-            let (input, glyphs, local) = if let Some(remote) = remote.as_mut() {
-                let Some(view) = remote.view.pane(layout.pane.0) else {
-                    continue;
+            // Both window modes reduce a pane to the same render input and the
+            // same projected kitty placements, so the GPU code is shared.
+            let (input, glyphs, frame_images) =
+                if let (Some(view), Some(remote_panes)) = (remote_view, remote_panes.as_mut()) {
+                    let Some(pane_view) = view.pane(layout.pane.0) else {
+                        continue;
+                    };
+                    (
+                        pane_view.render_input(),
+                        &mut remote_panes.entry(layout.pane).or_default().glyphs,
+                        pane_view.placements.clone(),
+                    )
+                } else {
+                    let Some(pane) = panes.get_mut(&layout.pane) else {
+                        continue;
+                    };
+                    let input = PaneRenderInput::from_model(&pane.model);
+                    let images = frame_placements(&pane.graphics.placements, &pane.model);
+                    (input, &mut pane.glyphs, images)
                 };
-                let input = view.render_input();
-                (input, &mut remote.pane_state(layout.pane).glyphs, None)
-            } else {
-                let Some(pane) = panes.get_mut(&layout.pane) else {
-                    continue;
-                };
-                let input = PaneRenderInput::from_model(&pane.model);
-                let Pane {
-                    glyphs,
-                    placements,
-                    model,
-                    ..
-                } = pane;
-                (input, glyphs, Some((&*placements, &*model)))
-            };
             let cells = input.render_cells();
             gpu.vertices.clear();
             let width = gpu.config.width as f32;
@@ -2679,53 +2575,32 @@ impl TerminalWindow {
                     &mut gpu.swash_cache,
                 )
                 .map_err(|error| format!("could not prepare pane text: {error}"))?;
-            // Kitty graphics are not shown in client mode until the server sends image blobs (T11d).
-            let (visible_placements, top_row) = match local {
-                Some((pane_placements, model)) => {
-                    let screen = if model.alternate_screen_active() {
-                        so1_terminal::blocks::GridScreen::Alternate
-                    } else {
-                        so1_terminal::blocks::GridScreen::Primary
-                    };
-                    let top_row = model.visible_stable_top_row();
-                    let (columns, viewport_rows) = model.grid_dimensions();
-                    let visible = pane_placements.visible(placements::Viewport {
-                        screen,
-                        top_row,
-                        rows: viewport_rows,
-                        columns,
-                    });
-                    (visible, top_row)
-                }
-                None => (Vec::new(), 0),
-            };
-            let layer_items: Vec<_> = visible_placements
+            // Placements arrive sorted by z and placement order, so the list
+            // position breaks z ties exactly like the placement insertion order.
+            let layer_items: Vec<_> = frame_images
                 .iter()
-                .map(|entry| so1_terminal::renderer::ImageLayerItem {
-                    z: entry.placement.z,
-                    insertion: entry.placement.insertion_order(),
-                })
+                .enumerate()
+                .map(
+                    |(index, placement)| so1_terminal::renderer::ImageLayerItem {
+                        z: placement.z,
+                        insertion: index as u64,
+                    },
+                )
                 .collect();
             let buckets = so1_terminal::renderer::bucket_image_layers(&layer_items);
             gpu.image_vertices.clear();
             let mut draw_layer = |indices: &[usize]| -> Vec<TextureDraw> {
                 let mut draws = Vec::new();
                 for &index in indices {
-                    let entry = &visible_placements[index];
-                    let key = (layout.pane, entry.placement.image_id);
-                    let Some(image) = graphics_store.get(key.0, key.1) else {
+                    let placement = &frame_images[index];
+                    let key = (layout.pane, placement.image);
+                    // Images still in flight (client mode) are skipped until complete.
+                    let Some(image) = pane_image(remote_view, graphics_store, key.0, key.1) else {
                         continue;
                     };
                     if !gpu.textures.contains_key(&key) {
                         continue;
                     }
-                    let anchor_row = entry
-                        .placement
-                        .anchor
-                        .line
-                        .saturating_sub(top_row)
-                        .clamp(i32::MIN as i64, i32::MAX as i64)
-                        as i32;
                     let quad = so1_terminal::renderer::project_image_quad(
                         so1_terminal::renderer::ImageQuadInput {
                             pane: so1_terminal::renderer::PixelRect {
@@ -2736,16 +2611,16 @@ impl TerminalWindow {
                             },
                             cell: (gpu.cell_width, gpu.cell_height),
                             anchor: (
-                                entry.placement.anchor.column.min(i32::MAX as usize) as i32,
-                                anchor_row,
+                                placement.column.min(i32::MAX as usize) as i32,
+                                placement.row,
                             ),
-                            cells: (entry.placement.cells.columns, entry.placement.cells.rows),
-                            pixel_offset: entry.placement.pixel_offset,
+                            cells: (placement.columns, placement.rows),
+                            pixel_offset: (placement.x_offset, placement.y_offset),
                             source: (
-                                entry.placement.source.x,
-                                entry.placement.source.y,
-                                entry.placement.source.width,
-                                entry.placement.source.height,
+                                placement.source_x,
+                                placement.source_y,
+                                placement.source_width,
+                                placement.source_height,
                             ),
                             image: (image.width, image.height),
                         },
@@ -3109,17 +2984,7 @@ impl TerminalWindow {
         if let Some(pane) = self.panes.get_mut(&pane_id) {
             for bytes in pane.pty.drain_output() {
                 changed = true;
-                let mut accepted_payloads = pane.apc_observer.feed(&bytes).into_iter();
-                let segments =
-                    pane.apc_cursor_tracker.feed(&bytes).into_iter().filter(
-                        |segment| match segment {
-                            TerminalSegment::Data(_) => true,
-                            TerminalSegment::Apc(payload) => {
-                                accepted_payloads.next().as_ref() == Some(payload)
-                            }
-                        },
-                    );
-                pane.segments.extend(segments);
+                pane.graphics.receive(&bytes);
             }
         }
         self.apply_segments(pane_id);
@@ -3138,251 +3003,50 @@ impl TerminalWindow {
     }
 
     fn apply_segments(&mut self, pane_id: PaneId) {
-        let proxy = self.proxy.clone();
-        if let Some(pane) = self.panes.get_mut(&pane_id) {
-            {
-                while let Some(segment) = pane.segments.next() {
-                    match segment {
-                        TerminalSegment::Data(data) => {
-                            let old_screen = if pane.model.alternate_screen_active() {
-                                so1_terminal::blocks::GridScreen::Alternate
-                            } else {
-                                so1_terminal::blocks::GridScreen::Primary
-                            };
-                            for observed in pane.model.feed(&data) {
-                                if let so1_terminal::osc::Event::CurrentDirectory { path, .. } =
-                                    observed.event
-                                {
-                                    let text = String::from_utf8_lossy(&path).into_owned();
-                                    pane.cwd = PathBuf::from(text);
-                                    pane.title =
-                                        pane_tab_title(&pane.cwd, pane.explicit_title.as_deref());
-                                }
-                            }
-                            let new_screen = if pane.model.alternate_screen_active() {
-                                so1_terminal::blocks::GridScreen::Alternate
-                            } else {
-                                so1_terminal::blocks::GridScreen::Primary
-                            };
-                            pane.placements.screen_changed(old_screen, new_screen);
-                            pane.placements
-                                .prune_evicted_primary(pane.model.block_row_base());
-                        }
-                        TerminalSegment::Apc(payload) => {
-                            match pane.graphics_protocol.ingest(&payload) {
-                                Ingest::Ignored | Ingest::Pending => {}
-                                Ingest::Reply(Some(reply)) => {
-                                    let _ = pane.pty.write(&reply);
-                                }
-                                Ingest::Reply(None) => {}
-                                Ingest::Delete(command) => {
-                                    let anchor = pane.model.cursor_anchor();
-                                    let mut selector = command.selector;
-                                    let stable_top = pane.model.visible_stable_top_row();
-                                    let (columns, rows) = pane.model.grid_dimensions();
-                                    match &mut selector {
-                                        placements::DeleteSelector::Cell { row, .. }
-                                        | placements::DeleteSelector::Row { row } => {
-                                            *row = row.saturating_add(stable_top);
-                                        }
-                                        _ => {}
-                                    }
-                                    let freed = pane.placements.delete(
-                                        selector,
-                                        command.frees_data,
-                                        anchor,
-                                        anchor.screen,
-                                        placements::Viewport {
-                                            screen: anchor.screen,
-                                            top_row: stable_top,
-                                            rows,
-                                            columns,
-                                        },
-                                    );
-                                    for id in freed {
-                                        self.graphics_store.remove_image(pane_id, id);
-                                        if let Some(gpu) = self.gpu.as_mut() {
-                                            gpu.textures.remove(&(pane_id, id));
-                                        }
-                                    }
-                                    if let Some(reply) = graphics::reply(&command.response, Ok(()))
-                                    {
-                                        let _ = pane.pty.write(&reply);
-                                    }
-                                }
-                                Ingest::Place(command) => {
-                                    let image_id = command.image_id.or_else(|| {
-                                        command.image_number.and_then(|number| {
-                                            pane.placements.resolve_image_number(number)
-                                        })
-                                    });
-                                    let result = image_id
-                                        .and_then(|id| {
-                                            self.graphics_store
-                                                .get(pane_id, id)
-                                                .map(|image| (id, image))
-                                        })
-                                        .ok_or_else(graphics::GraphicsError::not_found)
-                                        .and_then(|(id, image)| {
-                                            let texture_ready = if let Some(gpu) = self.gpu.as_mut()
-                                            {
-                                                gpu.textures.contains_key(&(pane_id, id))
-                                                    || upload_image_texture(gpu, pane_id, id, image)
-                                            } else {
-                                                false
-                                            };
-                                            if !texture_ready {
-                                                return Err(
-                                                    graphics::GraphicsError::invalid_placement(),
-                                                );
-                                            }
-                                            let anchor = pane.model.cursor_anchor();
-                                            commit_placement(
-                                                &mut pane.placements,
-                                                &mut pane.model,
-                                                id,
-                                                command.options,
-                                                anchor,
-                                                (image.width, image.height),
-                                                (
-                                                    self.gpu
-                                                        .as_ref()
-                                                        .map_or(8.0, |gpu| gpu.cell_width),
-                                                    self.gpu
-                                                        .as_ref()
-                                                        .map_or(16.0, |gpu| gpu.cell_height),
-                                                ),
-                                            )
-                                        });
-                                    if let Some(reply) = graphics::reply(&command.response, result)
-                                    {
-                                        let _ = pane.pty.write(&reply);
-                                    }
-                                }
-                                Ingest::Decode(job) => {
-                                    let anchor = pane.model.cursor_anchor();
-                                    pane.segments.begin_decode();
-                                    let sender = proxy.clone();
-                                    std::thread::spawn(move || {
-                                        let completion = graphics::decode_transfer(job);
-                                        let _ = sender.send_event(UserEvent::GraphicsDecoded(
-                                            pane_id, anchor, completion,
-                                        ));
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                for ev in pane.model.take_events() {
-                    if let Some(title) = apply_title_event(&pane.cwd, &mut pane.explicit_title, &ev)
-                    {
-                        pane.title = title;
-                        continue;
-                    }
-                    match ev {
-                        ModelEvent::PtyWrite(bytes) => {
-                            let _ = pane.pty.write(&bytes);
-                        }
-                        ModelEvent::Title(_) | ModelEvent::ResetTitle => unreachable!(),
-                        ModelEvent::Bell | ModelEvent::Other(_) => {}
-                    }
-                }
-            }
-        }
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        let mut host = WindowGraphicsHost {
+            gpu: self.gpu.as_mut(),
+            proxy: &self.proxy,
+        };
+        pane.apply_output(pane_id, &mut self.graphics, &mut host);
     }
 
     fn finish_graphics(
         &mut self,
         pane_id: PaneId,
         anchor: so1_terminal::blocks::GridAnchor,
-        mut completion: GraphicsCompletion,
+        completion: GraphicsCompletion,
     ) {
-        {
-            let Some(pane) = self.panes.get_mut(&pane_id) else {
-                return;
-            };
-            pane.graphics_protocol.finish_decode();
-            pane.segments.finish_decode();
-            let result = match completion.image {
-                Ok(image) => {
-                    let dimensions = (image.width, image.height);
-                    if completion.action != "q" {
-                        let id = if let Some(id) = completion.response.image_id {
-                            id
-                        } else {
-                            let start = self.next_graphics_image_id;
-                            let mut id = start;
-                            while self.graphics_store.get(pane_id, id).is_some() {
-                                id = id.wrapping_add(1);
-                                if id == start {
-                                    return;
-                                }
-                            }
-                            self.next_graphics_image_id = id.wrapping_add(1);
-                            id
-                        };
-                        if completion.response.image_number.is_some() {
-                            completion.response.image_id = Some(id);
-                        }
-                        if let Err(error) = self.graphics_store.insert(pane_id, id, image) {
-                            Err(error)
-                        } else {
-                            let texture_ready = if let Some(stored_image) =
-                                self.graphics_store.get(pane_id, id)
-                                && let Some(gpu) = self.gpu.as_mut()
-                            {
-                                gpu.textures.remove(&(pane_id, id));
-                                upload_image_texture(gpu, pane_id, id, stored_image)
-                            } else {
-                                false
-                            };
-                            pane.placements
-                                .register_image(id, completion.response.image_number);
-                            pane.placements.retain_images(|image_id| {
-                                self.graphics_store.get(pane_id, image_id).is_some()
-                            });
-                            if completion.action == "T" {
-                                if !texture_ready {
-                                    Err(graphics::GraphicsError::invalid_placement())
-                                } else if let Some(options) = completion.placement {
-                                    commit_placement(
-                                        &mut pane.placements,
-                                        &mut pane.model,
-                                        id,
-                                        options,
-                                        anchor,
-                                        dimensions,
-                                        (
-                                            self.gpu.as_ref().map_or(8.0, |gpu| gpu.cell_width),
-                                            self.gpu.as_ref().map_or(16.0, |gpu| gpu.cell_height),
-                                        ),
-                                    )
-                                } else {
-                                    Err(graphics::GraphicsError::invalid_placement())
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        }
-                    } else {
-                        Ok(())
-                    }
-                }
-                Err(error) => Err(error),
-            };
-            if let Some(bytes) = graphics::reply(&completion.response, result) {
-                let _ = pane.pty.write(&bytes);
-            }
-        }
-        for (evicted_pane, image_id) in self.graphics_store.take_evicted() {
-            if let Some(gpu) = self.gpu.as_mut() {
-                gpu.textures.remove(&(evicted_pane, image_id));
-            }
+        let mut host = WindowGraphicsHost {
+            gpu: self.gpu.as_mut(),
+            proxy: &self.proxy,
+        };
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        let Pane {
+            pty,
+            model,
+            graphics,
+            ..
+        } = pane;
+        graphics.finish_decode(
+            pane_id,
+            anchor,
+            completion,
+            model,
+            &mut self.graphics,
+            &mut host,
+            &mut |reply| {
+                let _ = pty.write(reply);
+            },
+        );
+        for (evicted_pane, image_id) in self.graphics.take_evicted(&mut host) {
             if let Some(pane) = self.panes.get_mut(&evicted_pane) {
-                pane.placements.retain_images(|id| {
-                    id != image_id || self.graphics_store.get(evicted_pane, id).is_some()
-                });
+                pane.graphics
+                    .forget_evicted(evicted_pane, image_id, &self.graphics.store);
             }
         }
     }
@@ -3843,9 +3507,31 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             self.retry_redraw_at = None;
             self.request_redraw();
         }
+        if let (Some(remote), Some(gpu)) = (self.remote.as_mut(), self.gpu.as_ref())
+            && remote.settle.due(now)
+        {
+            let metrics = WindowMetrics::new(
+                gpu.config.width,
+                gpu.config.height,
+                gpu.cell_width,
+                gpu.cell_height,
+            );
+            if let Err(error) = remote.attach(metrics, self.proxy.clone()) {
+                eprintln!("so1term: {error}");
+                remote.closing = true;
+                self.failed = true;
+                event_loop.exit();
+                return;
+            }
+        }
+        let attach_deadline = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.settle.deadline());
         let next_deadline = [
             (!self.panes.is_empty()).then_some(self.next_exit_poll),
             self.retry_redraw_at,
+            attach_deadline,
         ]
         .into_iter()
         .flatten()
@@ -4019,15 +3705,14 @@ fn start_control_server(proxy: EventLoopProxy<UserEvent>) -> Option<ControlServe
 #[cfg(test)]
 mod tests {
     use super::{
-        ApcCursorTracker, BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags,
-        OrderedSegments, PaneAction, PlacementOptions, SourceRect, TabAction, TerminalKey,
-        TerminalSegment, apply_title_event, block_marker_bounds, block_shortcut,
+        BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction,
+        TabAction, TerminalKey, apply_title_event, block_marker_bounds, block_shortcut,
         close_pane_lifecycle, create_tab_with, cwd_basename_title, encode_key_with_flags,
         glyph_key_requires_reshape, invalidate_glyph_cache, key_from_winit, modifier_event_state,
-        move_cursor_after_placement, overlay_vertex_range, pane_action, pane_cell_at,
-        pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title, placement_from_options,
-        retain_live_textures, route_block_shortcut, selection_target, tab_action_changes_geometry,
-        tab_bar_height, tab_content_rect, tab_index_at, tab_shortcut, tab_style,
+        overlay_vertex_range, pane_action, pane_cell_at, pane_exit_needs_redraw,
+        pane_is_in_active_tab, pane_tab_title, retain_live_textures, route_block_shortcut,
+        selection_target, tab_action_changes_geometry, tab_bar_height, tab_content_rect,
+        tab_index_at, tab_shortcut, tab_style,
     };
     use so1_terminal::keyboard::Modifiers;
     use so1_terminal::layout::{PaneId, PaneLayout, Rect};
@@ -4082,45 +3767,6 @@ mod tests {
     }
 
     #[test]
-    fn image_cursor_policy_moves_to_after_bottom_right_only_when_requested() {
-        let mut model = Model::new(10, 5);
-        move_cursor_after_placement(&mut model, (3, 2), false);
-        assert_eq!((model.cursor().column, model.cursor().row), (3, 1));
-        move_cursor_after_placement(&mut model, (2, 2), true);
-        assert_eq!((model.cursor().column, model.cursor().row), (3, 1));
-    }
-
-    #[test]
-    fn apc_boundaries_preserve_text_order_and_cursor_anchor_across_chunk_splits() {
-        let mut tracker = ApcCursorTracker::default();
-        let first = tracker.feed(b"before\x1b_Ga=p,i=7;");
-        assert!(matches!(&first[..], [TerminalSegment::Data(bytes)] if bytes == b"before"));
-        let second = tracker.feed(b"payload\x1b\\after");
-        assert!(
-            matches!(&second[..], [TerminalSegment::Apc(payload), TerminalSegment::Data(bytes)] if payload == b"Ga=p,i=7;payload" && bytes == b"after")
-        );
-    }
-
-    #[test]
-    fn segments_after_an_in_flight_decode_wait_until_it_finishes() {
-        let mut queue = OrderedSegments::default();
-        queue.extend([
-            TerminalSegment::Data(b"before".to_vec()),
-            TerminalSegment::Apc(b"Ga=T;image".to_vec()),
-            TerminalSegment::Data(b"after".to_vec()),
-        ]);
-        assert!(matches!(queue.next(), Some(TerminalSegment::Data(bytes)) if bytes == b"before"));
-        assert!(matches!(queue.next(), Some(TerminalSegment::Apc(_))));
-        queue.begin_decode();
-        queue.extend([TerminalSegment::Data(b"later".to_vec())]);
-        assert!(queue.next().is_none());
-        queue.finish_decode();
-        assert!(matches!(queue.next(), Some(TerminalSegment::Data(bytes)) if bytes == b"after"));
-        assert!(matches!(queue.next(), Some(TerminalSegment::Data(bytes)) if bytes == b"later"));
-        assert!(queue.next().is_none());
-    }
-
-    #[test]
     fn deleted_or_quota_evicted_images_drop_their_cached_texture_keys() {
         let mut cached = std::collections::BTreeMap::from([
             ((PaneId(1), 10), "deleted"),
@@ -4131,49 +3777,6 @@ mod tests {
         assert_eq!(
             cached,
             std::collections::BTreeMap::from([((PaneId(2), 21), "still-live")])
-        );
-    }
-
-    #[test]
-    fn placement_geometry_clips_source_and_derives_missing_display_dimension() {
-        let placement = placement_from_options(
-            9,
-            PlacementOptions {
-                source: (10, 0, 0, 20),
-                cells: (Some(4), None),
-                ..Default::default()
-            },
-            so1_terminal::blocks::GridAnchor {
-                line: 2,
-                column: 3,
-                screen: so1_terminal::blocks::GridScreen::Primary,
-            },
-            (100, 20),
-            (8.0, 16.0),
-        )
-        .unwrap();
-        assert_eq!(
-            placement.source,
-            SourceRect {
-                x: 10,
-                y: 0,
-                width: 90,
-                height: 20
-            }
-        );
-        assert_eq!((placement.cells.columns, placement.cells.rows), (4, 1));
-        assert!(
-            placement_from_options(
-                9,
-                PlacementOptions {
-                    offset: (8, 0),
-                    ..Default::default()
-                },
-                placement.anchor,
-                (100, 20),
-                (8.0, 16.0)
-            )
-            .is_err()
         );
     }
 

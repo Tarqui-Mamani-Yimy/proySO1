@@ -3,6 +3,7 @@ pub use so1_term_core::{
     renderer,
 };
 pub mod control;
+pub mod graphics_pipeline;
 pub mod pty;
 pub mod remote;
 pub mod selection;

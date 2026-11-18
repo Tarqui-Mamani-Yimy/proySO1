@@ -1,4 +1,4 @@
-//! End-to-end tests for the `so1term-server` attach stream (Phase 5 T11b).
+//! End-to-end tests for the `so1term-server` attach stream (Phase 5 T11b/T11d).
 //!
 //! Each test runs the real server binary with an isolated `XDG_RUNTIME_DIR`,
 //! upgrades a control connection with the `attach` request, and drives the
@@ -8,8 +8,8 @@
 use alacritty_terminal::selection::SelectionType;
 use so1_terminal::{
     attach::{
-        BlockOp, ClientMessage, CopySource, LayoutAction, LayoutFrame, PaneFrame, SelectionOp,
-        ServerMessage, SplitDirection, cells_from_runs, encode_client, parse_server,
+        BlockOp, ClientMessage, CopySource, FramePlacement, LayoutAction, LayoutFrame, PaneFrame,
+        SelectionOp, ServerMessage, SplitDirection, cells_from_runs, encode_client, parse_server,
     },
     control::{
         ControlCommand, ControlErrorCode, ControlOutcome, ControlRequest, ControlResponse,
@@ -104,6 +104,9 @@ impl Scratch {
             stream,
             views: BTreeMap::new(),
             layout: None,
+            images: BTreeMap::new(),
+            announcements: Vec::new(),
+            removed: Vec::new(),
         };
         let request = serialize_request(&ControlRequest {
             id: 7,
@@ -132,7 +135,12 @@ impl Scratch {
         };
         let visible = visible_panes(&layout);
         for _ in &visible {
-            let frame = client.expect_frame();
+            // Image data the frames reference precedes them.
+            let frame = client.recv_until("handshake frame", |message| match message {
+                ServerMessage::Frame(frame) => Some(frame.clone()),
+                ServerMessage::Image { .. } | ServerMessage::ImageData { .. } => None,
+                other => panic!("unexpected handshake message {other:?}"),
+            });
             assert!(frame.full, "handshake frames are full");
             assert!(visible.contains(&frame.pane));
         }
@@ -180,6 +188,15 @@ impl Drop for Server {
 struct PaneView {
     seq: u64,
     rows: Vec<String>,
+    placements: Vec<FramePlacement>,
+}
+
+/// Image data received for one (pane, image): announced size and bytes so far.
+struct ReceivedImage {
+    width: u32,
+    height: u32,
+    bytes: u64,
+    data: Vec<u8>,
 }
 
 /// Raw attach-protocol test client.
@@ -188,6 +205,11 @@ struct Client {
     reader: BufReader<UnixStream>,
     views: BTreeMap<u64, PaneView>,
     layout: Option<LayoutFrame>,
+    images: BTreeMap<(u64, u32), ReceivedImage>,
+    /// Every `Image` announcement, in arrival order.
+    announcements: Vec<(u64, u32)>,
+    /// Every `ImageRemoved`, in arrival order.
+    removed: Vec<(u64, u32)>,
 }
 
 impl Client {
@@ -215,12 +237,72 @@ impl Client {
                 }
                 self.layout = Some(layout.clone());
             }
+            ServerMessage::Image {
+                pane,
+                image,
+                width,
+                height,
+                bytes,
+            } => {
+                self.announcements.push((*pane, *image));
+                self.images.insert(
+                    (*pane, *image),
+                    ReceivedImage {
+                        width: *width,
+                        height: *height,
+                        bytes: *bytes,
+                        data: Vec::new(),
+                    },
+                );
+            }
+            ServerMessage::ImageData {
+                pane,
+                image,
+                offset,
+                data,
+            } => {
+                let received = self
+                    .images
+                    .get_mut(&(*pane, *image))
+                    .expect("image data after its announcement");
+                assert_eq!(*offset, received.data.len() as u64, "chunks are contiguous");
+                received.data.extend_from_slice(data);
+                assert!(received.data.len() as u64 <= received.bytes);
+            }
+            ServerMessage::ImageRemoved { pane, image } => {
+                self.removed.push((*pane, *image));
+                self.images.remove(&(*pane, *image));
+            }
             _ => {}
         }
         message
     }
 
+    /// Complete RGBA data of an image, once every chunk arrived.
+    fn image(&self, pane: u64, image: u32) -> Option<(u32, u32, &[u8])> {
+        let received = self.images.get(&(pane, image))?;
+        (received.data.len() as u64 == received.bytes).then_some((
+            received.width,
+            received.height,
+            received.data.as_slice(),
+        ))
+    }
+
+    fn placements(&self, pane: u64) -> Vec<FramePlacement> {
+        self.views
+            .get(&pane)
+            .map(|view| view.placements.clone())
+            .unwrap_or_default()
+    }
+
     fn apply(&mut self, frame: &PaneFrame) {
+        for placement in &frame.placements {
+            assert!(
+                self.images.contains_key(&(frame.pane, placement.image)),
+                "image {} is announced before a frame references it",
+                placement.image
+            );
+        }
         let rows: Vec<String> = frame
             .lines
             .iter()
@@ -241,6 +323,7 @@ impl Client {
                 PaneView {
                     seq: frame.seq,
                     rows: view,
+                    placements: frame.placements.clone(),
                 },
             );
         } else {
@@ -250,6 +333,7 @@ impl Client {
                 .expect("delta frame before a full frame");
             assert_eq!(frame.seq, view.seq + 1, "delta seq must be last+1");
             view.seq = frame.seq;
+            view.placements = frame.placements.clone();
             for (line, text) in frame.lines.iter().zip(rows) {
                 view.rows[line.row] = text;
             }
@@ -760,4 +844,233 @@ fn so1ctl_works_while_attached_and_shutdown_sends_exit() {
     assert_eq!(reason, "shutdown");
     assert!(server.wait_exit().success());
     assert!(!scratch.socket("ctl").exists());
+}
+
+/// One opaque red RGBA pixel, base64.
+const RED_PIXEL: &str = "/wAA/w==";
+
+/// Shell input that prints a 1x1 RGBA kitty image with `a=T` and image id `id`.
+fn print_image(id: u32, extra: &str) -> String {
+    format!("printf '\\033_Ga=T,f=32,s=1,v=1,i={id}{extra};{RED_PIXEL}\\033\\\\'\n")
+}
+
+#[test]
+fn kitty_image_reaches_the_client_once_with_placements_and_the_pty_gets_the_reply() {
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("image");
+    let mut client = scratch.attach_hello("image");
+    let pane = client.focused_pane();
+    // The reply is read back from the terminal and shown with od, so the test
+    // sees exactly the bytes the server wrote to the pane PTY.
+    let command = print_image(1, "").replace("printf", "stty -echo -icanon; printf");
+    let command = format!(
+        "{}; dd bs=1 count=11 2>/dev/null | od -An -c; stty sane\n",
+        command.trim_end()
+    );
+    input(&mut client, pane, &command);
+    client.wait_text(pane, "O   K");
+    let text = client.text(pane);
+    assert!(
+        text.contains("033   _   G   i   =   1   ;   O   K 033"),
+        "PTY reply: {text}"
+    );
+    wait_until_placed(&mut client, pane, 1);
+    assert_eq!(client.image(pane, 1), Some((1, 1, &[255, 0, 0, 255][..])));
+    assert_eq!(
+        client.placements(pane),
+        vec![FramePlacement {
+            image: 1,
+            column: client.placements(pane)[0].column,
+            row: client.placements(pane)[0].row,
+            // A square image in 8x16 px cells keeps its aspect over two columns.
+            columns: 2,
+            rows: 1,
+            x_offset: 0,
+            y_offset: 0,
+            source_x: 0,
+            source_y: 0,
+            source_width: 1,
+            source_height: 1,
+            z: 0,
+        }]
+    );
+    // More output re-sends frames but never the image again.
+    input(&mut client, pane, "echo after-image-$((3+4))\n");
+    client.wait_text(pane, "after-image-7");
+    assert_eq!(client.placements(pane).len(), 1);
+    assert_eq!(client.announcements, vec![(pane, 1)]);
+
+    // An uppercase delete frees the data: placements go away and the client drops it.
+    input(&mut client, pane, "printf '\\033_Ga=d,d=A\\033\\\\'\n");
+    client.recv_until("image removal", |message| match message {
+        ServerMessage::ImageRemoved { pane: p, image: 1 } if *p == pane => Some(()),
+        _ => None,
+    });
+    while !client.placements(pane).is_empty() {
+        client.recv_until("frame without placements", |message| match message {
+            ServerMessage::Frame(frame) if frame.pane == pane => Some(()),
+            _ => None,
+        });
+    }
+    assert_eq!(client.removed, vec![(pane, 1)]);
+    assert!(client.image(pane, 1).is_none());
+}
+
+/// Reads frames until `pane` shows a placement of `image`.
+fn wait_until_placed(client: &mut Client, pane: u64, image: u32) {
+    while !client
+        .placements(pane)
+        .iter()
+        .any(|placement| placement.image == image)
+    {
+        client.recv_until("placement frame", |message| match message {
+            ServerMessage::Frame(frame) if frame.pane == pane => Some(()),
+            _ => None,
+        });
+    }
+}
+
+#[test]
+fn reattach_resends_image_data_before_the_frames_that_place_it() {
+    let scratch = Scratch::new();
+    let mut server = scratch.spawn("reimage");
+    let mut first = scratch.attach_hello("reimage");
+    let pane = first.focused_pane();
+    input(&mut first, pane, &print_image(2, ",q=2"));
+    wait_until_placed(&mut first, pane, 2);
+    assert_eq!(first.announcements, vec![(pane, 2)]);
+    first.send(&ClientMessage::Detach);
+    wait_until("detached stream close", || first.closed());
+    assert!(server.is_running());
+
+    let mut second = None;
+    wait_until("re-attach", || {
+        let (client, reply) = scratch.attach("reimage");
+        let ok = matches!(reply.outcome, ControlOutcome::Success(_));
+        if ok {
+            second = Some(client);
+        }
+        ok
+    });
+    let mut second = second.unwrap();
+    second.send(&HELLO);
+    second.recv_until("welcome", |message| {
+        matches!(message, ServerMessage::Welcome { .. }).then_some(())
+    });
+    // Client::apply asserts the announcement precedes the placing frame.
+    wait_until_placed(&mut second, pane, 2);
+    assert_eq!(second.announcements, vec![(pane, 2)]);
+    assert_eq!(second.image(pane, 2), Some((1, 1, &[255, 0, 0, 255][..])));
+}
+
+/// Kills the attached client without `Detach` (like SIGTERM on the window)
+/// and re-attaches with `hello`, returning the new client after `Welcome`.
+fn reattach_after_kill(
+    scratch: &Scratch,
+    session: &str,
+    first: Client,
+    hello: &ClientMessage,
+) -> Client {
+    drop(first);
+    let mut second = None;
+    wait_until("re-attach", || {
+        let (client, reply) = scratch.attach(session);
+        let ok = matches!(reply.outcome, ControlOutcome::Success(_));
+        if ok {
+            second = Some(client);
+        }
+        ok
+    });
+    let mut second = second.unwrap();
+    second.send(hello);
+    second.recv_until("welcome", |message| {
+        matches!(message, ServerMessage::Welcome { .. }).then_some(())
+    });
+    second
+}
+
+#[test]
+fn reattach_after_a_killed_client_resends_a_multi_row_image_completely() {
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("killimg");
+    let mut first = scratch.attach_hello("killimg");
+    let pane = first.focused_pane();
+    let rgba = cat_image(&scratch, &mut first, pane, 3, 48, 48);
+    wait_until_placed(&mut first, pane, 3);
+    let placed = first.placements(pane);
+    assert_eq!((placed[0].columns, placed[0].rows), (6, 3));
+    let mut second = reattach_after_kill(&scratch, "killimg", first, &HELLO);
+    // Client::apply asserts the announcement precedes the placing frame.
+    wait_until_placed(&mut second, pane, 3);
+    assert_eq!(second.placements(pane), placed);
+    assert_eq!(second.image(pane, 3), Some((48, 48, rgba.as_slice())));
+    assert_eq!(second.announcements, vec![(pane, 3)]);
+}
+
+#[test]
+fn reattach_with_a_new_width_drops_placements_like_a_width_reflow() {
+    // Why the GUI client waits for its window size to settle before `Hello`:
+    // a different width reflows the panes and kitty placements are dropped.
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("widthimg");
+    let mut first = scratch.attach_hello("widthimg");
+    let pane = first.focused_pane();
+    cat_image(&scratch, &mut first, pane, 4, 48, 48);
+    wait_until_placed(&mut first, pane, 4);
+    let wider = ClientMessage::Hello {
+        width: 1000,
+        height: 480,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let mut second = reattach_after_kill(&scratch, "widthimg", first, &wider);
+    let frame = second.recv_until("full frame", |message| match message {
+        ServerMessage::Frame(frame) if frame.pane == pane => Some(frame.clone()),
+        _ => None,
+    });
+    assert!(frame.full);
+    assert_eq!(frame.cols, 125);
+    assert!(frame.placements.is_empty());
+    assert!(
+        second.announcements.is_empty(),
+        "unplaced images are not sent"
+    );
+}
+
+/// Standard base64 through the attach codec (the crate has no direct base64 dependency).
+fn base64_of(bytes: &[u8]) -> String {
+    let line = encode_client(&ClientMessage::Input {
+        pane: 0,
+        data: bytes.to_vec(),
+    })
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+    value["data"].as_str().unwrap().to_owned()
+}
+
+/// Makes the pane shell print a `width` x `height` RGBA kitty image (`a=T`,
+/// `q=2`) from a file, so no shell input line approaches the tty line limit.
+fn cat_image(
+    scratch: &Scratch,
+    client: &mut Client,
+    pane: u64,
+    id: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let rgba: Vec<u8> = (0..width * height)
+        .flat_map(|pixel| [(pixel % 251) as u8, 128, 255, 255])
+        .collect();
+    let sequence = format!(
+        "\x1b_Ga=T,f=32,s={width},v={height},i={id},q=2;{}\x1b\\",
+        base64_of(&rgba)
+    );
+    fs::write(scratch.root.join(format!("image-{id}.apc")), sequence).unwrap();
+    input(
+        client,
+        pane,
+        &format!("cat image-{id}.apc; echo; echo below-$((40+{id}))\n"),
+    );
+    client.wait_text(pane, &format!("below-{}", 40 + id));
+    rgba
 }

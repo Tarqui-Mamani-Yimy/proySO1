@@ -34,6 +34,14 @@
 //!   1024 of them pile up is detached. Socket writes time out after 30 s.
 //! - Detach (message, EOF, I/O error) closes the outbox, shuts the socket down
 //!   so both client threads return, joins the writer, and frees the slot.
+//! - Kitty graphics (T11d): panes run the shared graphics pipeline; image
+//!   decodes run on worker threads that report back as `GraphicsDecoded`
+//!   events. Before a frame that places an image, the image is announced and
+//!   its data sent in chunks, once per image and attached client (a new attach
+//!   starts over). Image lines are never dropped; a client with more than
+//!   256 MiB of them queued gets `IMAGE_BACKLOG` and is detached without
+//!   waiting for its writer. Freed or replaced image data is reported with
+//!   `ImageRemoved` when the client had received it.
 //! - Known limit shared with `send-text`: PTY writes for `Input` are blocking,
 //!   so a shell that stops reading its terminal can stall the loop.
 
@@ -83,17 +91,20 @@ mod unix {
         attach::{
             self, AttachError, AttachErrorCode, ClientMessage, MAX_ATTACH_LINE_BYTES, ServerMessage,
         },
+        blocks::GridAnchor,
         control::{
             self, AttachConnection, AttachHook, ControlError, ControlErrorCode, ControlOutcome,
             ControlRequest, ControlResponse, ControlServer, serialize_response,
         },
+        graphics::GraphicsCompletion,
         layout::PaneId,
         session::{
-            self, AttachFrames, ControlEffect, DEFAULT_COLS, DEFAULT_ROWS, Outbox, OutputNotifier,
-            Session,
+            self, AttachFrames, ControlEffect, DEFAULT_COLS, DEFAULT_ROWS, DecodeNotifier,
+            ImageEvent, Outbox, OutputNotifier, Session,
         },
     };
     use std::{
+        collections::BTreeSet,
         io::{self, BufRead, BufReader, Read, Write},
         net::Shutdown,
         os::unix::net::UnixStream,
@@ -126,6 +137,8 @@ mod unix {
 
     enum Event {
         Output(PaneId),
+        /// A kitty image decode finished on its worker thread.
+        GraphicsDecoded(PaneId, GridAnchor, GraphicsCompletion),
         Control(ControlRequest, mpsc::SyncSender<ControlResponse>),
         /// An upgraded connection whose client slot the attach hook already claimed.
         Attach(AttachConnection),
@@ -320,6 +333,8 @@ mod unix {
         stream: UnixStream,
         outbox: SharedOutbox,
         frames: AttachFrames,
+        /// Images whose data this client received (or has queued).
+        sent_images: BTreeSet<(PaneId, u32)>,
         welcomed: bool,
         inflight: Arc<AtomicUsize>,
         alive: Arc<AtomicBool>,
@@ -343,6 +358,9 @@ mod unix {
         fn handle(&mut self, event: Event) -> Option<&'static str> {
             match event {
                 Event::Output(pane) => self.session.receive_output(pane),
+                Event::GraphicsDecoded(pane, anchor, completion) => {
+                    self.session.finish_graphics(pane, anchor, completion)
+                }
                 Event::Control(request, reply) => {
                     let (response, effect) = self.session.handle_control(request);
                     let _ = reply.send(response);
@@ -427,6 +445,7 @@ mod unix {
                 stream: connection.stream,
                 outbox,
                 frames: AttachFrames::default(),
+                sent_images: BTreeSet::new(),
                 welcomed: false,
                 inflight,
                 alive,
@@ -548,18 +567,41 @@ mod unix {
             }
         }
 
-        /// Sends the layout (when changed) and frames of changed visible panes.
+        /// Sends image removals, the layout (when changed), the image data the
+        /// new frames place, and frames of changed visible panes, in that order.
         fn flush(&mut self) {
+            // Drained every time so the events never pile up without a client.
+            let image_events = self.session.take_image_events();
             let Some(client) = self.client.as_mut() else {
                 return;
             };
             if !client.welcomed {
                 return;
             }
+            let mut removed = Vec::new();
+            for event in image_events {
+                // Replaced data is dropped too and re-sent when a frame places it.
+                let (ImageEvent::Stored(pane, image) | ImageEvent::Freed(pane, image)) = event;
+                if client.sent_images.remove(&(pane, image)) {
+                    removed.push(ServerMessage::ImageRemoved {
+                        pane: pane.0,
+                        image,
+                    });
+                }
+            }
+            client
+                .sent_images
+                .retain(|(pane, _)| self.session.has_pane(*pane));
             let layout = client.frames.layout_message(&self.session);
             let frames = client.frames.frames(&self.session);
+            for message in &removed {
+                self.send(message);
+            }
             if let Some(layout) = layout {
                 self.send(&layout);
+            }
+            if !self.send_placed_images(&frames) {
+                return;
             }
             let mut errors = Vec::new();
             if let Some(client) = self.client.as_mut() {
@@ -589,6 +631,91 @@ mod unix {
             }
             for error in errors {
                 self.send(&error);
+            }
+        }
+
+        /// Queues announcement and data of every image the frames place that
+        /// the client has not received. Returns `false` when the client was
+        /// detached because its image backlog exceeded the outbox budget.
+        fn send_placed_images(&mut self, frames: &[attach::PaneFrame]) -> bool {
+            let Some(client) = self.client.as_mut() else {
+                return false;
+            };
+            let mut overflow = false;
+            'frames: for frame in frames {
+                for placement in &frame.placements {
+                    let key = (PaneId(frame.pane), placement.image);
+                    if client.sent_images.contains(&key) {
+                        continue;
+                    }
+                    let Some(image) = self.session.image(key.0, key.1) else {
+                        continue;
+                    };
+                    let messages = std::iter::once(attach::image_announcement(
+                        frame.pane,
+                        placement.image,
+                        image.width,
+                        image.height,
+                    ))
+                    .chain(attach::image_data_messages(
+                        frame.pane,
+                        placement.image,
+                        &image.rgba,
+                    ));
+                    for message in messages {
+                        let line = match attach::encode_server(&message) {
+                            Ok(line) => line,
+                            Err(error) => {
+                                eprintln!(
+                                    "so1term-server: cannot encode image {} of pane {}: {error}",
+                                    placement.image, frame.pane
+                                );
+                                continue;
+                            }
+                        };
+                        let queued = lock(&client.outbox).push_image(line);
+                        client.outbox.1.notify_one();
+                        if !queued {
+                            overflow = true;
+                            break 'frames;
+                        }
+                    }
+                    client.sent_images.insert(key);
+                }
+            }
+            if overflow {
+                self.drop_client_for_image_backlog();
+            }
+            !overflow
+        }
+
+        /// Detaches a client that let too much image data queue up. The outbox
+        /// is replaced by one error line; the writer sends it and exits on its
+        /// own and is not joined, so a stalled client cannot block the loop.
+        fn drop_client_for_image_backlog(&mut self) {
+            let Some(client) = self.client.take() else {
+                return;
+            };
+            eprintln!(
+                "so1term-server: attached client has more than 256 MiB of image data queued; detaching it"
+            );
+            let error = attach::encode_server(&session::attach_error(
+                session::ERROR_IMAGE_BACKLOG,
+                "queued image data exceeds 256 MiB; detaching",
+            ));
+            {
+                let mut outbox = lock(&client.outbox);
+                outbox.discard_all();
+                if let Ok(line) = error {
+                    outbox.push_message(line);
+                }
+                outbox.closed = true;
+            }
+            client.outbox.1.notify_all();
+            client.alive.store(false, Ordering::Release);
+            let _ = client.stream.shutdown(Shutdown::Read);
+            if !self.shutting_down {
+                self.slot.store(false, Ordering::Release);
             }
         }
 
@@ -683,7 +810,11 @@ mod unix {
         let notify: OutputNotifier = Arc::new(move |pane| {
             let _ = output_events.send(Event::Output(pane));
         });
-        let session = match Session::start(DEFAULT_COLS, DEFAULT_ROWS, cwd, notify) {
+        let decode_events = events.clone();
+        let decode: DecodeNotifier = Arc::new(move |pane, anchor, completion| {
+            let _ = decode_events.send(Event::GraphicsDecoded(pane, anchor, completion));
+        });
+        let session = match Session::start(DEFAULT_COLS, DEFAULT_ROWS, cwd, notify, decode) {
             Ok(session) => session,
             Err(error) => {
                 eprintln!("so1term-server: {error}");

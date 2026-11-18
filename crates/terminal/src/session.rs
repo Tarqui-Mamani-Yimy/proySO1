@@ -256,6 +256,13 @@ impl Session {
                 effect = ControlEffect::Shutdown;
                 serde_json::json!({"stopping": true})
             }
+            // Placeholder until T11b implements the attach upgrade in the server.
+            ControlCommand::Attach => {
+                return fail(
+                    ControlErrorCode::OperationRefused,
+                    "attach is not implemented yet".into(),
+                );
+            }
         };
         (
             ControlResponse {

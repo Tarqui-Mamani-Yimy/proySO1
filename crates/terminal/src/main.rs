@@ -1817,6 +1817,12 @@ impl TerminalWindow {
                     "shutdown is only supported by so1term-server".into(),
                 );
             }
+            ControlCommand::Attach => {
+                return fail(
+                    ControlErrorCode::OperationRefused,
+                    "attach is only supported by so1term-server".into(),
+                );
+            }
         };
         ControlResponse {
             id,

@@ -40,6 +40,9 @@ pub enum ControlCommand {
     },
     /// Stops a persistent `so1term-server` session; windows refuse it.
     Shutdown,
+    /// Upgrades this connection to the attach stream (`crate::attach`) of a
+    /// `so1term-server` session; windows refuse it.
+    Attach,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,6 +188,7 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
         "list" if allowed_fields(object, &base) => Ok(ControlCommand::List),
         "new-tab" if allowed_fields(object, &base) => Ok(ControlCommand::NewTab),
         "shutdown" if allowed_fields(object, &base) => Ok(ControlCommand::Shutdown),
+        "attach" if allowed_fields(object, &base) => Ok(ControlCommand::Attach),
         "split" => {
             if !allowed_fields(object, &["v", "id", "cmd", "pane", "direction"]) {
                 return Err(ControlErrorCode::InvalidArguments);
@@ -242,7 +246,7 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
                 scope,
             })
         }
-        "list" | "new-tab" | "shutdown" => Err(ControlErrorCode::InvalidArguments),
+        "list" | "new-tab" | "shutdown" | "attach" => Err(ControlErrorCode::InvalidArguments),
         _ => Err(ControlErrorCode::UnknownCommand),
     }
 }
@@ -321,6 +325,7 @@ pub fn serialize_request(request: &ControlRequest) -> Result<Vec<u8>, serde_json
         ControlCommand::List => ("list", Vec::new()),
         ControlCommand::NewTab => ("new-tab", Vec::new()),
         ControlCommand::Shutdown => ("shutdown", Vec::new()),
+        ControlCommand::Attach => ("attach", Vec::new()),
         ControlCommand::Split { pane, direction } => {
             let mut args = Vec::new();
             if let Some(pane) = pane {
@@ -469,6 +474,7 @@ mod tests {
                 r#"{"v":1,"id":9,"cmd":"shutdown"}"#,
                 ControlCommand::Shutdown,
             ),
+            (r#"{"v":1,"id":10,"cmd":"attach"}"#, ControlCommand::Attach),
             (
                 r#"{"v":1,"id":3,"cmd":"split","direction":"right"}"#,
                 ControlCommand::Split {
@@ -585,6 +591,10 @@ mod tests {
             ),
             (
                 r#"{"v":1,"id":1,"cmd":"shutdown","pane":1}"#,
+                ControlErrorCode::InvalidArguments,
+            ),
+            (
+                r#"{"v":1,"id":1,"cmd":"attach","session":"x"}"#,
                 ControlErrorCode::InvalidArguments,
             ),
         ];

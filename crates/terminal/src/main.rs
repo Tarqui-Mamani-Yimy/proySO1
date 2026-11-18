@@ -12,6 +12,11 @@ use so1_terminal::control::{
     ControlRequest, ControlResponse, ControlServer, TextScope,
 };
 use so1_terminal::{
+    PaneRenderInput,
+    attach::{
+        BlockOp, ClientMessage, CopySource, FocusDirection as RemoteFocusDirection, LayoutAction,
+        SelectionOp, ServerMessage, SplitDirection,
+    },
     clamp_surface_size, graphics,
     keyboard::{
         ImePreeditGate, Key as TerminalKey, KeyEventKind, KeyInput, KeyboardFlags,
@@ -21,10 +26,10 @@ use so1_terminal::{
     layout::{CellSize, Direction, FocusDirection, PaneId, PaneLayout, Rect, Tab, TabSet},
     model::{Model, ModelEvent},
     placements,
+    remote::{AttachConnection, FrameOutcome, RemoteEvent, RemoteView, ViewChange, WindowMetrics},
     renderer::{
-        BlockDecorationColor, BlockViewport, ExitPollBackoff, ExitPollDecision, FrameRecovery,
-        SurfaceFailure, SurfaceRetryBackoff, WakeupGate, WheelAccumulator,
-        apply_selection_highlight, collect_glyph_positions, grid_size, project_block_decorations,
+        BlockDecorationColor, ExitPollBackoff, ExitPollDecision, FrameRecovery, SurfaceFailure,
+        SurfaceRetryBackoff, WakeupGate, WheelAccumulator, collect_glyph_positions, grid_size,
         project_terminal_metrics, unicode_cell_width,
     },
     selection::{PointerAction, PointerButton, PointerState, SelectionGesture, SelectionRouter},
@@ -35,6 +40,7 @@ use so1_terminal::{
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
+    ffi::OsString,
     path::PathBuf,
     sync::Arc,
     time::Instant,
@@ -52,6 +58,7 @@ enum UserEvent {
     PtyOutput(PaneId),
     GraphicsDecoded(PaneId, so1_terminal::blocks::GridAnchor, GraphicsCompletion),
     Control(ControlRequest, std::sync::mpsc::SyncSender<ControlResponse>),
+    Remote(RemoteEvent),
 }
 struct TerminalWindow {
     window: Option<Arc<Window>>,
@@ -77,6 +84,100 @@ struct TerminalWindow {
     graphics_store: GraphicsStore,
     next_graphics_image_id: u32,
     _control_server: Option<ControlServer>,
+    /// Attached-client state; `None` for the standalone window.
+    remote: Option<RemoteClient>,
+}
+
+/// Window state of `so1term --session NAME`: the server owns PTYs and models,
+/// so this holds only the attach stream, the frame store, and per-pane
+/// pointer/glyph state that stays local to the window.
+struct RemoteClient {
+    socket: PathBuf,
+    connection: Option<AttachConnection>,
+    view: RemoteView,
+    panes: BTreeMap<PaneId, RemotePaneState>,
+    next_request: u64,
+    copy_requests: HashSet<u64>,
+    /// Set once the window detaches or the server reports `Exit`, so the
+    /// following end of stream is not reported as a broken connection.
+    closing: bool,
+}
+
+#[derive(Default)]
+struct RemotePaneState {
+    glyphs: GlyphCache,
+    selection_router: SelectionRouter,
+    wheel: WheelAccumulator,
+}
+
+impl RemoteClient {
+    fn new(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            connection: None,
+            view: RemoteView::default(),
+            panes: BTreeMap::new(),
+            next_request: 1,
+            copy_requests: HashSet::new(),
+            closing: false,
+        }
+    }
+
+    /// Send failures are not reported here: the reader thread observes the
+    /// same broken stream and closes the window with one diagnostic.
+    fn send(&self, message: ClientMessage) {
+        if let Some(connection) = &self.connection {
+            let _ = connection.send(&message);
+        }
+    }
+
+    fn request_id(&mut self) -> u64 {
+        let id = self.next_request;
+        self.next_request = self.next_request.wrapping_add(1).max(1);
+        id
+    }
+
+    fn layout(&mut self, action: LayoutAction) {
+        let request = self.request_id();
+        self.send(ClientMessage::Layout { request, action });
+    }
+
+    fn copy(&mut self, pane: PaneId, source: CopySource) {
+        let request = self.request_id();
+        self.copy_requests.insert(request);
+        self.send(ClientMessage::Copy {
+            request,
+            pane: pane.0,
+            source,
+        });
+    }
+
+    fn pane_state(&mut self, pane: PaneId) -> &mut RemotePaneState {
+        self.panes.entry(pane).or_default()
+    }
+}
+
+/// Input modes of the focused pane, from its local model or its latest frame.
+#[derive(Clone, Copy)]
+struct FocusedModes {
+    keyboard_flags: KeyboardFlags,
+    app_cursor: bool,
+    bracketed_paste: bool,
+    alternate_screen: bool,
+}
+
+/// Shaped glyph buffers for one pane, reused across frames.
+#[derive(Default)]
+struct GlyphCache {
+    buffers: Vec<Buffer>,
+    keys: Vec<Option<GlyphKey>>,
+    positions: Vec<(usize, usize)>,
+}
+
+impl GlyphCache {
+    fn invalidate(&mut self) {
+        invalidate_glyph_cache(&mut self.buffers, &mut self.keys, &mut self.positions);
+    }
 }
 
 #[derive(Default)]
@@ -109,9 +210,7 @@ struct Pane {
     wakeup: Arc<WakeupGate>,
     wheel: WheelAccumulator,
     selection_router: SelectionRouter,
-    glyph_buffers: Vec<Buffer>,
-    glyph_keys: Vec<Option<GlyphKey>>,
-    glyph_positions: Vec<(usize, usize)>,
+    glyphs: GlyphCache,
 }
 
 #[derive(Default)]
@@ -1109,15 +1208,22 @@ fn invalidate_glyph_cache<T>(
     glyph_positions.clear();
 }
 impl TerminalWindow {
-    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    /// `session_socket` selects client mode: no local PTYs, models or control
+    /// listener; the window attaches to that session server instead.
+    fn new(proxy: EventLoopProxy<UserEvent>, session_socket: Option<PathBuf>) -> Self {
         let now = Instant::now();
-        let control_server = start_control_server(proxy.clone());
-        if let Some(server) = &control_server {
-            // The value is established before any pane PTY is created and is inherited by every pane shell.
-            unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path().as_os_str()) };
+        let control_server = if session_socket.is_some() {
+            None
         } else {
-            unsafe { std::env::remove_var("SO1TERM_SOCKET") };
-        }
+            let control_server = start_control_server(proxy.clone());
+            if let Some(server) = &control_server {
+                // The value is established before any pane PTY is created and is inherited by every pane shell.
+                unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path().as_os_str()) };
+            } else {
+                unsafe { std::env::remove_var("SO1TERM_SOCKET") };
+            }
+            control_server
+        };
         Self {
             window: None,
             gpu: None,
@@ -1142,6 +1248,7 @@ impl TerminalWindow {
             graphics_store: GraphicsStore::new(graphics::PANE_LIMIT, graphics::PROCESS_LIMIT),
             next_graphics_image_id: 1,
             _control_server: control_server,
+            remote: session_socket.map(RemoteClient::new),
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -1328,37 +1435,24 @@ impl TerminalWindow {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let tabs = TabSet::new(
-            Rect::new(0, 0, width, height),
-            CellSize::new(
-                physical_cell_width.ceil() as u32,
-                physical_cell_height.ceil() as u32,
-            ),
-            4,
-            20,
-            5,
-        );
-        let pane_id = tabs.active().expect("initial tab exists").active_pane();
-        let (cols, rows) = tabs
-            .active()
-            .expect("initial tab exists")
-            .layout()
-            .into_iter()
-            .find(|layout| layout.pane == pane_id && !layout.hidden)
-            .map(|layout| (layout.cols as usize, layout.rows as usize))
-            .unwrap_or_else(|| grid_size(width, height, physical_cell_width, physical_cell_height));
         self.window = Some(Arc::clone(&window));
-        self.tabs = Some(tabs);
-        self.panes.insert(
-            pane_id,
-            Self::create_pane(
-                pane_id,
-                cols,
-                rows,
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                self.proxy.clone(),
-            )?,
-        );
+        if let Some(remote) = self.remote.as_mut() {
+            let metrics =
+                WindowMetrics::new(width, height, physical_cell_width, physical_cell_height);
+            let proxy = self.proxy.clone();
+            let connection = AttachConnection::attach(&remote.socket, metrics, move |event| {
+                let _ = proxy.send_event(UserEvent::Remote(event));
+            })
+            .map_err(|error| {
+                format!(
+                    "could not attach to session socket {}: {error}",
+                    remote.socket.display()
+                )
+            })?;
+            remote.connection = Some(connection);
+        } else {
+            self.create_initial_tab(width, height, physical_cell_width, physical_cell_height)?;
+        }
         self.gpu = Some(GpuState {
             surface,
             device,
@@ -1387,6 +1481,46 @@ impl TerminalWindow {
             image_vertex_buffer,
             image_vertex_buffer_capacity_bytes,
         });
+        Ok(())
+    }
+
+    fn create_initial_tab(
+        &mut self,
+        width: u32,
+        height: u32,
+        physical_cell_width: f32,
+        physical_cell_height: f32,
+    ) -> Result<(), String> {
+        let tabs = TabSet::new(
+            Rect::new(0, 0, width, height),
+            CellSize::new(
+                physical_cell_width.ceil() as u32,
+                physical_cell_height.ceil() as u32,
+            ),
+            4,
+            20,
+            5,
+        );
+        let pane_id = tabs.active().expect("initial tab exists").active_pane();
+        let (cols, rows) = tabs
+            .active()
+            .expect("initial tab exists")
+            .layout()
+            .into_iter()
+            .find(|layout| layout.pane == pane_id && !layout.hidden)
+            .map(|layout| (layout.cols as usize, layout.rows as usize))
+            .unwrap_or_else(|| grid_size(width, height, physical_cell_width, physical_cell_height));
+        self.tabs = Some(tabs);
+        self.panes.insert(
+            pane_id,
+            Self::create_pane(
+                pane_id,
+                cols,
+                rows,
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                self.proxy.clone(),
+            )?,
+        );
         Ok(())
     }
     fn create_pane(
@@ -1423,9 +1557,7 @@ impl TerminalWindow {
             wakeup,
             wheel: WheelAccumulator::default(),
             selection_router: SelectionRouter::default(),
-            glyph_buffers: Vec::new(),
-            glyph_keys: Vec::new(),
-            glyph_positions: Vec::new(),
+            glyphs: GlyphCache::default(),
         })
     }
 
@@ -1435,6 +1567,14 @@ impl TerminalWindow {
         gpu.config.width = w;
         gpu.config.height = h;
         gpu.surface.configure(&gpu.device, &gpu.config);
+        if let Some(remote) = self.remote.as_mut() {
+            // The server adopts the window metrics and answers with layout and full frames.
+            for state in remote.panes.values_mut() {
+                state.glyphs.invalidate();
+            }
+            remote.send(WindowMetrics::new(w, h, gpu.cell_width, gpu.cell_height).resize());
+            return;
+        }
         let Some(tabs) = self.tabs.as_mut() else {
             return;
         };
@@ -1461,11 +1601,7 @@ impl TerminalWindow {
                         layout.rect.height.min(u16::MAX as u32) as u16,
                     );
                 }
-                invalidate_glyph_cache(
-                    &mut pane.glyph_buffers,
-                    &mut pane.glyph_keys,
-                    &mut pane.glyph_positions,
-                );
+                pane.glyphs.invalidate();
             }
         }
     }
@@ -1480,7 +1616,100 @@ impl TerminalWindow {
     }
 
     fn focused_pane_id(&self) -> Option<PaneId> {
+        if let Some(remote) = &self.remote {
+            return remote.view.focused_pane();
+        }
         self.tabs.as_ref()?.active().map(Tab::active_pane)
+    }
+
+    fn tab_count(&self) -> usize {
+        if let Some(remote) = &self.remote {
+            return remote.view.tab_count();
+        }
+        self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len())
+    }
+
+    fn active_tab_index(&self) -> usize {
+        if let Some(remote) = &self.remote {
+            return remote.view.active_tab_index();
+        }
+        self.tabs
+            .as_ref()
+            .and_then(TabSet::active_index)
+            .unwrap_or(0)
+    }
+
+    fn focused_modes(&self) -> Option<FocusedModes> {
+        let focused = self.focused_pane_id()?;
+        if let Some(remote) = &self.remote {
+            let pane = remote.view.pane(focused.0)?;
+            return Some(FocusedModes {
+                keyboard_flags: pane.keyboard_flags(),
+                app_cursor: pane.modes.app_cursor,
+                bracketed_paste: pane.modes.bracketed_paste,
+                alternate_screen: pane.modes.alternate_screen,
+            });
+        }
+        let model = &self.panes.get(&focused)?.model;
+        Some(FocusedModes {
+            keyboard_flags: model.keyboard_flags(),
+            app_cursor: model.application_cursor_keys(),
+            bracketed_paste: model.bracketed_paste_enabled(),
+            alternate_screen: model.alternate_screen_active(),
+        })
+    }
+
+    /// Writes already-encoded input to the focused pane: its PTY locally, or an
+    /// `Input` message that the server writes to the pane PTY.
+    fn write_focused(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let Some(focused) = self.focused_pane_id() else {
+            return Ok(());
+        };
+        if let Some(remote) = &self.remote {
+            remote.send(ClientMessage::Input {
+                pane: focused.0,
+                data: bytes.to_vec(),
+            });
+            return Ok(());
+        }
+        match self.panes.get_mut(&focused) {
+            Some(pane) => pane.pty.write(bytes),
+            None => Ok(()),
+        }
+    }
+
+    /// Local panes follow the live bottom after input; the server does the same
+    /// for every `Input` message, so client mode needs no extra message.
+    fn scroll_focused_to_bottom(&mut self) {
+        if let Some(pane) = self.focused_pane_mut() {
+            pane.model.scroll_to_bottom();
+        }
+    }
+
+    fn selection_router_mut(&mut self, pane: PaneId) -> Option<&mut SelectionRouter> {
+        if let Some(remote) = self.remote.as_mut() {
+            return Some(&mut remote.pane_state(pane).selection_router);
+        }
+        self.panes
+            .get_mut(&pane)
+            .map(|pane| &mut pane.selection_router)
+    }
+
+    fn selection_op(&mut self, pane: PaneId, op: SelectionOp) {
+        if let Some(remote) = &self.remote {
+            remote.send(ClientMessage::Selection { pane: pane.0, op });
+            return;
+        }
+        let Some(pane) = self.panes.get_mut(&pane) else {
+            return;
+        };
+        match op {
+            SelectionOp::Begin { column, row, kind } => {
+                pane.model.begin_selection(column, row, kind)
+            }
+            SelectionOp::Extend { column, row } => pane.model.extend_selection(column, row),
+            SelectionOp::Clear => pane.model.clear_selection(),
+        }
     }
 
     fn focused_pane(&self) -> Option<&Pane> {
@@ -1532,6 +1761,9 @@ impl TerminalWindow {
     }
 
     fn pane_layouts(&self) -> Vec<PaneLayout> {
+        if let Some(remote) = &self.remote {
+            return remote.view.pane_layouts();
+        }
         self.tabs
             .as_ref()
             .and_then(TabSet::active)
@@ -1550,6 +1782,14 @@ impl TerminalWindow {
     }
 
     fn split_focused(&mut self, direction: Direction) -> Result<(), String> {
+        if let Some(remote) = self.remote.as_mut() {
+            let direction = match direction {
+                Direction::Horizontal => SplitDirection::Right,
+                Direction::Vertical => SplitDirection::Down,
+            };
+            remote.layout(LayoutAction::Split { direction });
+            return Ok(());
+        }
         let pane_id = self
             .tabs
             .as_mut()
@@ -1589,6 +1829,10 @@ impl TerminalWindow {
     }
 
     fn close_focused(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.layout(LayoutAction::ClosePane);
+            return;
+        }
         let Some(pane_id) = self.focused_pane_id() else {
             return;
         };
@@ -1612,6 +1856,16 @@ impl TerminalWindow {
     }
 
     fn focus_direction(&mut self, direction: FocusDirection) {
+        if let Some(remote) = self.remote.as_mut() {
+            let direction = match direction {
+                FocusDirection::Left => RemoteFocusDirection::Left,
+                FocusDirection::Right => RemoteFocusDirection::Right,
+                FocusDirection::Up => RemoteFocusDirection::Up,
+                FocusDirection::Down => RemoteFocusDirection::Down,
+            };
+            remote.layout(LayoutAction::FocusDirection { direction });
+            return;
+        }
         if let Some(tab) = self.tabs.as_mut().and_then(TabSet::active_mut) {
             tab.move_focus(direction);
         }
@@ -1620,6 +1874,11 @@ impl TerminalWindow {
 
     fn refresh_window_title(&self) {
         let Some(window) = &self.window else { return };
+        if let Some(remote) = &self.remote {
+            let title = remote.view.active_title().unwrap_or("so1sh");
+            window.set_title(&format!("so1term — {title}"));
+            return;
+        }
         let title = self
             .tabs
             .as_ref()
@@ -1872,6 +2131,16 @@ impl TerminalWindow {
     }
 
     fn apply_tab_action(&mut self, action: TabAction, event_loop: &ActiveEventLoop) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.layout(match action {
+                TabAction::New => LayoutAction::NewTab,
+                TabAction::Close => LayoutAction::CloseTab,
+                TabAction::Next => LayoutAction::NextTab,
+                TabAction::Previous => LayoutAction::PreviousTab,
+                TabAction::Select(index) => LayoutAction::SelectTab { index },
+            });
+            return;
+        }
         let geometry_changed = tab_action_changes_geometry(action);
         match action {
             TabAction::New => {
@@ -1917,6 +2186,11 @@ impl TerminalWindow {
     }
 
     fn copy_selection(&mut self) {
+        if let (Some(focused), Some(remote)) = (self.focused_pane_id(), self.remote.as_mut()) {
+            // The clipboard is set when the matching `CopyText` arrives.
+            remote.copy(focused, CopySource::Selection);
+            return;
+        }
         let Some(text) = self
             .focused_pane()
             .and_then(|pane| pane.model.selection_text())
@@ -1932,6 +2206,15 @@ impl TerminalWindow {
     }
 
     fn copy_block_text(&mut self, input: bool) {
+        if let (Some(focused), Some(remote)) = (self.focused_pane_id(), self.remote.as_mut()) {
+            let source = if input {
+                CopySource::BlockInput
+            } else {
+                CopySource::BlockOutput
+            };
+            remote.copy(focused, source);
+            return;
+        }
         let text = self.focused_pane().and_then(|pane| {
             if input {
                 pane.model.selected_block_input_text()
@@ -1949,6 +2232,21 @@ impl TerminalWindow {
     }
 
     fn handle_block_shortcut(&mut self, action: BlockShortcut) {
+        if let (Some(focused), Some(remote)) = (self.focused_pane_id(), self.remote.as_ref()) {
+            let op = match action {
+                BlockShortcut::Previous => Some(BlockOp::Previous),
+                BlockShortcut::Next => Some(BlockOp::Next),
+                BlockShortcut::Select => Some(BlockOp::Select),
+                BlockShortcut::CopyOutput | BlockShortcut::CopyInput => None,
+            };
+            if let Some(op) = op {
+                remote.send(ClientMessage::Block {
+                    pane: focused.0,
+                    op,
+                });
+                return;
+            }
+        }
         match action {
             BlockShortcut::Previous => {
                 if let Some(pane) = self.focused_pane_mut() {
@@ -1988,44 +2286,158 @@ impl TerminalWindow {
             None => return,
         };
         let bracketed = self
-            .focused_pane()
-            .is_some_and(|pane| pane.model.bracketed_paste_enabled());
+            .focused_modes()
+            .is_some_and(|modes| modes.bracketed_paste);
         let bytes = encode_paste(&text, bracketed);
-        if let Some(pane) = self.focused_pane_mut()
-            && let Err(error) = pane.pty.write(&bytes)
-        {
+        if let Err(error) = self.write_focused(&bytes) {
             eprintln!("so1term: clipboard paste write failed: {error}");
         }
-        if let Some(pane) = self.focused_pane_mut() {
-            pane.model.scroll_to_bottom();
-        }
+        self.scroll_focused_to_bottom();
         self.request_redraw();
+    }
+
+    /// Applies one attach-stream event in client mode.
+    fn remote_event(&mut self, event: RemoteEvent, event_loop: &ActiveEventLoop) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        match event {
+            RemoteEvent::Message(ServerMessage::CopyText { request, text }) => {
+                if remote.copy_requests.remove(&request)
+                    && let Some(text) = text
+                    && let Some(clipboard) = self.clipboard()
+                    && let Err(error) = clipboard.set_text(text)
+                {
+                    eprintln!("so1term: clipboard copy failed: {error}");
+                }
+            }
+            RemoteEvent::Message(ServerMessage::LayoutResult { error, .. }) => {
+                if let Some(error) = error {
+                    eprintln!("so1term: {error}");
+                }
+            }
+            RemoteEvent::Message(ServerMessage::Error { code, message }) => {
+                eprintln!("so1term: session server error ({code}): {message}");
+            }
+            RemoteEvent::Message(ServerMessage::Exit { .. }) => {
+                remote.closing = true;
+                event_loop.exit();
+            }
+            RemoteEvent::Message(message) => match remote.view.apply(message) {
+                ViewChange::Layout { removed } => {
+                    for pane in removed {
+                        remote.panes.remove(&PaneId(pane));
+                        if self.selection_origin == Some(PaneId(pane)) {
+                            self.selection_origin = None;
+                        }
+                    }
+                    self.refresh_window_title();
+                    self.request_redraw();
+                }
+                ViewChange::Frame { pane, outcome } => match outcome {
+                    FrameOutcome::Applied => self.request_redraw(),
+                    FrameOutcome::ResyncNeeded => {
+                        remote.send(ClientMessage::Resync { pane: Some(pane) })
+                    }
+                    FrameOutcome::Ignored => {}
+                },
+                ViewChange::None => {}
+            },
+            RemoteEvent::Closed(diagnostic) => {
+                if !remote.closing {
+                    remote.closing = true;
+                    eprintln!(
+                        "so1term: {}",
+                        diagnostic
+                            .as_deref()
+                            .unwrap_or("session server closed the attach stream")
+                    );
+                    self.failed = true;
+                }
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Wheel in client mode: scrollback on the server, or arrow keys for a
+    /// full-screen application on the alternate screen (alternate scroll).
+    /// Mouse-reporting applications on the primary screen get nothing, as in
+    /// the standalone window.
+    fn remote_wheel(&mut self, delta: MouseScrollDelta) {
+        let Some((pane_id, _, _)) = self.pane_and_cell_at_cursor() else {
+            return;
+        };
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(pane) = remote.view.pane(pane_id.0) else {
+            return;
+        };
+        let (modes, flags) = (pane.modes, pane.keyboard_flags());
+        let line_delta = match delta {
+            MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+            MouseScrollDelta::PixelDelta(pos) => pos.y / 16.0,
+        };
+        let lines = remote.pane_state(pane_id).wheel.push_lines(line_delta);
+        if lines == 0 {
+            return;
+        }
+        if !modes.mouse_or_alternate {
+            remote.send(ClientMessage::Scroll {
+                pane: pane_id.0,
+                lines,
+            });
+        } else if modes.alternate_screen {
+            let key = if lines > 0 {
+                TerminalKey::Up
+            } else {
+                TerminalKey::Down
+            };
+            let Some(bytes) = encode_key_with_flags(
+                KeyInput::new(key),
+                KeyModifiers::default(),
+                modes.app_cursor,
+                flags,
+                KeyEventKind::Press,
+            ) else {
+                return;
+            };
+            remote.send(ClientMessage::Input {
+                pane: pane_id.0,
+                data: bytes.repeat(lines.unsigned_abs() as usize),
+            });
+        }
     }
 
     fn draw(&mut self) -> Result<FrameRecovery, String> {
         let layouts = self.pane_layouts();
         let focused = self.focused_pane_id();
         let tabs = self.tabs.as_ref();
-        let tab_count = tabs.map_or(0, |tabs| tabs.tabs().len());
-        let active_tab_index = tabs.and_then(TabSet::active_index).unwrap_or(0);
+        let tab_count = self.tab_count();
+        let active_tab_index = self.active_tab_index();
         let tab_bar_height = self
             .gpu
             .as_ref()
             .map_or(0, |gpu| tab_bar_height(tab_count, gpu.cell_height));
-        let dividers = tabs.and_then(TabSet::active).map_or_else(Vec::new, |tab| {
-            tab.layout_tree().divider_rects(tab.active_pane())
-        });
-        let tab_labels: Vec<String> = tabs.map_or_else(Vec::new, |tabs| {
-            tabs.tabs()
-                .iter()
-                .map(|tab| {
-                    self.panes
-                        .get(&tab.active_pane())
-                        .map(|pane| pane.title.clone())
-                        .unwrap_or_else(|| "so1sh".into())
-                })
-                .collect()
-        });
+        let (dividers, tab_labels): (Vec<Rect>, Vec<String>) = if let Some(remote) = &self.remote {
+            (remote.view.divider_rects(), remote.view.tab_titles())
+        } else {
+            let dividers = tabs.and_then(TabSet::active).map_or_else(Vec::new, |tab| {
+                tab.layout_tree().divider_rects(tab.active_pane())
+            });
+            let tab_labels = tabs.map_or_else(Vec::new, |tabs| {
+                tabs.tabs()
+                    .iter()
+                    .map(|tab| {
+                        self.panes
+                            .get(&tab.active_pane())
+                            .map(|pane| pane.title.clone())
+                            .unwrap_or_else(|| "so1sh".into())
+                    })
+                    .collect()
+            });
+            (dividers, tab_labels)
+        };
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(FrameRecovery::WaitForEvent);
         };
@@ -2066,19 +2478,30 @@ impl TerminalWindow {
             graphics_store.get(pane, id).is_some()
         });
         let panes = &mut self.panes;
+        let mut remote = self.remote.as_mut();
         for layout in layouts.iter().filter(|layout| !layout.hidden) {
-            let Some(pane) = panes.get_mut(&layout.pane) else {
-                continue;
+            // Both window modes reduce a pane to the same render input; only the
+            // standalone window has local kitty placements to draw.
+            let (input, glyphs, local) = if let Some(remote) = remote.as_mut() {
+                let Some(view) = remote.view.pane(layout.pane.0) else {
+                    continue;
+                };
+                let input = view.render_input();
+                (input, &mut remote.pane_state(layout.pane).glyphs, None)
+            } else {
+                let Some(pane) = panes.get_mut(&layout.pane) else {
+                    continue;
+                };
+                let input = PaneRenderInput::from_model(&pane.model);
+                let Pane {
+                    glyphs,
+                    placements,
+                    model,
+                    ..
+                } = pane;
+                (input, glyphs, Some((&*placements, &*model)))
             };
-            let rows = pane.model.visible_cells();
-            let cursor = pane.model.cursor();
-            let mut cells =
-                so1_terminal::renderer::render_cells(&rows, (cursor.column, cursor.row));
-            for (column, row) in pane.model.selected_cells() {
-                if let Some(cell) = cells.get_mut(row).and_then(|row| row.get_mut(column)) {
-                    apply_selection_highlight(cell);
-                }
-            }
+            let cells = input.render_cells();
             gpu.vertices.clear();
             let width = gpu.config.width as f32;
             let height = gpu.config.height as f32;
@@ -2097,15 +2520,7 @@ impl TerminalWindow {
                 }
             }
             let background_vertices = gpu.vertices.len();
-            let block_viewport = BlockViewport {
-                evicted_rows: pane.model.block_row_base(),
-                history_size: pane.model.history_size(),
-                display_offset: pane.model.display_offset(),
-                first_visible_line: Some(pane.model.visible_top_line()),
-                screen_lines: rows.len(),
-                alternate_screen: pane.model.alternate_screen_active(),
-            };
-            for decoration in project_block_decorations(pane.model.blocks(), block_viewport) {
+            for decoration in &input.decorations {
                 let color = match decoration.color {
                     BlockDecorationColor::Accent => [105, 165, 220],
                     BlockDecorationColor::Success => [80, 200, 120],
@@ -2185,22 +2600,22 @@ impl TerminalWindow {
                     border,
                 );
             }
-            collect_glyph_positions(&cells, &mut pane.glyph_positions);
-            pane.glyph_keys.resize(pane.glyph_positions.len(), None);
-            for (index, &(row, column)) in pane.glyph_positions.iter().enumerate() {
+            collect_glyph_positions(&cells, &mut glyphs.positions);
+            glyphs.keys.resize(glyphs.positions.len(), None);
+            for (index, &(row, column)) in glyphs.positions.iter().enumerate() {
                 let cell = cells[row][column];
-                if index == pane.glyph_buffers.len() {
-                    pane.glyph_buffers.push(Buffer::new(
+                if index == glyphs.buffers.len() {
+                    glyphs.buffers.push(Buffer::new(
                         &mut gpu.font_system,
                         Metrics::new(gpu.font_size, gpu.cell_height),
                     ));
                 }
                 let width_cells = unicode_cell_width(cell.character).max(1);
                 let key = (cell.character, cell.foreground, cell.bold, width_cells);
-                if !glyph_key_requires_reshape(pane.glyph_keys[index], Some(key)) {
+                if !glyph_key_requires_reshape(glyphs.keys[index], Some(key)) {
                     continue;
                 }
-                let buffer = &mut pane.glyph_buffers[index];
+                let buffer = &mut glyphs.buffers[index];
                 buffer.set_size(
                     Some(gpu.cell_width * width_cells as f32),
                     Some(gpu.cell_height),
@@ -2225,7 +2640,7 @@ impl TerminalWindow {
                     None,
                 );
                 buffer.shape_until_scroll(&mut gpu.font_system, true);
-                pane.glyph_keys[index] = Some(key);
+                glyphs.keys[index] = Some(key);
             }
             gpu.viewport.update(
                 &gpu.queue,
@@ -2234,12 +2649,12 @@ impl TerminalWindow {
                     height: gpu.config.height,
                 },
             );
-            let areas: Vec<_> = pane
-                .glyph_positions
+            let areas: Vec<_> = glyphs
+                .positions
                 .iter()
                 .enumerate()
                 .map(|(index, &(row, column))| TextArea {
-                    buffer: &pane.glyph_buffers[index],
+                    buffer: &glyphs.buffers[index],
                     left: layout.rect.x as f32 + column as f32 * gpu.cell_width,
                     top: layout.rect.y as f32 + row as f32 * gpu.cell_height,
                     scale: 1.0,
@@ -2264,19 +2679,26 @@ impl TerminalWindow {
                     &mut gpu.swash_cache,
                 )
                 .map_err(|error| format!("could not prepare pane text: {error}"))?;
-            let screen = if pane.model.alternate_screen_active() {
-                so1_terminal::blocks::GridScreen::Alternate
-            } else {
-                so1_terminal::blocks::GridScreen::Primary
+            // Kitty graphics are not shown in client mode until the server sends image blobs (T11d).
+            let (visible_placements, top_row) = match local {
+                Some((pane_placements, model)) => {
+                    let screen = if model.alternate_screen_active() {
+                        so1_terminal::blocks::GridScreen::Alternate
+                    } else {
+                        so1_terminal::blocks::GridScreen::Primary
+                    };
+                    let top_row = model.visible_stable_top_row();
+                    let (columns, viewport_rows) = model.grid_dimensions();
+                    let visible = pane_placements.visible(placements::Viewport {
+                        screen,
+                        top_row,
+                        rows: viewport_rows,
+                        columns,
+                    });
+                    (visible, top_row)
+                }
+                None => (Vec::new(), 0),
             };
-            let top_row = pane.model.visible_stable_top_row();
-            let (columns, viewport_rows) = pane.model.grid_dimensions();
-            let visible_placements = pane.placements.visible(placements::Viewport {
-                screen,
-                top_row,
-                rows: viewport_rows,
-                columns,
-            });
             let layer_items: Vec<_> = visible_placements
                 .iter()
                 .map(|entry| so1_terminal::renderer::ImageLayerItem {
@@ -2998,11 +3420,19 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 let response = self.control_command(request, event_loop);
                 let _ = reply.send(response);
             }
+            UserEvent::Remote(event) => self.remote_event(event, event_loop),
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                if let Some(remote) = self.remote.as_mut() {
+                    // Detach leaves the session and its shells running on the server.
+                    remote.closing = true;
+                    if let Some(connection) = &remote.connection {
+                        let _ = connection.detach();
+                    }
+                }
                 self.panes.clear();
                 event_loop.exit()
             }
@@ -3039,10 +3469,10 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 self.ime_gate.preedit(&preedit);
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
-                if let Some(pane) = self.focused_pane_mut() {
-                    let bytes = encode_ime_commit_with_flags(&text, pane.model.keyboard_flags());
-                    let _ = pane.pty.write(&bytes);
-                    pane.model.scroll_to_bottom();
+                if let Some(modes) = self.focused_modes() {
+                    let bytes = encode_ime_commit_with_flags(&text, modes.keyboard_flags);
+                    let _ = self.write_focused(&bytes);
+                    self.scroll_focused_to_bottom();
                 }
                 self.request_redraw();
                 self.ime_gate.commit();
@@ -3052,8 +3482,8 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     return;
                 }
                 let flags = self
-                    .focused_pane()
-                    .map_or(KeyboardFlags::empty(), |pane| pane.model.keyboard_flags());
+                    .focused_modes()
+                    .map_or(KeyboardFlags::empty(), |modes| modes.keyboard_flags);
                 if !flags.contains(KeyboardFlags::REPORT_EVENT_TYPES) {
                     return;
                 }
@@ -3065,7 +3495,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 );
                 let modifiers = key_modifiers(self.modifiers, self.caps_lock, self.num_lock);
                 if let Some(mut input) = key
-                    && let Some(pane) = self.focused_pane_mut()
+                    && let Some(modes) = self.focused_modes()
                 {
                     input.associated_text = event.text.as_deref();
                     let modifiers =
@@ -3073,11 +3503,11 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     if let Some(bytes) = encode_key_with_flags(
                         input,
                         modifiers,
-                        pane.model.application_cursor_keys(),
+                        modes.app_cursor,
                         flags,
                         KeyEventKind::Release,
                     ) {
-                        let _ = pane.pty.write(&bytes);
+                        let _ = self.write_focused(&bytes);
                     }
                 }
             }
@@ -3093,12 +3523,8 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     }
                 }
                 let mods = key_modifiers(self.modifiers, self.caps_lock, self.num_lock);
-                let tab_count = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
-                let active_tab_index = self
-                    .tabs
-                    .as_ref()
-                    .and_then(TabSet::active_index)
-                    .unwrap_or(0);
+                let tab_count = self.tab_count();
+                let active_tab_index = self.active_tab_index();
                 if let Some(action) = tab_shortcut(
                     &event.logical_key,
                     mods,
@@ -3113,8 +3539,8 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 let action = block_shortcut(&event.logical_key, mods, cfg!(target_os = "macos"));
                 let action = route_block_shortcut(
                     action,
-                    self.focused_pane()
-                        .is_some_and(|pane| pane.model.alternate_screen_active()),
+                    self.focused_modes()
+                        .is_some_and(|modes| modes.alternate_screen),
                 );
                 if let Some(action) = action {
                     self.handle_block_shortcut(action);
@@ -3149,8 +3575,8 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     None => {}
                 }
                 let kitty_flags = self
-                    .focused_pane()
-                    .map_or(KeyboardFlags::empty(), |pane| pane.model.keyboard_flags());
+                    .focused_modes()
+                    .map_or(KeyboardFlags::empty(), |modes| modes.keyboard_flags);
                 let kitty_active = kitty_flags.intersects(
                     KeyboardFlags::DISAMBIGUATE
                         | KeyboardFlags::REPORT_EVENT_TYPES
@@ -3179,10 +3605,10 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 }
                 let suppress_key =
                     terminal_key.is_some_and(|key| self.ime_gate.suppresses_key(key, mods.control));
-                if let (Some(key), Some(pane)) = (terminal_key, self.focused_pane_mut())
+                if let (Some(key), Some(modes)) = (terminal_key, self.focused_modes())
                     && !suppress_key
                 {
-                    let app_cursor = pane.model.application_cursor_keys();
+                    let app_cursor = modes.app_cursor;
                     let mut input = terminal_input.unwrap_or_else(|| KeyInput::new(key));
                     input.associated_text = event.text.as_deref();
                     let kind = if event.repeat {
@@ -3195,12 +3621,12 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         input,
                         protocol_modifiers,
                         app_cursor,
-                        pane.model.keyboard_flags(),
+                        modes.keyboard_flags,
                         kind,
                     ) {
-                        let _ = pane.pty.write(&bytes);
+                        let _ = self.write_focused(&bytes);
                     }
-                    pane.model.scroll_to_bottom();
+                    self.scroll_focused_to_bottom();
                 }
                 self.request_redraw();
             }
@@ -3224,11 +3650,10 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     self.pane_and_cell_at_cursor()
                 };
                 if let Some((pane_id, column, row)) = endpoint
-                    && let Some(pane) = self.panes.get_mut(&pane_id)
-                    && pane.selection_router.cursor_moved(Some((column, row)))
-                        == PointerAction::Extend
+                    && let Some(router) = self.selection_router_mut(pane_id)
+                    && router.cursor_moved(Some((column, row))) == PointerAction::Extend
                 {
-                    pane.model.extend_selection(column, row);
+                    self.selection_op(pane_id, SelectionOp::Extend { column, row });
                     self.request_redraw();
                 }
             }
@@ -3244,7 +3669,18 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     PointerState::Released
                 };
                 if state == PointerState::Pressed && button == PointerButton::Primary {
-                    let tab_count = self.tabs.as_ref().map_or(0, |tabs| tabs.tabs().len());
+                    let tab_count = self.tab_count();
+                    if let Some(remote) = self.remote.as_mut()
+                        && let Some(gpu) = self.gpu.as_ref()
+                        && self.cursor_position.y >= 0.0
+                        && self.cursor_position.y
+                            < f64::from(tab_bar_height(tab_count, gpu.cell_height))
+                        && let Some(index) =
+                            tab_index_at(self.cursor_position.x, gpu.config.width, tab_count)
+                    {
+                        remote.layout(LayoutAction::SelectTab { index });
+                        return;
+                    }
                     let bar_height = self
                         .gpu
                         .as_ref()
@@ -3267,14 +3703,21 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     && button == PointerButton::Primary
                     && let Some(previous) = self.selection_origin
                     && Some(previous) != hit.map(|(pane_id, _, _)| pane_id)
-                    && let Some(pane) = self.panes.get_mut(&previous)
+                    && let Some(router) = self.selection_router_mut(previous)
                 {
-                    let _ = pane.selection_router.mouse_input(
+                    let _ = router.mouse_input(
                         PointerButton::Primary,
                         PointerState::Released,
                         None,
                         Instant::now(),
                     );
+                }
+                if state == PointerState::Pressed
+                    && let Some((pane_id, _, _)) = hit
+                    && self.focused_pane_id() != Some(pane_id)
+                    && let Some(remote) = self.remote.as_mut()
+                {
+                    remote.layout(LayoutAction::FocusPane { pane: pane_id.0 });
                 }
                 if state == PointerState::Pressed
                     && let Some((pane_id, _, _)) = hit
@@ -3308,33 +3751,26 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 });
                 let action = route_id
                     .and_then(|pane_id| {
-                        let pane = self.panes.get_mut(&pane_id)?;
+                        let router = self.selection_router_mut(pane_id)?;
                         let cell = route_cell.map(|(_, column, row)| (column, row));
-                        Some(
-                            pane.selection_router
-                                .mouse_input(button, state, cell, Instant::now()),
-                        )
+                        Some(router.mouse_input(button, state, cell, Instant::now()))
                     })
                     .unwrap_or(PointerAction::Ignore);
                 let pane_id = route_id;
                 match action {
                     PointerAction::Begin(gesture) => {
-                        if let (Some((_, column, row)), Some(pane)) = (
-                            route_cell,
-                            pane_id.and_then(|pane_id| self.panes.get_mut(&pane_id)),
-                        ) {
+                        if let (Some((_, column, row)), Some(pane_id)) = (route_cell, pane_id) {
                             let kind = match gesture {
                                 SelectionGesture::Simple => SelectionType::Simple,
                                 SelectionGesture::Semantic => SelectionType::Semantic,
                                 SelectionGesture::Lines => SelectionType::Lines,
                             };
-                            pane.model.begin_selection(column, row, kind);
+                            self.selection_op(pane_id, SelectionOp::Begin { column, row, kind });
                         }
                     }
                     PointerAction::Clear => {
-                        if let Some(pane) = pane_id.and_then(|pane_id| self.panes.get_mut(&pane_id))
-                        {
-                            pane.model.clear_selection();
+                        if let Some(pane_id) = pane_id {
+                            self.selection_op(pane_id, SelectionOp::Clear);
                         }
                     }
                     _ => {}
@@ -3345,6 +3781,9 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 if state == PointerState::Released && button == PointerButton::Primary {
                     self.selection_origin = None;
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.remote.is_some() => {
+                self.remote_wheel(delta);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some((pane_id, _, _)) = self.pane_and_cell_at_cursor()
@@ -3377,11 +3816,12 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     );
                     // Buffers retain their Metrics, so discard them when the device scale changes.
                     for pane in self.panes.values_mut() {
-                        invalidate_glyph_cache(
-                            &mut pane.glyph_buffers,
-                            &mut pane.glyph_keys,
-                            &mut pane.glyph_positions,
-                        );
+                        pane.glyphs.invalidate();
+                    }
+                    if let Some(remote) = self.remote.as_mut() {
+                        for state in remote.panes.values_mut() {
+                            state.glyphs.invalidate();
+                        }
                     }
                 }
                 if let Some(window) = self.window.as_ref() {
@@ -3417,13 +3857,92 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
     }
 }
 
+const USAGE: &str = "\
+Usage: so1term [--session NAME]
+
+Opens a so1term window running a local shell.
+
+Options:
+  --session NAME  Attach the window to the persistent so1term-server session
+                  NAME, starting the server when it is not running. NAME is
+                  1-64 ASCII letters, digits, '-' or '_'. Closing the window
+                  detaches and leaves the session running.
+  -h, --help      Print this help.
+";
+
+/// What the command line asks the window to do.
+#[derive(Debug, PartialEq, Eq)]
+enum WindowArgs {
+    Standalone,
+    Session(String),
+    Help,
+}
+
+fn parse_window_args(args: impl IntoIterator<Item = OsString>) -> Result<WindowArgs, String> {
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return Ok(WindowArgs::Standalone);
+    };
+    // Only --session and --help are options; anything else is ignored, as the
+    // standalone window always did.
+    let Ok(first) = first.into_string() else {
+        return Ok(WindowArgs::Standalone);
+    };
+    let session = match first.as_str() {
+        "-h" | "--help" => return Ok(WindowArgs::Help),
+        "--session" => args
+            .next()
+            .ok_or_else(|| "--session requires a session NAME".to_owned())?
+            .into_string()
+            .map_err(|name| format!("invalid session name {name:?}"))?,
+        other => match other.strip_prefix("--session=") {
+            Some(name) => name.to_owned(),
+            None => return Ok(WindowArgs::Standalone),
+        },
+    };
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected argument {extra:?}"));
+    }
+    control::validate_session_name(&session)?;
+    Ok(WindowArgs::Session(session))
+}
+
 fn main() {
-    if run_terminal() != 0 {
-        std::process::exit(1);
+    let code = match parse_window_args(std::env::args_os().skip(1)) {
+        Ok(WindowArgs::Help) => {
+            print!("{USAGE}");
+            0
+        }
+        Ok(WindowArgs::Standalone) => run_terminal(None),
+        Ok(WindowArgs::Session(session)) => run_session_client(&session),
+        Err(error) => {
+            eprintln!("so1term: {error}");
+            eprint!("{USAGE}");
+            2
+        }
+    };
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
-fn run_terminal() -> i32 {
+/// `so1term --session NAME`: make sure the session server runs, then open the
+/// window as its attached client.
+fn run_session_client(session: &str) -> i32 {
+    if cfg!(not(unix)) {
+        eprintln!("so1term: persistent sessions are unsupported on this platform");
+        return 1;
+    }
+    match so1_terminal::remote::ensure_server(session) {
+        Ok(socket) => run_terminal(Some(socket)),
+        Err(error) => {
+            eprintln!("so1term: could not reach session {session}: {error}");
+            1
+        }
+    }
+}
+
+fn run_terminal(session_socket: Option<PathBuf>) -> i32 {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
@@ -3431,7 +3950,7 @@ fn run_terminal() -> i32 {
             return 1;
         }
     };
-    let mut app = TerminalWindow::new(event_loop.create_proxy());
+    let mut app = TerminalWindow::new(event_loop.create_proxy(), session_socket);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("so1term: window event loop failed: {error}");
         return 1;
@@ -3515,6 +4034,52 @@ mod tests {
     use so1_terminal::model::{Model, ModelEvent};
     use so1_terminal::selection::PointerState;
     use winit::keyboard::{Key, NamedKey};
+
+    fn window_args(args: &[&str]) -> Result<super::WindowArgs, String> {
+        super::parse_window_args(args.iter().map(std::ffi::OsString::from))
+    }
+
+    #[test]
+    fn window_args_select_standalone_session_client_or_help() {
+        use super::WindowArgs;
+        assert_eq!(window_args(&[]), Ok(super::WindowArgs::Standalone));
+        assert_eq!(window_args(&["--help"]), Ok(WindowArgs::Help));
+        assert_eq!(window_args(&["-h"]), Ok(WindowArgs::Help));
+        assert_eq!(
+            window_args(&["--session", "work-1"]),
+            Ok(WindowArgs::Session("work-1".into()))
+        );
+        assert_eq!(
+            window_args(&["--session=dev_2"]),
+            Ok(WindowArgs::Session("dev_2".into()))
+        );
+        assert!(super::USAGE.contains("--session NAME"));
+    }
+
+    #[test]
+    fn window_args_reject_invalid_session_names_and_ignore_unknown_arguments() {
+        let invalid = window_args(&["--session", "bad name"]).unwrap_err();
+        assert!(invalid.contains("invalid session name"), "{invalid}");
+        assert!(window_args(&["--session", ""]).is_err());
+        assert!(window_args(&["--session", &"x".repeat(65)]).is_err());
+        assert!(
+            window_args(&["--session"])
+                .unwrap_err()
+                .contains("requires a session NAME")
+        );
+        // Arguments other than --session/--help were always ignored by the
+        // standalone window; keep that behaviour.
+        assert_eq!(window_args(&["--bogus"]), Ok(super::WindowArgs::Standalone));
+        assert_eq!(
+            window_args(&["file.txt", "-x"]),
+            Ok(super::WindowArgs::Standalone)
+        );
+        assert!(
+            window_args(&["--session", "a", "b"])
+                .unwrap_err()
+                .contains("unexpected argument")
+        );
+    }
 
     #[test]
     fn image_cursor_policy_moves_to_after_bottom_right_only_when_requested() {

@@ -4,11 +4,65 @@ pub use so1_term_core::{
 };
 pub mod control;
 pub mod pty;
+pub mod remote;
 pub mod selection;
 pub mod session;
 
 #[cfg(all(test, unix))]
 mod model_pty_tests;
+
+/// Everything the GPU renderer needs to draw one pane's grid.
+///
+/// Both window modes produce it: the standalone window builds it from its local
+/// [`model::Model`], and an attached client builds it from the server's frames
+/// ([`remote::RemotePane::render_input`]). The renderer only consumes this type,
+/// so glyph shaping and cell drawing are shared by both paths.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneRenderInput {
+    /// Visible grid rows, top to bottom.
+    pub rows: Vec<Vec<model::VisibleCell>>,
+    /// Cursor cell as `(column, row)`; `None` draws no cursor.
+    pub cursor: Option<(usize, usize)>,
+    /// Selected cells as `(column, row)`.
+    pub selected: Vec<(usize, usize)>,
+    /// Block markers and separators in viewport rows.
+    pub decorations: Vec<renderer::BlockDecoration>,
+}
+
+impl PaneRenderInput {
+    /// Projects a local model exactly as the standalone window always has.
+    pub fn from_model(model: &model::Model) -> Self {
+        let rows = model.visible_cells();
+        let cursor = model.cursor();
+        let viewport = renderer::BlockViewport {
+            evicted_rows: model.block_row_base(),
+            history_size: model.history_size(),
+            display_offset: model.display_offset(),
+            first_visible_line: Some(model.visible_top_line()),
+            screen_lines: rows.len(),
+            alternate_screen: model.alternate_screen_active(),
+        };
+        let decorations = renderer::project_block_decorations(model.blocks(), viewport);
+        Self {
+            selected: model.selected_cells(),
+            cursor: Some((cursor.column, cursor.row)),
+            rows,
+            decorations,
+        }
+    }
+
+    /// Resolves colors, the cursor and the selection highlight into render cells.
+    pub fn render_cells(&self) -> Vec<Vec<renderer::RenderCell>> {
+        let cursor = self.cursor.unwrap_or((usize::MAX, usize::MAX));
+        let mut cells = renderer::render_cells(&self.rows, cursor);
+        for &(column, row) in &self.selected {
+            if let Some(cell) = cells.get_mut(row).and_then(|row| row.get_mut(column)) {
+                renderer::apply_selection_highlight(cell);
+            }
+        }
+        cells
+    }
+}
 
 /// Default interactive-shell command candidates, in preference order.
 pub fn default_shell_candidates() -> &'static [&'static str] {
@@ -94,6 +148,34 @@ mod tests {
     fn windows_shell_candidate_order_is_testable_on_any_host() {
         assert_eq!(resolve_shell_choice(None, false, &["pwsh", "cmd"]), "pwsh");
         assert_eq!(default_shell_candidates_for(true), &["pwsh", "cmd"]);
+    }
+
+    #[test]
+    fn model_render_input_marks_cursor_and_highlights_selected_cells() {
+        let mut model = crate::model::Model::new(3, 1);
+        model.feed(b"ab");
+        model.begin_selection(0, 0, alacritty_terminal::selection::SelectionType::Simple);
+        model.extend_selection(0, 0);
+        let input = super::PaneRenderInput::from_model(&model);
+        assert_eq!(input.cursor, Some((2, 0)));
+        assert_eq!(input.selected, model.selected_cells());
+        let cells = input.render_cells();
+        assert!(cells[0][2].cursor);
+        let plain = crate::renderer::render_cells(&input.rows, (2, 0));
+        for &(column, row) in &input.selected {
+            assert_eq!(cells[row][column].foreground, plain[row][column].background);
+        }
+        let hidden = super::PaneRenderInput {
+            cursor: None,
+            ..input
+        };
+        assert!(
+            hidden
+                .render_cells()
+                .iter()
+                .flatten()
+                .all(|cell| !cell.cursor)
+        );
     }
 
     #[test]

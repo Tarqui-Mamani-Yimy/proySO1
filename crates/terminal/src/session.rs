@@ -640,7 +640,7 @@ pub const ERROR_UNAVAILABLE: &str = "UNAVAILABLE";
 /// Attach error code for invalid client window metrics.
 pub const ERROR_INVALID_GEOMETRY: &str = "INVALID_GEOMETRY";
 /// Attach error code sent before detaching a client whose queued image data
-/// exceeded [`OUTBOX_MAX_IMAGE_BYTES`].
+/// still exceeds [`OUTBOX_MAX_IMAGE_BYTES`] when another image must start.
 pub const ERROR_IMAGE_BACKLOG: &str = "IMAGE_BACKLOG";
 
 /// Builds a [`ServerMessage::Error`].
@@ -1099,8 +1099,13 @@ pub const OUTBOX_MAX_FRAMES: usize = 64;
 pub const OUTBOX_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Most queued non-frame messages; beyond this the client is considered stuck.
 pub const OUTBOX_MAX_MESSAGES: usize = 1024;
-/// Most encoded image lines (announcements and chunks) queued for one client;
-/// beyond this the client gets an error and is detached.
+/// Image backlog limit for one client. A new image may start only while less
+/// than this many bytes of earlier image lines are queued; once started, every
+/// line of that image is queued, so one image larger than the budget still
+/// reaches the client. Queued image bytes therefore stay below this budget plus
+/// one image, which the process graphics limit already bounds. A client whose
+/// backlog is still over the budget when another image must start gets an
+/// error and is detached.
 pub const OUTBOX_MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 
 enum Outgoing {
@@ -1168,16 +1173,17 @@ impl Outbox {
         true
     }
 
-    /// Queues an image announcement or chunk that is never dropped; `false`
-    /// means the client already has [`OUTBOX_MAX_IMAGE_BYTES`] of image lines
-    /// queued and must be detached.
-    pub fn push_image(&mut self, line: Vec<u8>) -> bool {
-        if self.image_bytes.saturating_add(line.len()) > OUTBOX_MAX_IMAGE_BYTES {
-            return false;
-        }
+    /// Whether another image may start: earlier image lines still queued are
+    /// below [`OUTBOX_MAX_IMAGE_BYTES`]. `false` means the client must be detached.
+    pub fn can_start_image(&self) -> bool {
+        self.image_bytes < OUTBOX_MAX_IMAGE_BYTES
+    }
+
+    /// Queues an image announcement or chunk that is never dropped. Call it for
+    /// every line of an image after [`Outbox::can_start_image`] allowed the image.
+    pub fn push_image(&mut self, line: Vec<u8>) {
         self.image_bytes += line.len();
         self.queue.push_back((Outgoing::Image, line));
-        true
     }
 
     /// Drops everything queued, e.g. before a final error to a detached client.
@@ -1365,11 +1371,11 @@ mod tests {
     #[test]
     fn outbox_never_drops_images_and_bounds_their_queued_bytes() {
         let mut outbox = Outbox::default();
-        assert!(outbox.push_image(b"image".to_vec()));
+        outbox.push_image(b"image".to_vec());
         for _ in 0..OUTBOX_MAX_FRAMES {
             assert!(outbox.push_frame(1, b"f".to_vec()).is_empty());
         }
-        assert!(outbox.push_image(b"chunk".to_vec()));
+        outbox.push_image(b"chunk".to_vec());
         // A frame overflow drops frames only; image lines keep their order.
         assert_eq!(outbox.push_frame(2, b"late".to_vec()), vec![1, 2]);
         assert_eq!(outbox.pop(), Some(b"image".to_vec()));
@@ -1379,14 +1385,33 @@ mod tests {
         for _ in 0..OUTBOX_MAX_MESSAGES {
             assert!(outbox.push_message(b"m".to_vec()));
         }
-        assert!(outbox.push_image(vec![0; OUTBOX_MAX_IMAGE_BYTES - 1]));
-        assert!(outbox.push_image(vec![0; 1]));
-        assert!(!outbox.push_image(vec![0; 1]), "the 256 MiB budget is full");
+        assert!(outbox.can_start_image());
+        outbox.push_image(vec![0; OUTBOX_MAX_IMAGE_BYTES - 1]);
+        assert!(outbox.can_start_image(), "just below the budget");
+        outbox.push_image(vec![0; 1]);
+        assert!(!outbox.can_start_image(), "the 256 MiB budget is full");
         while outbox.pop().is_some_and(|line| line.len() < 2) {}
-        assert!(outbox.push_image(vec![0; 1]), "popping frees the budget");
+        assert!(outbox.can_start_image(), "popping frees the budget");
         outbox.discard_all();
         assert!(outbox.is_empty());
-        assert!(outbox.push_image(vec![0; OUTBOX_MAX_IMAGE_BYTES]));
+        assert!(outbox.can_start_image());
+    }
+
+    #[test]
+    fn outbox_queues_a_whole_image_larger_than_the_budget_when_no_image_is_pending() {
+        let mut outbox = Outbox::default();
+        // One image whose chunk lines exceed the budget: starting it is allowed
+        // because nothing is queued yet, and every chunk is then accepted.
+        assert!(outbox.can_start_image());
+        let chunk = OUTBOX_MAX_IMAGE_BYTES / 2 + 1;
+        outbox.push_image(vec![0; chunk]);
+        outbox.push_image(vec![0; chunk]);
+        outbox.push_image(vec![0; chunk]);
+        // A further image waits until the backlog drains below the budget.
+        assert!(!outbox.can_start_image(), "backlog above the budget");
+        outbox.pop();
+        outbox.pop();
+        assert!(outbox.can_start_image(), "draining frees the budget");
     }
 
     #[test]

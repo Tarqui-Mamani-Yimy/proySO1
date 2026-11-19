@@ -662,6 +662,12 @@ mod unix {
                         placement.image,
                         &image.rgba,
                     ));
+                    // The backlog budget is checked once per image, so an image
+                    // larger than the budget is still queued whole.
+                    if !lock(&client.outbox).can_start_image() {
+                        overflow = true;
+                        break 'frames;
+                    }
                     for message in messages {
                         let line = match attach::encode_server(&message) {
                             Ok(line) => line,
@@ -673,12 +679,8 @@ mod unix {
                                 continue;
                             }
                         };
-                        let queued = lock(&client.outbox).push_image(line);
+                        lock(&client.outbox).push_image(line);
                         client.outbox.1.notify_one();
-                        if !queued {
-                            overflow = true;
-                            break 'frames;
-                        }
                     }
                     client.sent_images.insert(key);
                 }

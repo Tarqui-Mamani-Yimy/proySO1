@@ -82,18 +82,12 @@ struct ShellPrompt {
 }
 
 impl ShellPrompt {
-    fn from_shell(shell: &Shell) -> Self {
-        fn value(shell: &Shell, name: &str, default: &str) -> String {
-            shell.get_var_bytes(name).map_or_else(
-                || default.to_owned(),
-                // reedline's Prompt requires str: preserve valid Unicode, replace
-                // invalid UTF-8 for display only, without changing the shell value.
-                |bytes| String::from_utf8_lossy(bytes.as_bytes()).into_owned(),
-            )
-        }
+    /// Rebuilt before every line so `PS1`/`PS2` expansion, the cwd and the
+    /// last status are current; see `crate::prompt`.
+    fn from_shell(shell: &mut Shell) -> Self {
         Self {
-            primary: value(shell, "PS1", "$ "),
-            continuation: value(shell, "PS2", "> "),
+            primary: crate::prompt::primary(shell),
+            continuation: crate::prompt::continuation(shell),
         }
     }
 }
@@ -159,6 +153,8 @@ pub fn run(shell: &mut Shell) -> i32 {
 fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     let jobs = crate::jobs::register(shell)
         .map_err(|error| io::Error::other(format!("so1sh: jobs builtin: {error}")))?;
+    crate::sysinfo::register_sysinfo_builtin(shell)
+        .map_err(|error| io::Error::other(format!("so1sh: sysinfo builtin: {error}")))?;
     shell.suppress_repl_stopped_diagnostic(true);
     let terminal = match crate::terminal::Terminal::acquire() {
         Ok(terminal) => Some(terminal),
@@ -186,6 +182,8 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
             return Ok(status.code());
         }
     }
+    // After the rc file, so it can set SO1SH_BANNER=0; before the first prompt.
+    crate::sysinfo::show_startup_banner(shell);
     let completion_state = CompletionState::new(shell);
     let completion_menu = Box::new(ColumnarMenu::default().with_name("shell_completion_menu"));
     let mut keybindings = default_emacs_keybindings();
@@ -329,7 +327,7 @@ mod tests {
             .set_var_bytes("PS1", ShellBytes::from_vec(b"prompt\xff> ".to_vec()))
             .unwrap();
         shell.set_var("PS2", "continued> ").unwrap();
-        let prompt = ShellPrompt::from_shell(&shell);
+        let prompt = ShellPrompt::from_shell(&mut shell);
         assert_eq!(prompt.primary, "prompt\u{fffd}> ");
         assert_eq!(prompt.continuation, "continued> ");
         assert_eq!(

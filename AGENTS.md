@@ -32,6 +32,20 @@ persistent shell, so prompts, variables, functions and cwd can be configured.
 Missing defaults are silent; explicit missing files and rc errors are reported
 with normal REPL recovery (including `set -e` semantics). `exit` in the rc ends
 the session. Piped input, `-c`, and script arguments never source an rc file.
+`PS1` and `PS2` undergo POSIX parameter expansion before each prompt (heredoc-body
+quoting, as in dash), so `PS1='$PWD $ '` follows `cd`; command substitution,
+backticks and arithmetic are rejected so drawing a prompt never runs code, and any
+expansion error falls back to the literal value. With `PS1` unset the default
+prompt is `user@host <cwd> (<git branch>) $ `: `$HOME` is abbreviated to `~`, root
+gets `#`, the branch is read from `.git/HEAD` in the cwd or an ancestor (gitdir
+files followed; detached HEAD shows 7 hex digits; omitted outside a repository),
+and the `$`/`#` turns red after a non-zero status. Prompt and banner colours are
+used only when stdout is a terminal and `NO_COLOR` is unset or empty. After the rc
+file and before the first prompt, an interactive session prints a system banner
+(distro ASCII logo for Debian, Ubuntu, Arch, Fedora or a generic one, then
+user@host, OS, kernel, shell, terminal, CPU, RAM, disk usage of `/` and uptime;
+unreadable fields are omitted). `SO1SH_BANNER=0`, set in the environment or the
+rc file, disables it; the `sysinfo` builtin prints it on demand.
 Job resume (`fg`/`bg`) and done/stopped notifications are later Phase 2 tasks.
 
 ## Architecture
@@ -56,6 +70,8 @@ crates/shell/
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
   src/jobs.rs     Job table, job specs and the `jobs` builtin
+  src/prompt.rs   PS1/PS2 expansion and the default prompt (cwd, git branch, status)
+  src/sysinfo.rs  Startup system banner, distro logos and the `sysinfo` builtin
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/terminal/

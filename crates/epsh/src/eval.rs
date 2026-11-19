@@ -81,6 +81,33 @@ fn read_shebang_interpreter(path: &Path) -> Option<String> {
 }
 
 /// The platform's strerror text for an errno, e.g. "Not a directory".
+fn prompt_error(msg: &str) -> ShellError {
+    ShellError::Runtime {
+        msg: format!("prompt: {msg}"),
+        span: Span::default(),
+    }
+}
+
+/// Whether expanding this prompt part would run commands or arithmetic.
+fn prompt_part_runs_code(part: &WordPart) -> bool {
+    match part {
+        WordPart::CmdSubst(_) | WordPart::Backtick(_) | WordPart::Arith(_) => true,
+        WordPart::DoubleQuoted(parts) => parts.iter().any(prompt_part_runs_code),
+        WordPart::Param(param) => match &param.op {
+            ParamOp::Default { word, .. }
+            | ParamOp::Assign { word, .. }
+            | ParamOp::Error { word, .. }
+            | ParamOp::Alternative { word, .. }
+            | ParamOp::TrimSuffixSmall(word)
+            | ParamOp::TrimSuffixLarge(word)
+            | ParamOp::TrimPrefixSmall(word)
+            | ParamOp::TrimPrefixLarge(word) => word.iter().any(prompt_part_runs_code),
+            ParamOp::Normal | ParamOp::Length | ParamOp::BadSubst => false,
+        },
+        WordPart::Literal(_) | WordPart::SingleQuoted(_) | WordPart::Tilde(_) => false,
+    }
+}
+
 fn os_error_string(code: i32) -> String {
     unsafe {
         let msg = libc::strerror(code);
@@ -1956,6 +1983,69 @@ impl Shell {
         expand::expand_word_to_string(word, self)
     }
 
+    /// Expand a prompt string such as `PS1` or `PS2` for display.
+    ///
+    /// The text is read with here-document (double-quote) syntax, as dash
+    /// does for prompts: single and double quotes are literal, and only
+    /// `\$`, `` \` ``, `\\` and `\<newline>` are backslash escapes. Only
+    /// parameter expansion is performed (POSIX); there is no field
+    /// splitting, pathname expansion or tilde expansion. Command
+    /// substitution and arithmetic expansion are refused with an error
+    /// instead of running code or assigning variables, so displaying a
+    /// prompt never executes commands. `$?` and the last exit status are
+    /// left unchanged; `${var=word}` may still assign, as POSIX requires.
+    /// On error (for example `${x?msg}`, `set -u`, or a refused
+    /// substitution) nothing is printed and callers choose a fallback.
+    /// Bytes that are not valid UTF-8 are preserved.
+    pub fn expand_prompt(&mut self, prompt: &ShellBytes) -> crate::error::Result<ShellBytes> {
+        let text = prompt.as_bytes();
+        if !text.contains(&b'$') && !text.contains(&b'`') && !text.contains(&b'\\') {
+            return Ok(prompt.clone());
+        }
+        // Reuse the parser's here-document body reader through a synthetic
+        // `: <<DELIM` command whose delimiter is not a line of the prompt.
+        let mut delimiter = b"SO1SH_PROMPT_EOF".to_vec();
+        while text.split(|&b| b == b'\n').any(|line| line == delimiter) {
+            delimiter.push(b'_');
+        }
+        let mut source = b": <<".to_vec();
+        source.extend_from_slice(&delimiter);
+        source.push(b'\n');
+        source.extend_from_slice(text);
+        source.push(b'\n');
+        source.extend_from_slice(&delimiter);
+        source.push(b'\n');
+        let program = Parser::new_bytes(&source).parse()?;
+        let parts = match program.commands.as_slice() {
+            [Command::Simple { redirs, .. }] => match redirs.as_slice() {
+                [
+                    Redir {
+                        kind: RedirKind::HereDoc(HereDocBody::Parsed(parts)),
+                        ..
+                    },
+                ] => parts.clone(),
+                _ => return Err(prompt_error("unsupported prompt syntax")),
+            },
+            _ => return Err(prompt_error("unsupported prompt syntax")),
+        };
+        if parts.iter().any(prompt_part_runs_code) {
+            return Err(prompt_error(
+                "command substitution and arithmetic are not supported in prompts",
+            ));
+        }
+        let word = Word {
+            parts,
+            span: Span::default(),
+        };
+        let mut expanded = expand::expand_word_to_string(&word, self)?;
+        // The here-document body ends with the newline added above, unless
+        // a trailing `\<newline>` continuation consumed it.
+        if expanded.ends_with('\n') {
+            expanded.pop();
+        }
+        Ok(ShellBytes::from_str_lossless(&expanded))
+    }
+
     /// Expand word parts into a fnmatch-ready pattern string.
     /// Glob chars from quoted regions are escaped.
     pub(crate) fn expand_pattern(&mut self, word: &Word) -> crate::error::Result<String> {
@@ -3112,6 +3202,69 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt(shell: &mut Shell, text: &str) -> crate::error::Result<String> {
+        shell
+            .expand_prompt(&ShellBytes::from(text))
+            .map(|bytes| String::from_utf8(bytes.into_vec()).unwrap())
+    }
+
+    #[test]
+    fn expand_prompt_performs_parameter_expansion_in_double_quote_syntax() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.set_var("PWD", "/work dir").unwrap();
+        shell.set_var("HOME", "/home/u").unwrap();
+        assert_eq!(prompt(&mut shell, "$PWD $ ").unwrap(), "/work dir $ ");
+        assert_eq!(
+            prompt(&mut shell, "${PWD#/work} ${UNSET:-def}> ").unwrap(),
+            " dir def> "
+        );
+        // Quotes are literal and no field splitting, globbing or tilde expansion applies.
+        assert_eq!(
+            prompt(&mut shell, "'a'  \"b\" * ~ ").unwrap(),
+            "'a'  \"b\" * ~ "
+        );
+        assert_eq!(prompt(&mut shell, "\\$PWD\\\\").unwrap(), "$PWD\\");
+        assert_eq!(
+            prompt(&mut shell, "line1\nline2 ").unwrap(),
+            "line1\nline2 "
+        );
+        assert_eq!(prompt(&mut shell, "").unwrap(), "");
+    }
+
+    #[test]
+    fn expand_prompt_keeps_status_and_survives_a_delimiter_line() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.exit_status = ExitStatus::from(3);
+        assert_eq!(prompt(&mut shell, "[$?] ").unwrap(), "[3] ");
+        assert_eq!(
+            prompt(&mut shell, "SO1SH_PROMPT_EOF\n$?").unwrap(),
+            "SO1SH_PROMPT_EOF\n3"
+        );
+        assert!(prompt(&mut shell, "${x?boom}").is_err());
+        assert_eq!(shell.exit_status(), ExitStatus::from(3));
+    }
+
+    #[test]
+    fn expand_prompt_never_runs_commands() {
+        let mut shell = Shell::builder().env_clear().build();
+        for text in ["$(x=1)", "`x=1`", "$((x=1))", "${y:-$(x=1)}"] {
+            assert!(prompt(&mut shell, text).is_err(), "{text:?}");
+        }
+        assert_eq!(shell.get_var("x"), None);
+    }
+
+    #[test]
+    fn expand_prompt_preserves_non_utf8_bytes() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell
+            .set_var_bytes("V", ShellBytes::from_vec(b"v\xff".to_vec()))
+            .unwrap();
+        let expanded = shell
+            .expand_prompt(&ShellBytes::from_vec(b"\xfe$V".to_vec()))
+            .unwrap();
+        assert_eq!(expanded.as_bytes(), b"\xfev\xff");
+    }
 
     #[test]
     fn reaped_job_status_cache_is_bounded_and_evicts_oldest() {

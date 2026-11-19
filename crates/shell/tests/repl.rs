@@ -138,6 +138,9 @@ fn session_with_term(args: &[&str], prompt: Option<&str>, term: &str) -> (PtySes
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
+        // Keep the historical literal prompt; default-prompt tests unset PS1.
+        .env("PS1", "$ ")
+        .env("SO1SH_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", term)
         .env("SO1SH_SHELL_INTEGRATION", "0")
@@ -159,6 +162,9 @@ fn session_with_shell_integration(value: Option<&str>) -> (PtySession, TempDir) 
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
+        // Keep the historical literal prompt; default-prompt tests unset PS1.
+        .env("PS1", "$ ")
+        .env("SO1SH_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("HOME", dir.path())
@@ -244,6 +250,9 @@ fn kitty_test_session(enabled: bool) -> (PtySession, TempDir) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
+        // Keep the historical literal prompt; default-prompt tests unset PS1.
+        .env("PS1", "$ ")
+        .env("SO1SH_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "xterm-256color")
         .env("HOME", dir.path())
@@ -538,6 +547,9 @@ fn history_session_with_file(dir: &TempDir, path: Option<&std::path::Path>) -> P
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
+        // Keep the historical literal prompt; default-prompt tests unset PS1.
+        .env("PS1", "$ ")
+        .env("SO1SH_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("SO1SH_HIGHLIGHT", "0")
@@ -1265,6 +1277,9 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
+        // Keep the historical literal prompt; default-prompt tests unset PS1.
+        .env("PS1", "$ ")
+        .env("SO1SH_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("SO1SH_HIGHLIGHT", "0")
@@ -1472,6 +1487,9 @@ mod startup_rc {
         let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
         command
             .env_clear()
+            // Keep the historical literal prompt; default-prompt tests unset PS1.
+            .env("PS1", "$ ")
+            .env("SO1SH_BANNER", "0")
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
             .env("SO1SH_SHELL_INTEGRATION", "0")
@@ -1552,6 +1570,9 @@ mod startup_rc {
         let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
         command
             .env_clear()
+            // Keep the historical literal prompt; default-prompt tests unset PS1.
+            .env("PS1", "$ ")
+            .env("SO1SH_BANNER", "0")
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", path_dir.path().display()),
@@ -2409,6 +2430,9 @@ fn history_hint_is_visible_and_right_arrow_accepts_it() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
     command
         .env_clear()
+        // Keep the historical literal prompt; default-prompt tests unset PS1.
+        .env("PS1", "$ ")
+        .env("SO1SH_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("SO1SH_SHELL_INTEGRATION", "0")
@@ -2604,4 +2628,179 @@ fn first_sgr_after(text: &str, offset: usize) -> Option<&str> {
         }
     }
     None
+}
+
+mod prompt_expansion {
+    use super::*;
+
+    fn short_hostname() -> String {
+        let output = Command::new("uname").arg("-n").output().unwrap();
+        let name = String::from_utf8(output.stdout).unwrap();
+        name.trim().split('.').next().unwrap().to_owned()
+    }
+
+    fn user_name() -> String {
+        let output = Command::new("id").arg("-un").output().unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A session whose PS1 is unset, so the default prompt is shown uncolored.
+    fn default_prompt_session(dir: &TempDir) -> PtySession {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("SO1SH_BANNER", "0")
+            .env("SO1SH_SHELL_INTEGRATION", "0")
+            .env("SO1SH_KITTY_KEYBOARD", "0")
+            .env("SO1SH_HIGHLIGHT", "0")
+            .env("HOME", dir.path())
+            .current_dir(dir.path());
+        let mut session = spawn_pty(command);
+        session.process_mut().set_kill_timeout(Some(1000));
+        session
+    }
+
+    #[test]
+    fn ps1_parameter_expansion_follows_cd() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "PS1='[$PWD]> '");
+        submit(&mut session, "cd /usr");
+        session.exp_string("[/usr]> ").unwrap();
+        submit(&mut session, "cd /");
+        session.exp_string("[/]> ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn ps1_without_expansions_renders_exactly() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "PS1='\"q\" * ~ plain> '");
+        session.exp_string("\"q\" * ~ plain> ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn ps1_expansion_error_shows_literal_prompt_and_session_continues() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "PS1='${x?boom}> '");
+        session.exp_string("${x?boom}> ").unwrap();
+        submit(&mut session, "echo still-alive");
+        session.exp_string("still-alive\r\n").unwrap();
+        session.exp_string("${x?boom}> ").unwrap();
+        submit(&mut session, "exit 3");
+        exited(&mut session, 3);
+    }
+
+    #[test]
+    fn unset_ps1_shows_user_host_cwd_and_git_branch() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("repo/.git")).unwrap();
+        std::fs::write(dir.path().join("repo/.git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        let mut session = default_prompt_session(&dir);
+        let identity = format!("{}@{}", user_name(), short_hostname());
+        // SAFETY: geteuid has no preconditions.
+        let marker = if unsafe { libc::geteuid() } == 0 {
+            "#"
+        } else {
+            "$"
+        };
+        session
+            .exp_string(&format!("{identity} ~ {marker} "))
+            .unwrap();
+        submit(&mut session, "cd repo");
+        session
+            .exp_string(&format!("{identity} ~/repo (topic) {marker} "))
+            .unwrap();
+        submit(&mut session, "cd /");
+        session
+            .exp_string(&format!("{identity} / {marker} "))
+            .unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+}
+
+mod startup_banner {
+    use super::*;
+
+    /// A session with `SO1SH_BANNER` left unset unless `banner` is given.
+    fn banner_session(dir: &TempDir, banner: Option<&str>, rc: Option<&str>) -> PtySession {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("PS1", "$ ")
+            .env("SO1SH_SHELL_INTEGRATION", "0")
+            .env("SO1SH_KITTY_KEYBOARD", "0")
+            .env("SO1SH_HIGHLIGHT", "0")
+            .env("HOME", dir.path())
+            .current_dir(dir.path());
+        if let Some(value) = banner {
+            command.env("SO1SH_BANNER", value);
+        }
+        if let Some(text) = rc {
+            let path = dir.path().join("banner.rc");
+            std::fs::write(&path, text).unwrap();
+            command.env("SO1SH_RC", path);
+        }
+        let mut session = spawn_pty(command);
+        session.process_mut().set_kill_timeout(Some(1000));
+        session
+    }
+
+    #[test]
+    fn interactive_startup_prints_the_system_banner_before_the_first_prompt() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = TempDir::new().unwrap();
+        let mut session = banner_session(&dir, None, None);
+        let before = session.exp_string("Shell:  so1sh").unwrap();
+        assert!(
+            !before.contains("$ "),
+            "banner precedes the prompt: {before:?}"
+        );
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn so1sh_banner_zero_from_the_environment_or_rc_suppresses_the_banner() {
+        let _pty_test_guard = serialize_pty_test();
+        for (env, rc) in [(Some("0"), None), (None, Some("SO1SH_BANNER=0\n"))] {
+            let dir = TempDir::new().unwrap();
+            let mut session = banner_session(&dir, env, rc);
+            submit(&mut session, "echo banner-check");
+            let before = session.exp_string("banner-check\r\n").unwrap();
+            assert!(!before.contains("Shell:"), "no banner expected: {before:?}");
+            submit(&mut session, "exit");
+            exited(&mut session, 0);
+        }
+    }
+
+    #[test]
+    fn sysinfo_builtin_prints_the_banner_on_demand() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = TempDir::new().unwrap();
+        let mut session = banner_session(&dir, Some("0"), None);
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "sysinfo; echo status=$?");
+        session.exp_string("Shell:  so1sh").unwrap();
+        session.exp_string("status=0").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
 }

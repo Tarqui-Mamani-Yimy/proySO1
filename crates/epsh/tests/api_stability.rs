@@ -98,6 +98,20 @@ fn shell_public_methods() {
 }
 
 #[test]
+fn prompt_expansion_api_is_additive() {
+    let _: fn(
+        &mut eval::Shell,
+        &shell_bytes::ShellBytes,
+    ) -> error::Result<shell_bytes::ShellBytes> = eval::Shell::expand_prompt;
+    let mut shell = eval::Shell::builder().env_clear().build();
+    shell.set_var("NAME", "dir").unwrap();
+    let expanded = shell
+        .expand_prompt(&shell_bytes::ShellBytes::from("'$NAME' \\$ "))
+        .unwrap();
+    assert_eq!(expanded.as_bytes(), b"'dir' $ ");
+}
+
+#[test]
 fn embedder_builtin_api_is_additive() {
     let handler: Box<eval::EmbedderBuiltinHandler> = Box::new(|shell, argv| {
         shell.write_stdout(argv[1].as_bytes());

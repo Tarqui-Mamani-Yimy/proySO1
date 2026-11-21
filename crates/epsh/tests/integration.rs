@@ -1055,6 +1055,33 @@ mod kill_builtin {
     }
 }
 
+mod exec_command {
+    use super::*;
+
+    #[test]
+    fn exec_replaces_the_shell_with_the_named_command() {
+        let (stdout, stderr, code) = run("exec echo hi; echo not-reached");
+        assert_eq!((stdout.as_str(), stderr.as_str(), code), ("hi\n", "", 0));
+    }
+
+    #[test]
+    fn exec_reports_the_exit_status_of_the_replacement_command() {
+        let (_, _, code) = run("exec sh -c 'exit 7'");
+        assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn exec_of_a_missing_command_names_it_and_exits_127() {
+        let (stdout, stderr, code) = run("exec no-such-command-xyz; echo not-reached");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains("exec: no-such-command-xyz: "),
+            "unexpected stderr: {stderr}"
+        );
+        assert_eq!(code, 127);
+    }
+}
+
 mod exec_redirects {
     use super::*;
 

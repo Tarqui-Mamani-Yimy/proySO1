@@ -625,13 +625,20 @@ impl Shell {
             return Ok(status);
         }
 
-        // exec with command — replace process
-        let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
+        // exec with command — replace the shell with args[1..] (args[0] is "exec").
+        let args_bytes: Vec<ShellBytes> = args[1..].iter().cloned().map(Into::into).collect();
         let env = self.vars.env_for_command_os(&[]);
         let _ = std::env::set_current_dir(&self.cwd);
         let err = exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
-        self.err_msg(&format!("exec: {}: {err}", args[0]));
-        Ok(ExitStatus::NOT_EXECUTABLE)
+        self.err_msg(&format!("exec: {}: {err}", args[1]));
+        let status = if err.kind() == std::io::ErrorKind::NotFound {
+            ExitStatus::NOT_FOUND
+        } else {
+            ExitStatus::NOT_EXECUTABLE
+        };
+        // A failed exec is a special-builtin error: non-interactive shells
+        // exit with it, the interactive REPL recovers.
+        Err(self.special_builtin_error(status))
     }
 
     fn builtin_command(

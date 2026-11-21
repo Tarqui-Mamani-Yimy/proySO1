@@ -64,7 +64,11 @@ file and before the first prompt, an interactive session prints a system banner
 user@host, OS, kernel, shell, terminal, CPU, RAM, disk usage of `/` and uptime;
 unreadable fields are omitted). `SO1SH_BANNER=0`, set in the environment or the
 rc file, disables it; the `sysinfo` builtin prints it on demand.
-Job resume (`fg`/`bg`) and done/stopped notifications are later Phase 2 tasks.
+`fg %n` resumes a job in the foreground and `bg %n` in the background; before each
+prompt so1sh reports changed background jobs (`[n]+ Done/Stopped/Killed`), and
+`exit` with stopped jobs warns once. `exec CMD` replaces the shell with CMD; a
+failed exec exits a non-interactive shell (127 not found, 126 otherwise) and the
+REPL recovers.
 
 ## Architecture
 
@@ -87,7 +91,10 @@ crates/shell/
   src/main.rs     so1sh binary, selects the REPL for TTY input
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
-  src/jobs.rs     Job table, job specs and the `jobs` builtin
+  src/jobs.rs     Job table, job specs and the `jobs`, `fg` and `bg` builtins
+  src/completion.rs Tab completion of commands, paths and variables
+  src/highlighter.rs Syntax highlighting from the epsh lexer (SO1SH_HIGHLIGHT=0 disables it)
+  src/history_hint.rs Ghost-text hints from history
   src/policy.rs   Opt-in `SO1SH_POLICY` command/write policy parser and hooks
   src/prompt.rs   PS1/PS2 expansion and the default prompt (cwd, git branch, status)
   src/sysinfo.rs  Startup system banner, distro logos and the `sysinfo` builtin
@@ -131,7 +138,7 @@ Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarde
 
 On Unix, each running `so1term` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/so1term/so1term-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/so1term-<uid>/so1term-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
 
-`SO1TERM_SOCKET` is inherited by every pane shell and tells `so1ctl` which instance to address. Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the listener. `so1ctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, `get-text` (screen or last finished block output), and `shutdown` (only `so1term-server` accepts it); use `so1ctl --help` for argument syntax. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `so1ctl` reports that local control is unsupported there.
+`SO1TERM_SOCKET` is inherited by every pane shell and tells `so1ctl` which instance to address. Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the listener. `so1ctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, `get-text` (screen or last finished block output), `block`, `wait`, and `shutdown` (only `so1term-server` accepts it); use `so1ctl --help` for argument syntax. `list` reports for every pane `state` (`unknown` before any shell-integration mark, `idle` at a prompt, `running` between OSC 133 `C` and `D`) and `last_exit_status` (the newest finished command's status, or null). `block [--pane ID] [--id N]` describes one block (default: the newest block that ran a command) as `pane`, `id`, `state`, `command`, `cwd`, `exit_status`, `started_at_ms`, `finished_at_ms` and `duration_ms` (Unix milliseconds, null when unknown); when the command text is no longer retained, `command` is null and `command_unavailable` is `anchors-missing` or `alternate-screen`. Unknown ids return `NOT_FOUND` and blocks discarded with their scrollback return `EVICTED`. `wait [--pane ID] [--after ID] [--timeout SECS]` is client-side: it polls `block` every 50 ms until the newest command block (newer than `--after`, when given) has finished, prints it, and exits 1 with `TIMEOUT` after SECS (default 600). To wait for a command you send, read `block` first and pass its id as `--after`, so the previous block is never mistaken for the new one. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `so1ctl` reports that local control is unsupported there.
 
 ## so1term Persistent Sessions
 

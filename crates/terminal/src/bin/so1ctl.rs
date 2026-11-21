@@ -35,13 +35,42 @@ fn run() -> Result<(), String> {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], shutdown (so1term-server only)"
+            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], wait [--pane ID] [--after ID] [--timeout SECS] (default 600), shutdown (so1term-server only)"
         );
         return Ok(());
     }
     let command_name = args.next().ok_or("missing command (try --help)")?;
+    if command_name == "wait" {
+        let wait = parse_wait(args.collect())?;
+        let socket = resolve_socket(socket)?;
+        return wait_for_block(&socket, &wait);
+    }
     let command = parse_command(&command_name, args.collect())?;
-    let socket = if let Some(path) =
+    let socket = resolve_socket(socket)?;
+    let request = ControlRequest {
+        id: REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        command,
+    };
+    let response = control::send_request(&socket, &request).map_err(|error| error.to_string())?;
+    match response.outcome {
+        ControlOutcome::Success(value) => println!(
+            "{}",
+            serde_json::to_string(&value).map_err(|error| error.to_string())?
+        ),
+        ControlOutcome::Failure(error) => {
+            return Err(format!("{}: {}", error.code.as_str(), error.message));
+        }
+    }
+    Ok(())
+}
+
+/// Picks the control socket: `--socket`, then `SO1TERM_SOCKET`, then the only
+/// so1term socket in the runtime directory.
+#[cfg(unix)]
+fn resolve_socket(socket: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
+    use so1_terminal::control;
+    use std::{env, path::PathBuf};
+    let path = if let Some(path) =
         socket.or_else(|| env::var_os("SO1TERM_SOCKET").map(PathBuf::from))
     {
         path
@@ -69,21 +98,122 @@ fn run() -> Result<(), String> {
             }
         }
     };
-    let request = ControlRequest {
-        id: REQUEST_ID.fetch_add(1, Ordering::Relaxed),
-        command,
+    Ok(path)
+}
+
+/// Arguments of the client-side `wait` command.
+#[cfg(unix)]
+#[derive(Debug, PartialEq)]
+struct WaitArgs {
+    pane: Option<u64>,
+    /// Only a block with a larger id counts, so a block that finished before
+    /// the awaited command started is never returned.
+    after: Option<u64>,
+    timeout: std::time::Duration,
+}
+
+#[cfg(unix)]
+fn parse_wait(args: Vec<String>) -> Result<WaitArgs, String> {
+    let mut wait = WaitArgs {
+        pane: None,
+        after: None,
+        timeout: std::time::Duration::from_secs(600),
     };
-    let response = control::send_request(&socket, &request).map_err(|error| error.to_string())?;
-    match response.outcome {
-        ControlOutcome::Success(value) => println!(
-            "{}",
-            serde_json::to_string(&value).map_err(|error| error.to_string())?
-        ),
-        ControlOutcome::Failure(error) => {
-            return Err(format!("{}: {}", error.code.as_str(), error.message));
+    let (mut pane_seen, mut after_seen, mut timeout_seen) = (false, false, false);
+    let mut index = 0;
+    while index < args.len() {
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{} requires a value", args[index]));
+        match args[index].as_str() {
+            "--pane" if !pane_seen => {
+                pane_seen = true;
+                wait.pane = Some(
+                    value?
+                        .parse()
+                        .map_err(|_| "--pane must be an unsigned integer")?,
+                );
+            }
+            "--after" if !after_seen => {
+                after_seen = true;
+                wait.after = Some(
+                    value?
+                        .parse()
+                        .map_err(|_| "--after must be an unsigned integer")?,
+                );
+            }
+            "--timeout" if !timeout_seen => {
+                timeout_seen = true;
+                let seconds = value?
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+                    .ok_or("--timeout must be a non-negative number of seconds")?;
+                wait.timeout = seconds;
+            }
+            "--pane" | "--after" | "--timeout" => {
+                return Err(format!("{} may only be supplied once", args[index]));
+            }
+            arg => return Err(format!("unexpected argument for wait: {arg}")),
         }
+        index += 2;
     }
-    Ok(())
+    Ok(wait)
+}
+
+/// Polls the `block` command until the pane's newest command block (newer
+/// than `--after`, when given) has finished, then prints it.
+#[cfg(unix)]
+fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), String> {
+    use so1_terminal::control::{
+        self, ControlCommand, ControlErrorCode, ControlOutcome, ControlRequest,
+    };
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + wait.timeout;
+    let mut id = 1;
+    loop {
+        let request = ControlRequest {
+            id,
+            command: ControlCommand::Block {
+                pane: wait.pane,
+                block: None,
+            },
+        };
+        id += 1;
+        let response =
+            control::send_request(socket, &request).map_err(|error| error.to_string())?;
+        match response.outcome {
+            ControlOutcome::Success(block) => {
+                let newer = wait
+                    .after
+                    .is_none_or(|after| block["id"].as_u64().is_some_and(|id| id > after));
+                if newer && block["state"] == "finished" {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&block).map_err(|error| error.to_string())?
+                    );
+                    return Ok(());
+                }
+            }
+            // No command has run yet: keep waiting for the first one.
+            ControlOutcome::Failure(error)
+                if error.code == ControlErrorCode::NotFound
+                    && error.message.ends_with("has not run a command") => {}
+            ControlOutcome::Failure(error) => {
+                return Err(format!("{}: {}", error.code.as_str(), error.message));
+            }
+        }
+        if Instant::now() >= deadline {
+            let what = wait.after.map_or("no command block".to_owned(), |after| {
+                format!("no block newer than {after}")
+            });
+            return Err(format!(
+                "TIMEOUT: {what} finished within {}s",
+                wait.timeout.as_secs_f64()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(unix)]
@@ -188,6 +318,48 @@ fn parse_command(
         "block" => Ok(ControlCommand::Block { pane, block }),
         "shutdown" => Ok(ControlCommand::Shutdown),
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    #[cfg(unix)]
+    #[test]
+    fn wait_arguments_parse_pane_after_and_timeout() {
+        use super::{WaitArgs, parse_wait};
+        use std::time::Duration;
+        assert_eq!(
+            parse_wait(vec![]),
+            Ok(WaitArgs {
+                pane: None,
+                after: None,
+                timeout: Duration::from_secs(600),
+            })
+        );
+        assert_eq!(
+            parse_wait(
+                ["--pane", "3", "--after", "7", "--timeout", "1.5"]
+                    .map(String::from)
+                    .to_vec()
+            ),
+            Ok(WaitArgs {
+                pane: Some(3),
+                after: Some(7),
+                timeout: Duration::from_millis(1500),
+            })
+        );
+        for args in [
+            vec!["--after", "x"],
+            vec!["--timeout", "-1"],
+            vec!["--timeout", "nan"],
+            vec!["--pane", "1", "--pane", "2"],
+            vec!["--scope", "screen"],
+        ] {
+            assert!(
+                parse_wait(args.iter().map(|arg| arg.to_string()).collect()).is_err(),
+                "{args:?}"
+            );
+        }
     }
 }
 

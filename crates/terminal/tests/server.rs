@@ -246,6 +246,33 @@ fn list_reports_each_pane_state_and_last_exit_status() {
 }
 
 #[test]
+fn wait_returns_the_finished_block_and_times_out_without_a_newer_one() {
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("wait");
+    // The command has not started yet when wait begins; wait keeps polling.
+    stdout(&scratch.ctl(
+        "wait",
+        &[
+            "send-text",
+            "sleep 0.3; printf '\\033]133;C\\033\\\\'; sleep 0.3; printf '\\033]133;D;5\\033\\\\'\n",
+        ],
+    ));
+    let block = json(&scratch.ctl("wait", &["wait", "--timeout", "20"]));
+    assert_eq!(block["state"], "finished");
+    assert_eq!(block["exit_status"], 5);
+
+    let id = block["id"].as_u64().unwrap().to_string();
+    let started = Instant::now();
+    let timed_out = scratch.ctl("wait", &["wait", "--after", &id, "--timeout", "0.5"]);
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert_eq!(timed_out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&timed_out.stderr).trim(),
+        format!("so1ctl: TIMEOUT: no block newer than {id} finished within 0.5s")
+    );
+}
+
+#[test]
 fn server_exits_when_the_last_shell_exits() {
     let scratch = Scratch::new();
     let mut server = scratch.spawn("exit");

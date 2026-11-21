@@ -369,6 +369,30 @@ pub struct RedirectOpen<'a> {
 pub type RedirectOpenHandler =
     Box<dyn FnMut(&RedirectOpen<'_>) -> Option<std::io::Result<std::os::fd::OwnedFd>> + Send>;
 
+/// Decision returned by a [`CommandPolicyHandler`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandPolicyDecision {
+    /// Run the command normally.
+    Allow,
+    /// Refuse the command. The reason, when non-empty, is appended to the
+    /// `<argv0>: denied by policy` diagnostic.
+    Deny(String),
+}
+
+/// Callback that decides whether a command may run.
+///
+/// Called with the expanded argv (`argv[0]` is the command name) of every
+/// simple command before function, builtin, embedder-builtin or external
+/// dispatch and before its redirections are opened. The target argv of
+/// `exec CMD` and `command CMD` (also nested) is checked at that same point,
+/// so a denied `exec` changes no descriptors, and again inside those
+/// builtins. A denial writes
+/// `<argv0>: denied by policy[: <reason>]` to the shell's stderr route and
+/// yields status 126 without running anything. Builtin command substitutions
+/// such as `$(echo ...)` take the ordinary fork path while a policy is
+/// installed so they are checked too.
+pub type CommandPolicyHandler = Box<dyn FnMut(&[ShellBytes]) -> CommandPolicyDecision + Send>;
+
 /// A POSIX shell interpreter instance.
 ///
 /// Each `Shell` maintains its own variable scope, working directory, function
@@ -458,6 +482,8 @@ pub struct Shell {
     embedder_builtins: FxHashMap<String, RegisteredEmbedderBuiltin>,
     /// Optional provider that opens writable redirection targets.
     pub(crate) redirect_open_handler: Option<RedirectOpenHandler>,
+    /// Optional policy consulted before each command runs.
+    command_policy: Option<CommandPolicyHandler>,
     /// PID of the last background command ($!).
     last_bg_pid: Option<u32>,
     /// Pending stdin fd for the next external command, set by setup_redirections
@@ -655,6 +681,7 @@ pub struct ShellBuilder {
     external_handler: Option<ExternalHandler>,
     embedder_builtins: FxHashMap<String, RegisteredEmbedderBuiltin>,
     redirect_open_handler: Option<RedirectOpenHandler>,
+    command_policy: Option<CommandPolicyHandler>,
 }
 
 impl Default for ShellBuilder {
@@ -682,6 +709,7 @@ impl ShellBuilder {
             external_handler: None,
             embedder_builtins: FxHashMap::default(),
             redirect_open_handler: None,
+            command_policy: None,
         }
     }
 
@@ -751,6 +779,11 @@ impl ShellBuilder {
         self.redirect_open_handler = Some(handler);
         self
     }
+    /// Set a policy consulted before each command runs. See [`CommandPolicyHandler`].
+    pub fn command_policy(mut self, handler: CommandPolicyHandler) -> Self {
+        self.command_policy = Some(handler);
+        self
+    }
 
     pub fn build(self) -> Shell {
         let vars = if self.env_clear {
@@ -813,6 +846,7 @@ impl ShellBuilder {
             external_handler: self.external_handler,
             embedder_builtins: self.embedder_builtins,
             redirect_open_handler: self.redirect_open_handler,
+            command_policy: self.command_policy,
             last_bg_pid: None,
             pending_stdin: None,
         }
@@ -873,6 +907,7 @@ impl Shell {
             external_handler: None,
             embedder_builtins: FxHashMap::default(),
             redirect_open_handler: None,
+            command_policy: None,
             last_bg_pid: None,
             pending_stdin: None,
         }
@@ -1613,6 +1648,31 @@ impl Shell {
     /// (`>`, `>|`, `>>`, `<>`). See [`RedirectOpenHandler`].
     pub fn set_redirect_open_handler(&mut self, handler: RedirectOpenHandler) {
         self.redirect_open_handler = Some(handler);
+    }
+
+    /// Install a policy consulted before each command runs. See
+    /// [`CommandPolicyHandler`].
+    pub fn set_command_policy(&mut self, handler: CommandPolicyHandler) {
+        self.command_policy = Some(handler);
+    }
+
+    /// Consult the command policy for `argv`. On denial, write the
+    /// diagnostic and return the status the command yields instead of running.
+    pub(crate) fn command_policy_denial(&mut self, argv: &[String]) -> Option<ExitStatus> {
+        let policy = self.command_policy.as_mut()?;
+        let argv_bytes: Vec<ShellBytes> = argv.iter().cloned().map(Into::into).collect();
+        match policy(&argv_bytes) {
+            CommandPolicyDecision::Allow => None,
+            CommandPolicyDecision::Deny(reason) => {
+                let name = &argv[0];
+                if reason.is_empty() {
+                    self.err_msg(&format!("{name}: denied by policy"));
+                } else {
+                    self.err_msg(&format!("{name}: denied by policy: {reason}"));
+                }
+                Some(ExitStatus::NOT_EXECUTABLE)
+            }
+        }
     }
 
     /// Handle newly launched background jobs immediately instead of deferring
@@ -2433,6 +2493,20 @@ impl Shell {
             self.write_err(&trace);
         }
 
+        // The policy runs before redirections are opened, so a denied
+        // command neither runs nor creates or truncates its targets.
+        if let Some(status) = self.command_policy_denial(&expanded_args) {
+            return Ok(status);
+        }
+        // `exec CMD` and `command CMD` would apply redirections (permanently
+        // for exec) before their builtins check CMD, so check it here first.
+        if self.command_policy.is_some()
+            && let Some(target) = crate::builtins::wrapped_command_target(&expanded_args)
+            && let Some(status) = self.command_policy_denial(target)
+        {
+            return Ok(status);
+        }
+
         let cmd_name = &expanded_args[0];
 
         // exec is special: its redirections are permanent (no save/restore)
@@ -3067,6 +3141,8 @@ impl Shell {
             && assigns.is_empty()
             && redirs.is_empty()
             && !args.is_empty()
+            // A policy must see the command, which the fork path guarantees.
+            && self.command_policy.is_none()
         {
             let mut expanded = Vec::new();
             let expand_ok = (|| -> crate::error::Result<()> {

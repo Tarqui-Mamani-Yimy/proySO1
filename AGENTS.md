@@ -32,6 +32,24 @@ persistent shell, so prompts, variables, functions and cwd can be configured.
 Missing defaults are silent; explicit missing files and rc errors are reported
 with normal REPL recovery (including `set -e` semantics). `exit` in the rc ends
 the session. Piped input, `-c`, and script arguments never source an rc file.
+When `SO1SH_POLICY` is non-empty, the interactive REPL loads that policy file
+before the rc file; a missing, unreadable or invalid file prints one diagnostic
+(`so1sh: policy FILE[:LINE]: ...`) and exits with status 2. One rule per line,
+`#` comments and blank lines ignored: exactly one `default allow|deny`;
+`allow|deny command NAME...` matches argv[0] or its basename; `allow|deny write
+GLOB...` matches the lexically normalized absolute target of `>`, `>|`, `>>` and
+`<>` with `epsh::glob::fnmatch`. Command and write rules each use first match in
+file order, then the default. Denied commands print `NAME: denied by policy` and
+yield 126 without opening their redirections; the targets of `exec CMD` and
+`command CMD` (also nested, as in `command exec CMD`) are checked the same way
+before any redirection, so a denied `exec` leaves the shell's descriptors
+unchanged, and commands run through `eval` are checked too. A denied write
+prints `PATH: denied by policy` and aborts the rest of the line like any failed
+redirection. A `default deny` policy also governs startup and exit: the rc file
+is sourced through `.`, so it needs `allow command .`, and `exit` needs
+`allow command exit`. Piped input, `-c` and scripts ignore `SO1SH_POLICY`. It is not a sandbox:
+programs that run other programs (`env`, `xargs`, `sh -c`, interpreters),
+symlinks in write targets, and reads are not policed.
 `PS1` and `PS2` undergo POSIX parameter expansion before each prompt (heredoc-body
 quoting, as in dash), so `PS1='$PWD $ '` follows `cd`; command substitution,
 backticks and arithmetic are rejected so drawing a prompt never runs code, and any
@@ -70,6 +88,7 @@ crates/shell/
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
   src/jobs.rs     Job table, job specs and the `jobs` builtin
+  src/policy.rs   Opt-in `SO1SH_POLICY` command/write policy parser and hooks
   src/prompt.rs   PS1/PS2 expansion and the default prompt (cwd, git branch, status)
   src/sysinfo.rs  Startup system banner, distro logos and the `sysinfo` builtin
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
@@ -125,7 +144,7 @@ A control `attach` request upgrades its connection to the attach stream (`crates
 ## Embedding API
 
 ```rust
-use epsh::eval::Shell;
+use epsh::eval::{CommandPolicyDecision, Shell};
 use epsh::parser::Parser;
 use epsh::builtins::{is_builtin, BUILTIN_NAMES};
 
@@ -162,6 +181,19 @@ shell.set_external_handler(Box::new(|argv, prefix_assignments| {
 shell.set_redirect_open_handler(Box::new(|request| {
     let _ = (request.path, request.mode, request.fd);
     None
+}));
+
+// Optional: refuse commands before they run. Called with the expanded argv
+// of every simple command (before function/builtin/external dispatch and
+// before its redirections open, including the target of `exec CMD` and
+// `command CMD`) and again inside those builtins. Deny writes `<argv0>: denied by policy[: <reason>]` to the
+// shell's stderr route and yields 126. Also `ShellBuilder::command_policy`.
+shell.set_command_policy(Box::new(|argv| {
+    if argv[0].as_bytes() == b"rm" {
+        CommandPolicyDecision::Deny(String::from("agents may not delete"))
+    } else {
+        CommandPolicyDecision::Allow
+    }
 }));
 
 // Interactive shell primitives

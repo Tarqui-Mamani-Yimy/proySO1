@@ -621,6 +621,10 @@ impl Shell {
             return Ok(ExitStatus::SUCCESS);
         }
 
+        if let Some(status) = self.command_policy_denial(&args[1..]) {
+            return Ok(status);
+        }
+
         // exec with command — replace process
         let args_bytes: Vec<ShellBytes> = args.iter().cloned().map(Into::into).collect();
         let env = self.vars.env_for_command_os(&[]);
@@ -638,28 +642,7 @@ impl Shell {
         if args.len() <= 1 {
             return Ok(ExitStatus::SUCCESS);
         }
-        let mut mode = None; // None = execute, Some('v') = -v, Some('V') = -V
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-v" => {
-                    mode = Some('v');
-                    i += 1;
-                }
-                "-V" => {
-                    mode = Some('V');
-                    i += 1;
-                }
-                "-p" => {
-                    i += 1;
-                } // -p: use default PATH (ignored for now)
-                "--" => {
-                    i += 1;
-                    break;
-                }
-                _ => break,
-            }
-        }
+        let (mode, i) = parse_command_options(args);
         if i >= args.len() {
             return Ok(ExitStatus::SUCCESS);
         }
@@ -698,6 +681,9 @@ impl Shell {
         }
 
         let new_args: Vec<String> = args[i..].to_vec();
+        if let Some(status) = self.command_policy_denial(&new_args) {
+            return Ok(status);
+        }
 
         // `command` bypasses functions but NOT builtins. External commands use
         // the embedder's handler when one is installed, like ordinary lookup.
@@ -1291,6 +1277,50 @@ impl Shell {
 
         self.write_out(&out);
         ExitStatus::SUCCESS
+    }
+}
+
+/// Parse the options of `command`: the describe mode (`-v`/`-V`, `None` to
+/// execute) and the index of the first operand.
+fn parse_command_options(args: &[String]) -> (Option<char>, usize) {
+    let mut mode = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" => mode = Some('v'),
+            "-V" => mode = Some('V'),
+            "-p" => {} // -p: use default PATH (ignored for now)
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    (mode, i)
+}
+
+/// The argv `exec` or `command` would run for `argv`, unwrapping nested
+/// wrappers such as `command exec CMD`. `None` when `argv` is not such a
+/// wrapper or runs nothing (`exec` alone, `command -v`, `command` alone).
+pub(crate) fn wrapped_command_target(argv: &[String]) -> Option<&[String]> {
+    let mut target = None;
+    let mut current = argv;
+    loop {
+        let start = match current.first().map(String::as_str) {
+            Some("exec") => 1,
+            Some("command") => match parse_command_options(current) {
+                (None, i) => i,
+                (Some(_), _) => return target,
+            },
+            _ => return target,
+        };
+        if start >= current.len() {
+            return target;
+        }
+        current = &current[start..];
+        target = Some(current);
     }
 }
 

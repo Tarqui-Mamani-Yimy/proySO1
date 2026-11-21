@@ -139,6 +139,14 @@ fn startup_rc_command(shell: &Shell) -> Option<&'static str> {
     (!matches!(path.try_exists(), Ok(false))).then_some(". \"$HOME/.so1shrc\"")
 }
 
+/// Interactive command policy file from a non-empty `SO1SH_POLICY`.
+fn policy_path(shell: &Shell) -> Option<PathBuf> {
+    shell
+        .get_var_bytes("SO1SH_POLICY")
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_path_buf())
+}
+
 /// Reedline owns editing/history; epsh owns parsing, evaluation, and exit semantics.
 pub fn run(shell: &mut Shell) -> i32 {
     match read_lines(shell) {
@@ -151,6 +159,16 @@ pub fn run(shell: &mut Shell) -> i32 {
 }
 
 fn read_lines(shell: &mut Shell) -> io::Result<i32> {
+    // Fail closed before the rc file or any prompt when the policy is unusable.
+    if let Some(path) = policy_path(shell) {
+        match crate::policy::load(&path) {
+            Ok(policy) => crate::policy::install(shell, policy),
+            Err(diagnostic) => {
+                eprintln!("{diagnostic}");
+                return Ok(2);
+            }
+        }
+    }
     let jobs = crate::jobs::register(shell)
         .map_err(|error| io::Error::other(format!("so1sh: jobs builtin: {error}")))?;
     crate::sysinfo::register_sysinfo_builtin(shell)

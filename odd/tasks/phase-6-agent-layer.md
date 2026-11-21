@@ -1,12 +1,20 @@
 # Phase 6 — Agent layer
 
 Objective: expose a generic, agent-agnostic contract (block metadata, per-pane state, waiting) over the so1term control API, and a command-permission policy on epsh hooks. No Pi-specific integration.
-Branch: `feat/phase-6-agent-layer`. Delivery strategy: `ask-on-risk`. Test runner: `cargo test --workspace` (focused: `cargo test -p so1-term-core`, `cargo test -p so1-terminal --test server`).
+Branch: `feat/phase-6-agent-layer`. Delivery strategy: `ask-on-risk` → chain `stacked-to-main` (user, 2026-11-21). Slice 1 = T1+T2 (`238ac6e`, `436ad9a`). Test runner: `cargo test --workspace` (focused: `cargo test -p so1-term-core`, `cargo test -p so1-terminal --test server`).
 
 ## Specs
 
 - **S1** — planing.md Fase 6: "Chequeo de permisos de comandos de agentes vía AST de epsh."
-  Design notes (from sugPerms.md, not user strings): enforce on expanded argv through epsh hooks, not on the AST alone; it is not a security boundary. Scope, policy format and who installs it are an open product decision (see Log).
+  Decision (user, 2026-11-21, L11): "En so1sh, opt-in (Recomendado)" — so1sh loads a policy file (for example `$SO1SH_POLICY`) and enforces it at run time through epsh hooks on the expanded argv, writable redirections and builtins such as `exec`. It covers agents driving a so1sh pane with `so1ctl send-text`. It is not a sandbox.
+  T5 design (orchestrator, derived from the decision; not user strings):
+  - **epsh hook (S1a).** New embedding API `Shell::set_command_policy(Box<dyn FnMut(&[ShellBytes]) -> CommandPolicyDecision + Send>)` with `enum CommandPolicyDecision { Allow, Deny(String) }` (reason may be empty). It is called with the expanded argv of every simple command before function, builtin, embedder-builtin or external dispatch (`eval_simple`), and again with the target argv inside `exec CMD` (`builtin_exec`, before `execve`) and `command CMD` (`builtin_command`). Denial writes `<argv0>: denied by policy` (plus `: <reason>` when non-empty) through the shell's stderr path and yields status 126 without running anything; `set -e` and `||` behave as for any status-126 command. Without a policy, behavior is unchanged. Update `tests/api_stability.rs` and the AGENTS.md Embedding API section.
+  - **so1sh policy (S1b).** When `SO1SH_POLICY` is non-empty, the interactive REPL reads that file at startup, before the rc file. A missing, unreadable or invalid file prints one diagnostic naming the file and line and exits with status 2 (fail closed). Piped input, `-c` and scripts ignore it (documented). Format, one rule per line, `#` comments and blank lines ignored, first matching rule wins, in file order:
+    - `default allow` or `default deny` — required exactly once; applies when no rule matches.
+    - `allow command NAME...` / `deny command NAME...` — a NAME matches when it equals argv[0] or the basename of argv[0].
+    - `allow write GLOB...` / `deny write GLOB...` — matched with `epsh::glob::fnmatch` against the lexically normalized absolute target of a writable redirection (`>`, `>|`, `>>`, `<>`; relative paths resolved against the shell cwd). Write rules use their own first-match order; when none matches, the `default` applies.
+    - Commands are enforced through the S1a hook; writes through `set_redirect_open_handler` (deny = `Some(Err(PermissionDenied))`, allow = `None`).
+  - **Not a sandbox (documented):** external programs that run other programs (`env`, `xargs`, `sh -c`, interpreters), symlinks in write targets, and reads are not policed.
 - **S2** — planing.md Fase 6: "Estado por panel de agente (trabajando / bloqueado / ocioso)."
   Derived from OSC 133 (running between C and D, idle at a prompt). "bloqueado" has no reliable signal yet; assumption: report it only when a signal exists, never guessed.
 - **S3** — planing.md Fase 6: "Contrato genérico para agentes vía `so1ctl` (metadatos de bloques, `wait`, `status`). Sin integración específica con Pi: cualquier agente, Pi incluido, es un cliente más."
@@ -17,11 +25,11 @@ Branch: `feat/phase-6-agent-layer`. Delivery strategy: `ask-on-risk`. Test runne
 
 | ID | Specs | Route | Status | Commit |
 |---|---|---|---|---|
-| T1 — Block wall-clock times and a metadata accessor in term-core (command text, cwd, exit status, state, start/end, duration, explicit evicted result) | S3 | inline | pending | |
-| T2 — Shared control helpers + new `block` control command (window and server) + `so1ctl block` | S3 | inline | pending | |
-| T3 — Per-pane state in `list` (idle / running, last exit status) for window and server | S2, S3 | inline | pending | |
-| T4 — `so1ctl wait` (client-side, bounded timeout, waits for the pane's running block to finish) | S3 | inline | pending | |
-| T5 — Command-permission policy on epsh hooks | S1 | inline | blocked: product decision | |
+| T1 — Block wall-clock times and a metadata accessor in term-core (command text, cwd, exit status, state, start/end, duration, explicit evicted result) | S3 | inline | done (RED: missing API compile errors; GREEN: 4 new tests, workspace green) | `238ac6e` |
+| T2 — Shared control helpers + new `block` control command (window and server) + `so1ctl block` | S3 | inline | done (RED: missing variant/function compile errors; GREEN: protocol, so1ctl and server tests) | `436ad9a` |
+| T3 — Per-pane state in `list` (idle / running, last exit status) for window and server | S2, S3 | inline | done (RED: missing API + server test assertion; GREEN) | `d5f6161` |
+| T4 — `so1ctl wait` (client-side, bounded timeout, waits for the pane's running block to finish) | S3 | inline | done (RED: missing parse_wait + server test; GREEN; differential check of shared socket resolution) | `5137845` |
+| T5 — Command-permission policy on epsh hooks | S1 | inline | in progress | |
 | T6 — Docs (AGENTS.md, resumen.md, `so1ctl --help`) and phase verification | S4 | inline | pending | |
 
 ## Log
@@ -30,4 +38,13 @@ Branch: `feat/phase-6-agent-layer`. Delivery strategy: `ask-on-risk`. Test runne
 - **L2** (2026-11-21): planing.md Fase 6 item 3 changed from "Integración con Pi por su modo RPC" to the generic contract (S3); sugPerms.md records the decision.
 - **L3** (2026-11-21, mapping): `Block` holds stream offsets only (`blocks.rs` `PhaseBoundaries`), no wall-clock times. Control dispatch is duplicated in `crates/terminal/src/main.rs:1791` and `crates/terminal/src/session.rs:343`, including the `list` JSON. Protocol v1 is strict (`allowed_fields`), so new capability is added as new commands. so1sh installs no `ExternalHandler`; `exec`, `kill` and `cd` bypass it; the redirect hook only sees writable redirections. `so1ctl` is hand-rolled and prints compact JSON.
 - **L4**: forecast ~1250 authored lines (T1 250, T2 250, T3 120, T4 150, T5 400, T6 80); chain strategy to be asked before the commit that crosses ~400 lines.
-- Next: T1.
+- **L5**: T1 done in `238ac6e`. Assess (committed-only from `32d0740`, untracked notes excluded): medium, `under_budget`, no review; slice stays pending. Risk: none.
+- **L6**: T2 done in `436ad9a` (new v1 `block` command, `EVICTED` error code, shared `block_result`, `so1ctl block [--pane ID] [--id N]`). Chain strategy chosen by the user: `stacked-to-main`. Slice assess from `32d0740`: high (`process_boundary`, server test spawns shells), `review_due`; consent granted by the user; native review lineage `review-83c0ede20d0db5c8` with lenses readability + reliability running. Risk: none (adds a command and an error code; no existing command changed).
+- **L7**: slice 1 review `review-83c0ede20d0db5c8` approved and acknowledged. Advisory follow-ups (non-blocking): R2-001/R3-evicted-boundary at `crates/term-core/src/blocks.rs:186-189` (clarify and test the evicted-vs-unknown id boundary); R2-002/R3-window-dispatch-untested at `crates/terminal/src/main.rs:1924-1938` (window `block` dispatch untested and duplicated with the server). Reviewed boundary is now `436ad9a`.
+- **L8**: T3 done in `d5f6161`: `list` panes gain `state` (`unknown`/`idle`/`running`) and `last_exit_status`. "bloqueado" is not reported (no reliable signal). Review `review-e67a9ac4a5a67a54` (reliability) approved and acknowledged; advisory R3-gui-list-untested at `crates/terminal/src/main.rs:1813`. Risk: none (adds response fields).
+- **L9**: T4 done in `5137845`: client-side `so1ctl wait [--pane ID] [--after ID] [--timeout SECS]` (default 600 s, polls `block` every 50 ms). `--after` avoids returning the block that finished before the awaited command started. Socket resolution moved into `resolve_socket`; differential check against `d5f6161` (missing socket, unknown command) shows identical stderr and exit codes. Review lenses resilience + readability running. Slice 2 = T3+T4. Risk: none (adds a CLI command).
+- **L10**: T4 review `review-159b130937e42a46` (resilience + readability) approved and acknowledged. Fixed two advisories in `c42b2ff` (RED: `wait_deadline` missing; GREEN): R4-deadline-overflow-panic (huge `--timeout` now waits without a deadline) and R4-brittle-notfound-match (shared `NO_COMMAND_BLOCK` constant). Assess: medium, `under_budget`. Remaining advisories (non-blocking): R2-001..003 readability in `so1ctl.rs` wait parsing/loop; R4-timeout-not-bounding-request (a single request can still block up to the 30 s socket timeout past `--timeout`).
+- **L11** (2026-11-21, user answer to the T5 scope question): "En so1sh, opt-in (Recomendado)". Risk: item 2 (security guard) → independent verifier after its checks.
+- **L12**: T5 route: delegated writer (trigger: long-session context backstop). Writer status `done`, S1 covered: epsh `set_command_policy` / `CommandPolicyDecision` (checked in `eval_simple` before redirections, in `exec` and `command`; in-process `$(builtin)` shortcut disabled while a policy is installed), `crates/shell/src/policy.rs`, REPL fail-closed load, AGENTS.md. RED observed for 14 epsh, 8 parser and 5 PTY tests; workspace green. Parent spot check: `cargo test -p so1sh --test repl command_policy` → 5 passed. Pre-existing bug found (not in scope): `epsh -c 'exec echo hi'` → `exec: exec: No such file or directory`, status 126 (`builtin_exec` passes argv with "exec" at index 0 to execve). Independent verifier running.
+- **L13**: Verifier verdict S1 partial, S4 partial. Blockers: `exec DENIED > file` truncates the file and keeps stdout redirected; `command DENIED > file` truncates the file (checks run after `eval_simple` opened redirections). AGENTS.md claims the opposite. Non-blocking: default-deny also governs rc sourcing via `.` and `exit`; denied writes print two lines (pre-existing redirection-failure behavior); invalid-UTF-8 diagnostic lacks a line; `#` cannot appear in globs. ~30 bypass probes passed; differential (no policy) identical on 12 scripts. One correction batch sent to the writer (both blockers + doc fixes).
+- Next: correction result, recheck limited to the two blockers, commit T5, review, then T6.

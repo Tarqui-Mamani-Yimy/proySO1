@@ -140,3 +140,41 @@ fn non_interactive_modes_ignore_startup_rc_files() {
         assert_output(child.wait_with_output().unwrap(), 0, b"piped\n");
     }
 }
+
+#[test]
+fn non_interactive_modes_ignore_command_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let deny_all = dir.path().join("deny-all");
+    std::fs::write(&deny_all, "default deny\n").unwrap();
+    std::fs::write(dir.path().join("script.sh"), "echo script > out; cat out\n").unwrap();
+    for policy in [deny_all.as_os_str(), "missing-policy".as_ref()] {
+        let configured = || {
+            let mut command = command(&dir);
+            command.env("SO1SH_POLICY", policy);
+            command
+        };
+        assert_output(
+            configured().args(["-c", "echo command"]).output().unwrap(),
+            0,
+            b"command\n",
+        );
+        assert_output(
+            configured().arg("script.sh").output().unwrap(),
+            0,
+            b"script\n",
+        );
+        let mut child = configured()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"echo piped\n")
+            .unwrap();
+        assert_output(child.wait_with_output().unwrap(), 0, b"piped\n");
+    }
+}

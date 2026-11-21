@@ -2804,3 +2804,156 @@ mod startup_banner {
         exited(&mut session, 0);
     }
 }
+
+mod command_policy {
+    use super::*;
+
+    /// Start so1sh with `SO1SH_POLICY` pointing at `policy_path`.
+    fn session_with_policy_path(
+        dir: &TempDir,
+        policy_path: &std::path::Path,
+        rc: Option<&str>,
+    ) -> PtySession {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        command
+            .env_clear()
+            .env("PS1", "$ ")
+            .env("SO1SH_BANNER", "0")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "dumb")
+            .env("SO1SH_SHELL_INTEGRATION", "0")
+            .env("SO1SH_KITTY_KEYBOARD", "0")
+            .env("SO1SH_HIGHLIGHT", "0")
+            .env("HOME", dir.path())
+            .env("SO1SH_POLICY", policy_path)
+            .current_dir(dir.path());
+        if let Some(rc) = rc {
+            std::fs::write(dir.path().join("rc"), rc).unwrap();
+            command.env("SO1SH_RC", dir.path().join("rc"));
+        }
+        let mut session = spawn_pty(command);
+        session.process_mut().set_kill_timeout(Some(1000));
+        session
+    }
+
+    fn policy_session(dir: &TempDir, policy: &str, rc: Option<&str>) -> PtySession {
+        let policy_path = dir.path().join("policy");
+        std::fs::write(&policy_path, policy).unwrap();
+        session_with_policy_path(dir, &policy_path, rc)
+    }
+
+    #[test]
+    fn denied_command_reports_and_the_prompt_continues() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = policy_session(&dir, "default allow\ndeny command touch\n", None);
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "/usr/bin/touch made");
+        session
+            .exp_string("/usr/bin/touch: denied by policy\r\n")
+            .unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo status=$?");
+        session.exp_string("status=126\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        assert!(!dir.path().join("made").exists());
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn denied_exec_target_keeps_stdout_on_the_terminal() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t5"), "keep\n").unwrap();
+        let mut session = policy_session(&dir, "default allow\ndeny command rm cat\n", None);
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exec rm victim > t5; echo A$?");
+        session.exp_string("rm: denied by policy\r\n").unwrap();
+        session.exp_string("A126\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo after");
+        session.exp_string("after\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t5")).unwrap(),
+            "keep\n"
+        );
+        submit(&mut session, "exit 0");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn denied_write_redirection_creates_nothing() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = policy_session(&dir, "default allow\ndeny write */blocked\n", None);
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo hi > sub/../blocked");
+        session
+            .exp_string("sub/../blocked: denied by policy")
+            .unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo ok > allowed; echo done");
+        session.exp_string("done\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        assert!(!dir.path().join("blocked").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("allowed")).unwrap(),
+            "ok\n"
+        );
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn policy_applies_before_the_rc_file() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = policy_session(
+            &dir,
+            "default allow\ndeny command touch\n",
+            Some("touch fromrc\n"),
+        );
+        session.exp_string("touch: denied by policy").unwrap();
+        session.exp_string("$ ").unwrap();
+        assert!(!dir.path().join("fromrc").exists());
+        submit(&mut session, "echo status=$?");
+        session.exp_string("status=126\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit 0");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn invalid_policy_file_exits_with_status_2() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = policy_session(
+            &dir,
+            "default deny\nallow everything\n",
+            Some("touch fromrc\n"),
+        );
+        let path = dir.path().join("policy");
+        session
+            .exp_string(&format!(
+                "so1sh: policy {}:2: unknown rule kind `everything`; expected `command` or `write`",
+                path.display()
+            ))
+            .unwrap();
+        exited(&mut session, 2);
+        assert!(!dir.path().join("fromrc").exists());
+    }
+
+    #[test]
+    fn missing_policy_file_exits_with_status_2() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let mut session = session_with_policy_path(&dir, &missing, None);
+        session
+            .exp_string(&format!("so1sh: policy {}: ", missing.display()))
+            .unwrap();
+        exited(&mut session, 2);
+    }
+}

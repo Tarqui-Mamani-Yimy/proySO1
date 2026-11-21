@@ -415,3 +415,22 @@ fn result_type_alias() {
         Ok(())
     }
 }
+
+#[test]
+fn command_policy_api_is_additive() {
+    let handler: eval::CommandPolicyHandler = Box::new(|argv: &[shell_bytes::ShellBytes]| {
+        if argv[0].as_bytes() == b"rm" {
+            eval::CommandPolicyDecision::Deny(String::from("reason"))
+        } else {
+            eval::CommandPolicyDecision::Allow
+        }
+    });
+    let _shell = eval::Shell::builder().command_policy(handler).build();
+    let _: fn(&mut eval::Shell, eval::CommandPolicyHandler) = eval::Shell::set_command_policy;
+    let decision = eval::CommandPolicyDecision::Deny(String::new());
+    assert_eq!(
+        decision.clone(),
+        eval::CommandPolicyDecision::Deny(String::new())
+    );
+    assert_ne!(decision, eval::CommandPolicyDecision::Allow);
+}

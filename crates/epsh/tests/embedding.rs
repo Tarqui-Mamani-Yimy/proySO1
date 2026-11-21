@@ -2053,3 +2053,358 @@ mod interactive_wait {
         assert!(joined, "cleanup returned before its relay thread finished");
     }
 }
+
+mod command_policy {
+    use super::*;
+    use epsh::eval::{CommandPolicyDecision, CommandPolicyHandler};
+    use epsh::shell_bytes::ShellBytes;
+
+    type Calls = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// Records every argv and denies commands named in `denied` with `reason`.
+    fn recording_policy(
+        calls: Calls,
+        denied: &'static [&'static str],
+        reason: &'static str,
+    ) -> CommandPolicyHandler {
+        Box::new(move |argv: &[ShellBytes]| {
+            let argv: Vec<String> = argv
+                .iter()
+                .map(|arg| String::from_utf8_lossy(arg.as_bytes()).into_owned())
+                .collect();
+            let deny = denied.contains(&argv[0].as_str());
+            calls.lock().unwrap().push(argv);
+            if deny {
+                CommandPolicyDecision::Deny(reason.to_string())
+            } else {
+                CommandPolicyDecision::Allow
+            }
+        })
+    }
+
+    struct Run {
+        status: i32,
+        stdout: String,
+        stderr: String,
+        calls: Vec<Vec<String>>,
+    }
+
+    fn run_with_policy(
+        dir: &std::path::Path,
+        denied: &'static [&'static str],
+        reason: &'static str,
+        script: &str,
+    ) -> Run {
+        let calls = Calls::default();
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .cwd(dir.to_path_buf())
+            .stdout_sink(stdout.clone())
+            .stderr_sink(stderr.clone())
+            .command_policy(recording_policy(calls.clone(), denied, reason))
+            .build();
+        let status = shell.run_script(script);
+        let stdout = String::from_utf8_lossy(&stdout.lock().unwrap()).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
+        let calls = calls.lock().unwrap().clone();
+        Run {
+            status,
+            stdout,
+            stderr,
+            calls,
+        }
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn denied_external_command_runs_nothing() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &["touch"], "", "touch created");
+        assert_eq!(run.status, 126);
+        assert_eq!(run.stderr, "touch: denied by policy\n");
+        assert_eq!(run.stdout, "");
+        assert!(!dir.path().join("created").exists());
+        assert_eq!(run.calls, vec![argv(&["touch", "created"])]);
+    }
+
+    #[test]
+    fn denial_reason_is_appended_when_non_empty() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["touch"],
+            "agents may not create files",
+            "touch created",
+        );
+        assert_eq!(run.status, 126);
+        assert_eq!(
+            run.stderr,
+            "touch: denied by policy: agents may not create files\n"
+        );
+        assert!(!dir.path().join("created").exists());
+    }
+
+    #[test]
+    fn denied_command_does_not_open_its_redirections() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &["touch"], "", "touch created > out");
+        assert_eq!(run.status, 126);
+        assert_eq!(run.stderr, "touch: denied by policy\n");
+        assert!(!dir.path().join("out").exists());
+        assert!(!dir.path().join("created").exists());
+    }
+
+    #[test]
+    fn denied_builtin_does_not_run() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &["cd"], "", "cd /; echo $?; pwd");
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stderr, "cd: denied by policy\n");
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        let out_dir = run.stdout.lines().nth(1).unwrap().to_string();
+        assert_eq!(run.stdout.lines().next(), Some("126"));
+        assert_eq!(fs::canonicalize(out_dir).unwrap(), canonical);
+    }
+
+    #[test]
+    fn denied_function_call_does_not_run_its_body() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &["greet"], "", "greet() { echo hi; }; greet");
+        assert_eq!(run.status, 126);
+        assert_eq!(run.stdout, "");
+        assert_eq!(run.stderr, "greet: denied by policy\n");
+    }
+
+    #[test]
+    fn exec_target_is_checked_before_execve() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &["touch"], "", "exec touch created");
+        assert_eq!(run.status, 126);
+        assert_eq!(run.stderr, "touch: denied by policy\n");
+        assert!(!dir.path().join("created").exists());
+        assert_eq!(
+            run.calls,
+            vec![
+                argv(&["exec", "touch", "created"]),
+                argv(&["touch", "created"])
+            ]
+        );
+    }
+
+    #[test]
+    fn command_target_is_checked() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["touch", "printf"],
+            "",
+            "command touch created; command printf no",
+        );
+        assert_eq!(run.status, 126);
+        assert_eq!(run.stdout, "");
+        assert_eq!(
+            run.stderr,
+            "touch: denied by policy\nprintf: denied by policy\n"
+        );
+        assert!(!dir.path().join("created").exists());
+        assert_eq!(
+            run.calls,
+            vec![
+                argv(&["command", "touch", "created"]),
+                argv(&["touch", "created"]),
+                argv(&["command", "printf", "no"]),
+                argv(&["printf", "no"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_commands_are_checked() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &["touch"], "", "eval 'touch created'");
+        assert_eq!(run.status, 126);
+        assert_eq!(run.stderr, "touch: denied by policy\n");
+        assert!(!dir.path().join("created").exists());
+    }
+
+    #[test]
+    fn denial_status_feeds_or_lists() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["touch"],
+            "",
+            "touch created || printf fallback",
+        );
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stdout, "fallback");
+        assert_eq!(run.stderr, "touch: denied by policy\n");
+    }
+
+    #[test]
+    fn builtin_command_substitution_is_checked() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["echo"],
+            "",
+            "x=$(echo hi); printf '[%s]' \"$x\"",
+        );
+        // The substitution runs in a forked child, so the parent's recorded
+        // calls cannot observe it; the empty capture proves echo never ran.
+        assert_eq!(run.stdout, "[]");
+        assert_eq!(run.status, 0);
+    }
+
+    #[test]
+    fn allowed_commands_run_unchanged() {
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(dir.path(), &[], "", "echo hi; touch created");
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stdout, "hi\n");
+        assert_eq!(run.stderr, "");
+        assert!(dir.path().join("created").exists());
+        assert_eq!(
+            run.calls,
+            vec![argv(&["echo", "hi"]), argv(&["touch", "created"])]
+        );
+    }
+
+    #[test]
+    fn set_command_policy_installs_a_policy() {
+        let dir = tempdir().unwrap();
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .cwd(dir.path().to_path_buf())
+            .stderr_sink(stderr.clone())
+            .build();
+        shell.set_command_policy(recording_policy(Calls::default(), &["touch"], ""));
+        assert_eq!(shell.run_script("touch created"), 126);
+        assert_eq!(
+            String::from_utf8_lossy(&stderr.lock().unwrap()),
+            "touch: denied by policy\n"
+        );
+        assert!(!dir.path().join("created").exists());
+    }
+
+    #[test]
+    fn without_policy_exec_command_and_eval_keep_running() {
+        let dir = tempdir().unwrap();
+        let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .cwd(dir.path().to_path_buf())
+            .stdout_sink(stdout.clone())
+            .build();
+        let status = shell.run_script(
+            "command printf a; eval 'printf b'; x=$(echo c); printf %s \"$x\"; touch created > out",
+        );
+        assert_eq!(status, 0);
+        assert_eq!(String::from_utf8_lossy(&stdout.lock().unwrap()), "abc");
+        assert!(dir.path().join("created").exists());
+        assert!(dir.path().join("out").exists());
+    }
+
+    #[test]
+    fn denied_exec_target_keeps_redirections_closed() {
+        if isolated_test("command_policy::denied_exec_target_keeps_redirections_closed") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("t5"), "keep\n").unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["rm"],
+            "",
+            "exec rm victim > t5; echo A$?; echo after",
+        );
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stderr, "rm: denied by policy\n");
+        // Later output still reaches the original stdout, not the file.
+        assert_eq!(run.stdout, "A126\nafter\n");
+        assert_eq!(fs::read_to_string(dir.path().join("t5")).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn denied_command_target_keeps_redirections_closed() {
+        if isolated_test("command_policy::denied_command_target_keeps_redirections_closed") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("t2"), "keep\n").unwrap();
+        fs::write(dir.path().join("t3"), "keep\n").unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["rm"],
+            "",
+            "command rm victim > t2; echo B$?; command -p -- exec rm victim > t3; echo C$?",
+        );
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stderr, "rm: denied by policy\nrm: denied by policy\n");
+        assert_eq!(run.stdout, "B126\nC126\n");
+        assert_eq!(fs::read_to_string(dir.path().join("t2")).unwrap(), "keep\n");
+        assert_eq!(fs::read_to_string(dir.path().join("t3")).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn exec_without_command_and_command_describe_stay_allowed() {
+        if isolated_test("command_policy::exec_without_command_and_command_describe_stay_allowed") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let run = run_with_policy(
+            dir.path(),
+            &["rm"],
+            "",
+            "command -v rm > described; exec 3> opened; echo ok >&3",
+        );
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stderr, "");
+        assert!(
+            fs::read_to_string(dir.path().join("described"))
+                .unwrap()
+                .ends_with("rm\n")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("opened")).unwrap(),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    fn denial_inside_a_pipeline() {
+        if isolated_test("command_policy::denial_inside_a_pipeline") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let mut shell = Shell::builder()
+            .cwd(dir.path().to_path_buf())
+            .pipefail(true)
+            .command_policy(recording_policy(Calls::default(), &["touch"], ""))
+            .build();
+        let status = shell.run_script("touch created | true");
+        assert_eq!(status, 126);
+        assert!(!dir.path().join("created").exists());
+        let status = shell.run_script("true | touch created");
+        assert_eq!(status, 126);
+        assert!(!dir.path().join("created").exists());
+    }
+
+    #[test]
+    fn denial_inside_a_background_job() {
+        if isolated_test("command_policy::denial_inside_a_background_job") {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let mut shell = Shell::builder()
+            .cwd(dir.path().to_path_buf())
+            .command_policy(recording_policy(Calls::default(), &["touch"], ""))
+            .build();
+        let status = shell.run_script("touch created & wait $!");
+        assert_eq!(status, 126);
+        assert!(!dir.path().join("created").exists());
+    }
+}

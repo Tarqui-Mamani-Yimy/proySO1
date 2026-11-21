@@ -161,6 +161,13 @@ fn parse_wait(args: Vec<String>) -> Result<WaitArgs, String> {
     Ok(wait)
 }
 
+/// Deadline of a wait, or `None` when the timeout is too large to represent
+/// (the wait then has no deadline).
+#[cfg(unix)]
+fn wait_deadline(timeout: std::time::Duration) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(timeout)
+}
+
 /// Polls the `block` command until the pane's newest command block (newer
 /// than `--after`, when given) has finished, then prints it.
 #[cfg(unix)]
@@ -169,7 +176,7 @@ fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), Strin
         self, ControlCommand, ControlErrorCode, ControlOutcome, ControlRequest,
     };
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + wait.timeout;
+    let deadline = wait_deadline(wait.timeout);
     let mut id = 1;
     loop {
         let request = ControlRequest {
@@ -198,12 +205,12 @@ fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), Strin
             // No command has run yet: keep waiting for the first one.
             ControlOutcome::Failure(error)
                 if error.code == ControlErrorCode::NotFound
-                    && error.message.ends_with("has not run a command") => {}
+                    && error.message.ends_with(control::NO_COMMAND_BLOCK) => {}
             ControlOutcome::Failure(error) => {
                 return Err(format!("{}: {}", error.code.as_str(), error.message));
             }
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let what = wait.after.map_or("no command block".to_owned(), |after| {
                 format!("no block newer than {after}")
             });
@@ -323,6 +330,15 @@ fn parse_command(
 
 #[cfg(test)]
 mod wait_tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_huge_timeout_waits_without_a_deadline_instead_of_panicking() {
+        use std::time::Duration;
+        assert!(super::wait_deadline(Duration::from_secs(1)).is_some());
+        assert_eq!(super::wait_deadline(Duration::MAX), None);
+        assert!(super::parse_wait(vec!["--timeout".into(), "1e19".into()]).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn wait_arguments_parse_pane_after_and_timeout() {

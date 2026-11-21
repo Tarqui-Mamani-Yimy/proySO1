@@ -1,7 +1,7 @@
 pub use so1_term_core::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
-    ControlRequest, ControlResponse, MAX_REQUEST_LINE_BYTES, TextScope, block_result,
-    parse_request, parse_response, serialize_request, serialize_response,
+    ControlRequest, ControlResponse, MAX_REQUEST_LINE_BYTES, NO_COMMAND_BLOCK, TextScope,
+    block_result, parse_request, parse_response, serialize_request, serialize_response,
 };
 
 /// Longest accepted `so1term-server --session` name.

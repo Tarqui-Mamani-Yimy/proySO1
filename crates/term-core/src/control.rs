@@ -271,6 +271,10 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
     }
 }
 
+/// Ends the `NOT_FOUND` message of a `block` request for a pane that has not
+/// run any command yet; `so1ctl wait` keeps polling on it.
+pub const NO_COMMAND_BLOCK: &str = "has not run a command";
+
 /// Builds the `block` command result for one pane's model, shared by the
 /// window and the session server. Missing blocks map to `NOT_FOUND` and
 /// discarded ones to `EVICTED`; text no longer retained is reported through
@@ -294,7 +298,7 @@ pub fn block_result(
         ),
         BlockLookupError::NoCommandBlock => (
             ControlErrorCode::NotFound,
-            format!("pane {pane} has not run a command"),
+            format!("pane {pane} {NO_COMMAND_BLOCK}"),
         ),
     })?;
     let millis = |time: Option<std::time::SystemTime>| {

@@ -495,6 +495,8 @@ impl Session {
                             "cwd": pane.map(|pane| pane.cwd.to_string_lossy().into_owned()).unwrap_or_default(),
                             "title": pane.map(|pane| pane.title.clone()).unwrap_or_default(),
                             "focused": index == active && tab.active_pane() == *pane_id,
+                            "state": pane.map_or("unknown", |pane| pane.model.blocks().activity().as_str()),
+                            "last_exit_status": pane.and_then(|pane| pane.model.blocks().last_exit_status()),
                         })
                     })
                     .collect();

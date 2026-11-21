@@ -46,6 +46,27 @@ pub struct BlockTimes {
     pub finished: Option<SystemTime>,
 }
 
+/// What a pane's shell is doing, as reported by its integration marks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneActivity {
+    /// No shell-integration mark has been seen (or every block was discarded).
+    Unknown,
+    /// At a prompt or editing input; no command is running.
+    Idle,
+    /// A command is running (between OSC 133 `C` and `D`).
+    Running,
+}
+
+impl PaneActivity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Idle => "idle",
+            Self::Running => "running",
+        }
+    }
+}
+
 /// Selects one block of a pane for metadata queries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockQuery {
@@ -156,6 +177,24 @@ impl BlockList {
                 BlockState::Prompt | BlockState::Input | BlockState::Running
             )
         })
+    }
+
+    /// Activity of the pane, taken from its newest block.
+    pub fn activity(&self) -> PaneActivity {
+        match self.blocks.last().map(|block| block.state) {
+            None => PaneActivity::Unknown,
+            Some(BlockState::Running) => PaneActivity::Running,
+            Some(_) => PaneActivity::Idle,
+        }
+    }
+
+    /// Exit status of the newest finished command, when it reported one.
+    pub fn last_exit_status(&self) -> Option<i32> {
+        self.blocks
+            .iter()
+            .rev()
+            .find(|block| block.state == BlockState::Finished)
+            .and_then(|block| block.exit_status)
     }
 
     pub fn consume(&mut self, events: &[ObservedEvent]) {
@@ -540,6 +579,43 @@ mod tests {
         assert_eq!(implicit.state, BlockState::Finished);
         assert_eq!(implicit.times.started, Some(at(20)));
         assert_eq!(implicit.times.finished, Some(at(23)));
+    }
+
+    #[test]
+    fn pane_activity_follows_the_newest_block_and_keeps_the_last_exit_status() {
+        let mut list = BlockList::default();
+        assert_eq!(list.activity(), PaneActivity::Unknown);
+        assert_eq!(list.last_exit_status(), None);
+        list.consume(&[mark(1, SemanticMark::PromptStart)]);
+        assert_eq!(list.activity(), PaneActivity::Idle);
+        list.consume(&[
+            mark(2, SemanticMark::InputStart),
+            mark(3, SemanticMark::OutputStart),
+        ]);
+        assert_eq!(list.activity(), PaneActivity::Running);
+        list.consume(&[mark(
+            4,
+            SemanticMark::CommandFinished {
+                exit_status: Some(7),
+            },
+        )]);
+        assert_eq!(list.activity(), PaneActivity::Idle);
+        assert_eq!(list.last_exit_status(), Some(7));
+        // A new prompt and a cancelled line keep the previous command's status.
+        list.consume(&[
+            mark(5, SemanticMark::PromptStart),
+            mark(6, SemanticMark::PromptStart),
+        ]);
+        assert_eq!(list.activity(), PaneActivity::Idle);
+        assert_eq!(list.last_exit_status(), Some(7));
+        assert_eq!(
+            [
+                PaneActivity::Unknown.as_str(),
+                PaneActivity::Idle.as_str(),
+                PaneActivity::Running.as_str()
+            ],
+            ["unknown", "idle", "running"]
+        );
     }
 
     #[test]

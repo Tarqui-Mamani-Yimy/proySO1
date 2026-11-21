@@ -227,6 +227,25 @@ fn block_command_reports_the_last_command_block_and_unknown_ids() {
 }
 
 #[test]
+fn list_reports_each_pane_state_and_last_exit_status() {
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("state");
+    let pane =
+        |scratch: &Scratch| json(&scratch.ctl("state", &["list"]))["tabs"][0]["panes"][0].clone();
+    // /bin/sh emits no shell-integration marks until the test prints them.
+    let first = pane(&scratch);
+    assert_eq!(first["state"], "unknown");
+    assert_eq!(first["last_exit_status"], serde_json::Value::Null);
+    assert!(first["cwd"].is_string());
+
+    stdout(&scratch.ctl("state", &["send-text", "printf '\\033]133;C\\033\\\\'\n"]));
+    wait_until("running pane", || pane(&scratch)["state"] == "running");
+    stdout(&scratch.ctl("state", &["send-text", "printf '\\033]133;D;4\\033\\\\'\n"]));
+    wait_until("idle pane", || pane(&scratch)["state"] == "idle");
+    assert_eq!(pane(&scratch)["last_exit_status"], 4);
+}
+
+#[test]
 fn server_exits_when_the_last_shell_exits() {
     let scratch = Scratch::new();
     let mut server = scratch.spawn("exit");

@@ -189,6 +189,44 @@ fn pane_shells_inherit_the_server_socket() {
 }
 
 #[test]
+fn block_command_reports_the_last_command_block_and_unknown_ids() {
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("blocks");
+    // /bin/sh emits no shell-integration marks, so the test prints them itself.
+    stdout(&scratch.ctl(
+        "blocks",
+        &[
+            "send-text",
+            "printf '\\033]133;C\\033\\\\'; echo ran; printf '\\033]133;D;3\\033\\\\'\n",
+        ],
+    ));
+    wait_until("finished block", || {
+        let output = scratch.ctl("blocks", &["block"]);
+        output.status.success() && json(&output)["state"] == "finished"
+    });
+    let block = json(&scratch.ctl("blocks", &["block"]));
+    assert_eq!(block["exit_status"], 3);
+    assert_eq!(block["command"], serde_json::Value::Null);
+    assert_eq!(block["command_unavailable"], "anchors-missing");
+    assert!(block["duration_ms"].as_u64().is_some(), "{block}");
+    let id = block["id"].as_u64().unwrap();
+    assert_eq!(
+        json(&scratch.ctl("blocks", &["block", "--id", &id.to_string()])),
+        block
+    );
+
+    let missing = scratch.ctl("blocks", &["block", "--id", "999"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&missing.stderr).trim(),
+        format!(
+            "so1ctl: NOT_FOUND: block 999 does not exist in pane {}",
+            block["pane"]
+        )
+    );
+}
+
+#[test]
 fn server_exits_when_the_last_shell_exits() {
     let scratch = Scratch::new();
     let mut server = scratch.spawn("exit");

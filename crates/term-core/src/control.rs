@@ -38,6 +38,12 @@ pub enum ControlCommand {
         pane: Option<u64>,
         scope: TextScope,
     },
+    /// Describes one shell-integration block of a pane (`block` is its id;
+    /// `None` selects the newest block that ran a command).
+    Block {
+        pane: Option<u64>,
+        block: Option<u64>,
+    },
     /// Stops a persistent `so1term-server` session; windows refuse it.
     Shutdown,
     /// Upgrades this connection to the attach stream (`crate::attach`) of a
@@ -62,6 +68,9 @@ pub enum ControlErrorCode {
     Timeout,
     Unavailable,
     NotFound,
+    /// The requested item existed but was discarded (for example a block whose
+    /// scrollback was evicted).
+    Evicted,
     OperationRefused,
     Internal,
 }
@@ -78,6 +87,7 @@ impl ControlErrorCode {
             Self::Timeout => "TIMEOUT",
             Self::Unavailable => "UNAVAILABLE",
             Self::NotFound => "NOT_FOUND",
+            Self::Evicted => "EVICTED",
             Self::OperationRefused => "OPERATION_REFUSED",
             Self::Internal => "INTERNAL",
         }
@@ -144,6 +154,7 @@ fn error_from_value(id: Option<u64>, code: &str, message: &str) -> ControlError 
         "TIMEOUT" => ControlErrorCode::Timeout,
         "UNAVAILABLE" => ControlErrorCode::Unavailable,
         "NOT_FOUND" => ControlErrorCode::NotFound,
+        "EVICTED" => ControlErrorCode::Evicted,
         "OPERATION_REFUSED" => ControlErrorCode::OperationRefused,
         _ => ControlErrorCode::Internal,
     };
@@ -246,9 +257,100 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
                 scope,
             })
         }
+        "block" => {
+            if !allowed_fields(object, &["v", "id", "cmd", "pane", "block"]) {
+                return Err(ControlErrorCode::InvalidArguments);
+            }
+            Ok(ControlCommand::Block {
+                pane: optional_u64(object, "pane")?,
+                block: optional_u64(object, "block")?,
+            })
+        }
         "list" | "new-tab" | "shutdown" | "attach" => Err(ControlErrorCode::InvalidArguments),
         _ => Err(ControlErrorCode::UnknownCommand),
     }
+}
+
+/// Builds the `block` command result for one pane's model, shared by the
+/// window and the session server. Missing blocks map to `NOT_FOUND` and
+/// discarded ones to `EVICTED`; text no longer retained is reported through
+/// `command_unavailable`, never as partial text.
+pub fn block_result(
+    pane: u64,
+    model: &crate::model::Model,
+    block: Option<u64>,
+) -> Result<Value, (ControlErrorCode, String)> {
+    use crate::blocks::{BlockLookupError, BlockQuery, BlockState};
+    use crate::model::BlockText;
+    let query = block.map_or(BlockQuery::Last, BlockQuery::Id);
+    let metadata = model.block_metadata(query).map_err(|error| match error {
+        BlockLookupError::NotFound(id) => (
+            ControlErrorCode::NotFound,
+            format!("block {id} does not exist in pane {pane}"),
+        ),
+        BlockLookupError::Evicted(id) => (
+            ControlErrorCode::Evicted,
+            format!("block {id} of pane {pane} was evicted"),
+        ),
+        BlockLookupError::NoCommandBlock => (
+            ControlErrorCode::NotFound,
+            format!("pane {pane} has not run a command"),
+        ),
+    })?;
+    let millis = |time: Option<std::time::SystemTime>| {
+        time.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_millis() as u64)
+    };
+    let mut result = Map::from_iter([
+        ("pane".to_owned(), json!(pane)),
+        ("id".to_owned(), json!(metadata.id)),
+        (
+            "state".to_owned(),
+            json!(match metadata.state {
+                BlockState::Prompt => "prompt",
+                BlockState::Input => "input",
+                BlockState::Running => "running",
+                BlockState::Finished => "finished",
+                BlockState::Cancelled => "cancelled",
+            }),
+        ),
+        (
+            "cwd".to_owned(),
+            json!(
+                metadata
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| String::from_utf8_lossy(&cwd.path).into_owned())
+            ),
+        ),
+        ("exit_status".to_owned(), json!(metadata.exit_status)),
+        (
+            "started_at_ms".to_owned(),
+            json!(millis(metadata.started_at)),
+        ),
+        (
+            "finished_at_ms".to_owned(),
+            json!(millis(metadata.finished_at)),
+        ),
+        (
+            "duration_ms".to_owned(),
+            json!(
+                metadata
+                    .duration()
+                    .map(|elapsed| elapsed.as_millis() as u64)
+            ),
+        ),
+    ]);
+    match metadata.command {
+        BlockText::Available(text) => {
+            result.insert("command".to_owned(), json!(text));
+        }
+        BlockText::Unavailable(reason) => {
+            result.insert("command".to_owned(), Value::Null);
+            result.insert("command_unavailable".to_owned(), json!(reason.as_str()));
+        }
+    }
+    Ok(Value::Object(result))
 }
 
 pub fn parse_request(line: &[u8]) -> Result<ControlRequest, ControlError> {
@@ -349,6 +451,16 @@ pub fn serialize_request(request: &ControlRequest) -> Result<Vec<u8>, serde_json
             }
             args.push(("text", json!(text)));
             ("send-text", args)
+        }
+        ControlCommand::Block { pane, block } => {
+            let mut args = Vec::new();
+            if let Some(pane) = pane {
+                args.push(("pane", json!(pane)));
+            }
+            if let Some(block) = block {
+                args.push(("block", json!(block)));
+            }
+            ("block", args)
         }
         ControlCommand::GetText { pane, scope } => {
             let mut args = Vec::new();
@@ -626,6 +738,95 @@ mod tests {
         };
         let bytes = super::serialize_response(&response).unwrap();
         assert_eq!(super::parse_response(&bytes).unwrap(), response);
+    }
+
+    #[test]
+    fn block_command_parses_round_trips_and_rejects_bad_ids() {
+        assert_eq!(
+            parse(r#"{"v":1,"id":3,"cmd":"block"}"#).unwrap().command,
+            ControlCommand::Block {
+                pane: None,
+                block: None
+            }
+        );
+        let request = super::ControlRequest {
+            id: 4,
+            command: ControlCommand::Block {
+                pane: Some(2),
+                block: Some(5),
+            },
+        };
+        let bytes = super::serialize_request(&request).unwrap();
+        assert_eq!(parse_request(&bytes).unwrap(), request);
+        for source in [
+            r#"{"v":1,"id":1,"cmd":"block","block":"x"}"#,
+            r#"{"v":1,"id":1,"cmd":"block","scope":"screen"}"#,
+        ] {
+            assert_eq!(
+                parse(source).unwrap_err().code,
+                ControlErrorCode::InvalidArguments,
+                "{source}"
+            );
+        }
+        let response = super::ControlResponse {
+            id: Some(4),
+            outcome: super::ControlOutcome::Failure(super::ControlError::for_request(
+                Some(4),
+                ControlErrorCode::Evicted,
+                "block 1 was evicted",
+            )),
+        };
+        let bytes = super::serialize_response(&response).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"EVICTED\""));
+        assert_eq!(super::parse_response(&bytes).unwrap(), response);
+    }
+
+    #[test]
+    fn block_result_describes_a_block_or_names_why_it_is_missing() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |millis| UNIX_EPOCH + Duration::from_millis(millis);
+        let mut model = crate::model::Model::new(20, 4);
+        model.feed_at(b"\x1b]7;file://box/srv\x1b\\", at(1_000));
+        model.feed_at(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\make\r\n", at(1_000));
+        model.feed_at(b"\x1b]133;C\x1b\\", at(1_500));
+        model.feed_at(b"\x1b]133;D;2\x1b\\", at(4_000));
+        assert_eq!(
+            super::block_result(7, &model, None).unwrap(),
+            serde_json::json!({
+                "pane": 7,
+                "id": 1,
+                "state": "finished",
+                "command": "make",
+                "cwd": "/srv",
+                "exit_status": 2,
+                "started_at_ms": 1_500,
+                "finished_at_ms": 4_000,
+                "duration_ms": 2_500,
+            })
+        );
+        assert_eq!(
+            super::block_result(7, &model, Some(9)).unwrap_err(),
+            (
+                ControlErrorCode::NotFound,
+                "block 9 does not exist in pane 7".to_owned()
+            )
+        );
+        assert_eq!(
+            super::block_result(7, &crate::model::Model::new(20, 4), None).unwrap_err(),
+            (
+                ControlErrorCode::NotFound,
+                "pane 7 has not run a command".to_owned()
+            )
+        );
+
+        let mut evicted = crate::model::Model::with_scrollback_limit(12, 2, 1);
+        evicted.feed(
+            b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\cmd\r\n\x1b]133;C\x1b\\a\r\nb\r\nc\x1b]133;D;0\x1b\\",
+        );
+        let result = super::block_result(1, &evicted, None).unwrap();
+        assert_eq!(result["command"], serde_json::Value::Null);
+        assert_eq!(result["command_unavailable"], "anchors-missing");
+        assert!(result["duration_ms"].as_u64().is_some());
     }
 
     #[test]

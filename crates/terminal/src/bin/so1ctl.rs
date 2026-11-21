@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], shutdown (so1term-server only)"
+            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], shutdown (so1term-server only)"
         );
         return Ok(());
     }
@@ -92,12 +92,13 @@ fn parse_command(
     args: Vec<String>,
 ) -> Result<so1_terminal::control::ControlCommand, String> {
     use so1_terminal::control::{ControlCommand, ControlDirection, TextScope};
-    let (allow_pane, allow_direction, allow_scope, allow_text) = match command_name {
-        "list" | "new-tab" | "shutdown" => (false, false, false, false),
-        "split" => (true, true, false, false),
-        "focus" | "close" => (true, false, false, false),
-        "send-text" => (true, false, false, true),
-        "get-text" => (true, false, true, false),
+    let (allow_pane, allow_direction, allow_scope, allow_text, allow_id) = match command_name {
+        "list" | "new-tab" | "shutdown" => (false, false, false, false, false),
+        "split" => (true, true, false, false, false),
+        "focus" | "close" => (true, false, false, false, false),
+        "send-text" => (true, false, false, true, false),
+        "get-text" => (true, false, true, false, false),
+        "block" => (true, false, false, false, true),
         _ => return Err(format!("unknown command: {command_name}")),
     };
     let mut pane = None;
@@ -105,6 +106,7 @@ fn parse_command(
     let mut scope = TextScope::Screen;
     let mut scope_seen = false;
     let mut text = None;
+    let mut block = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -147,6 +149,17 @@ fn parse_command(
                 };
                 index += 2;
             }
+            "--id" if allow_id => {
+                if block.is_some() {
+                    return Err("--id may only be supplied once".into());
+                }
+                block = Some(
+                    next("--id")?
+                        .parse::<u64>()
+                        .map_err(|_| "--id must be an unsigned integer")?,
+                );
+                index += 2;
+            }
             _ if allow_text && text.is_none() => {
                 text = Some(arg.clone());
                 index += 1;
@@ -172,6 +185,7 @@ fn parse_command(
             text: text.ok_or("send-text requires TEXT")?,
         }),
         "get-text" => Ok(ControlCommand::GetText { pane, scope }),
+        "block" => Ok(ControlCommand::Block { pane, block }),
         "shutdown" => Ok(ControlCommand::Shutdown),
         _ => unreachable!(),
     }
@@ -222,11 +236,33 @@ mod tests {
                     scope: TextScope::LastBlock,
                 }),
             ),
+            (
+                "block",
+                vec![],
+                Ok(ControlCommand::Block {
+                    pane: None,
+                    block: None,
+                }),
+            ),
+            (
+                "block",
+                vec!["--pane".into(), "2".into(), "--id".into(), "5".into()],
+                Ok(ControlCommand::Block {
+                    pane: Some(2),
+                    block: Some(5),
+                }),
+            ),
         ];
         for (name, args, expected) in cases {
             assert_eq!(parse_command(name, args), expected, "{name}");
         }
         for (name, args) in [
+            ("block", vec!["--id".into(), "x".into()]),
+            (
+                "block",
+                vec!["--id".into(), "1".into(), "--id".into(), "2".into()],
+            ),
+            ("get-text", vec!["--id".into(), "1".into()]),
             ("new-tab", vec!["--pane".into(), "1".into()]),
             ("close", vec!["--scope".into(), "screen".into()]),
             ("list", vec!["extra".into()]),

@@ -391,7 +391,7 @@ impl Model {
         Self::with_scrollback_limit(cols, rows, 10_000)
     }
 
-    fn with_scrollback_limit(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
+    pub(crate) fn with_scrollback_limit(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         let listener = Listener::default();
         let config = Config {
             scrolling_history: scrollback_limit,

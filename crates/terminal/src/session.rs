@@ -417,6 +417,21 @@ impl Session {
                 target.model.scroll_to_bottom();
                 serde_json::json!({"pane": pane_id.0, "written": text.len()})
             }
+            ControlCommand::Block { pane, block } => {
+                let Some(pane_id) = pane.map(PaneId).or_else(|| self.focused_pane_id()) else {
+                    return fail(ControlErrorCode::Unavailable, "no focused pane".into());
+                };
+                let Some(target) = self.panes.get(&pane_id) else {
+                    return fail(
+                        ControlErrorCode::NotFound,
+                        format!("pane {} does not exist", pane_id.0),
+                    );
+                };
+                match crate::control::block_result(pane_id.0, &target.model, block) {
+                    Ok(result) => result,
+                    Err((code, message)) => return fail(code, message),
+                }
+            }
             ControlCommand::GetText { pane, scope } => {
                 let Some(pane_id) = pane.map(PaneId).or_else(|| self.focused_pane_id()) else {
                     return fail(ControlErrorCode::Unavailable, "no focused pane".into());

@@ -611,6 +611,7 @@ mod tests {
                 column: 0,
                 screen: GridScreen::Primary,
             }),
+            std::time::SystemTime::UNIX_EPOCH,
         );
     }
 

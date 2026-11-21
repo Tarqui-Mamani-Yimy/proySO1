@@ -32,6 +32,49 @@ pub enum ModelEvent {
     Other(String),
 }
 
+/// Text of a block range, or why it can no longer be extracted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockText {
+    Available(String),
+    Unavailable(TextUnavailable),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextUnavailable {
+    /// The alternate screen is active, so primary rows cannot be read.
+    AlternateScreen,
+    /// Its grid anchors were evicted, invalidated by a resize, or never marked.
+    AnchorsMissing,
+}
+
+impl TextUnavailable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlternateScreen => "alternate-screen",
+            Self::AnchorsMissing => "anchors-missing",
+        }
+    }
+}
+
+/// Agent-facing description of one shell-integration block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockMetadata {
+    pub id: u64,
+    pub state: crate::blocks::BlockState,
+    pub command: BlockText,
+    pub cwd: Option<crate::blocks::WorkingDirectory>,
+    pub exit_status: Option<i32>,
+    pub started_at: Option<std::time::SystemTime>,
+    pub finished_at: Option<std::time::SystemTime>,
+}
+
+impl BlockMetadata {
+    /// Time between command start and finish, when both were observed.
+    pub fn duration(&self) -> Option<std::time::Duration> {
+        self.finished_at?.duration_since(self.started_at?).ok()
+    }
+}
+
 #[derive(Clone, Default)]
 struct Listener(Rc<RefCell<Vec<TermEvent>>>);
 impl EventListener for Listener {
@@ -383,6 +426,16 @@ impl Model {
         }
     }
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<crate::osc::ObservedEvent> {
+        self.feed_at(bytes, std::time::SystemTime::now())
+    }
+
+    /// Feeds PTY bytes observed at `at`; shell marks in them record `at` as
+    /// their block's command start or finish time.
+    pub fn feed_at(
+        &mut self,
+        bytes: &[u8],
+        at: std::time::SystemTime,
+    ) -> Vec<crate::osc::ObservedEvent> {
         let previous_epoch = self.stable_row_base;
         let mut selected_damage = false;
         let mut full_damage = false;
@@ -410,7 +463,7 @@ impl Model {
                 crate::osc::Event::SemanticMark(crate::osc::SemanticMark::PromptStart)
             ) && anchor
                 .is_some_and(|anchor| anchor.screen == crate::blocks::GridScreen::Primary);
-            self.blocks.consume_event(event, anchor);
+            self.blocks.consume_event(event, anchor, at);
         }
         let (intersects, full, mutation) = self.advance_segment(&bytes[consumed..]);
         selected_damage |= intersects;
@@ -699,6 +752,33 @@ impl Model {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Describes one block for agents: its command line, cwd, exit status and
+    /// command times. Text that is no longer retained is reported as
+    /// unavailable, never as partial text.
+    pub fn block_metadata(
+        &self,
+        query: crate::blocks::BlockQuery,
+    ) -> Result<BlockMetadata, crate::blocks::BlockLookupError> {
+        let block = self.blocks.find(query)?;
+        let command = if self.alternate_screen_active() {
+            BlockText::Unavailable(TextUnavailable::AlternateScreen)
+        } else {
+            match self.block_range_text(block, true) {
+                Some(text) => BlockText::Available(text),
+                None => BlockText::Unavailable(TextUnavailable::AnchorsMissing),
+            }
+        };
+        Ok(BlockMetadata {
+            id: block.id,
+            state: block.state,
+            command,
+            cwd: block.cwd.clone(),
+            exit_status: block.exit_status,
+            started_at: block.times.started,
+            finished_at: block.times.finished,
+        })
     }
 
     pub fn selected_block_input_text(&self) -> Option<String> {
@@ -1448,6 +1528,60 @@ mod tests {
             Some("a\nb")
         );
         assert!(model.cell_selected(0, 1));
+    }
+
+    #[test]
+    fn block_metadata_reports_command_cwd_exit_status_and_duration() {
+        use crate::blocks::{BlockQuery, BlockState};
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        let mut model = Model::new(20, 4);
+        model.feed_at(b"\x1b]7;file://box/tmp/work\x1b\\", at(1));
+        model.feed_at(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\false\r\n", at(2));
+        model.feed_at(b"\x1b]133;C\x1b\\", at(3));
+        let running = model.block_metadata(BlockQuery::Last).unwrap();
+        assert_eq!(running.state, BlockState::Running);
+        assert_eq!(running.duration(), None);
+        model.feed_at(b"\x1b]133;D;1\x1b\\", at(5));
+
+        let block = model.block_metadata(BlockQuery::Last).unwrap();
+        assert_eq!(block.id, 1);
+        assert_eq!(block.state, BlockState::Finished);
+        assert_eq!(block.command, BlockText::Available("false".to_owned()));
+        assert_eq!(block.exit_status, Some(1));
+        assert_eq!(
+            block.cwd.as_ref().map(|cwd| cwd.path.as_slice()),
+            Some(&b"/tmp/work"[..])
+        );
+        assert_eq!(block.started_at, Some(at(3)));
+        assert_eq!(block.finished_at, Some(at(5)));
+        assert_eq!(block.duration(), Some(Duration::from_secs(2)));
+        assert_eq!(model.block_metadata(BlockQuery::Id(1)), Ok(block));
+    }
+
+    #[test]
+    fn block_metadata_command_text_is_unavailable_after_eviction_or_on_alternate_screen() {
+        use crate::blocks::{BlockLookupError, BlockQuery};
+        let mut model = Model::with_scrollback_limit(12, 2, 1);
+        model.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\cmd\r\n\x1b]133;C\x1b\\a\r\nb\r\nc\r\nd\x1b]133;D;0\x1b\\");
+        let block = model.block_metadata(BlockQuery::Last).unwrap();
+        assert_eq!(
+            block.command,
+            BlockText::Unavailable(TextUnavailable::AnchorsMissing)
+        );
+        assert_eq!(block.exit_status, Some(0));
+        assert_eq!(
+            model.block_metadata(BlockQuery::Id(7)),
+            Err(BlockLookupError::NotFound(7))
+        );
+
+        let mut alternate = Model::new(12, 2);
+        alternate.feed(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\vi\r\n\x1b]133;C\x1b\\\x1b[?1049h");
+        let block = alternate.block_metadata(BlockQuery::Last).unwrap();
+        assert_eq!(
+            block.command,
+            BlockText::Unavailable(TextUnavailable::AlternateScreen)
+        );
     }
 
     #[test]

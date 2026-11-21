@@ -112,6 +112,7 @@ mod tests {
             exit_status: Some(0),
             cwd: None,
             state: BlockState::Finished,
+            times: Default::default(),
             grid_anchors: GridAnchors {
                 prompt_start: Some(GridAnchor {
                     line,

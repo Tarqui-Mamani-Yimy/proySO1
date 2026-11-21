@@ -1,5 +1,7 @@
 //! Semantic command blocks derived from shell-integration events.
 
+use std::time::SystemTime;
+
 use crate::osc::{Event, ObservedEvent, SemanticMark};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +35,35 @@ pub struct PhaseBoundaries {
     pub output_start: Option<u64>,
     pub finished: Option<u64>,
     pub cancelled: Option<u64>,
+}
+
+/// Wall-clock times of a block's command, taken when its marks were observed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockTimes {
+    /// When the command started running (OSC 133 `C`).
+    pub started: Option<SystemTime>,
+    /// When the command finished (OSC 133 `D`, or an implicit finish).
+    pub finished: Option<SystemTime>,
+}
+
+/// Selects one block of a pane for metadata queries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockQuery {
+    /// The newest block that ran a command (running or finished).
+    Last,
+    /// A block by its pane-local identifier.
+    Id(u64),
+}
+
+/// Why a [`BlockQuery`] matched no block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockLookupError {
+    /// The identifier was never assigned in this pane.
+    NotFound(u64),
+    /// The block existed but was discarded with its scrollback or by the block limit.
+    Evicted(u64),
+    /// No block has run a command yet.
+    NoCommandBlock,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -103,6 +134,7 @@ pub struct Block {
     pub cwd: Option<WorkingDirectory>,
     pub state: BlockState,
     pub grid_anchors: GridAnchors,
+    pub times: BlockTimes,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -127,12 +159,45 @@ impl BlockList {
     }
 
     pub fn consume(&mut self, events: &[ObservedEvent]) {
+        self.consume_at(events, SystemTime::now());
+    }
+
+    /// Consumes events observed at `at`, which becomes the wall-clock time of
+    /// any command start or finish they mark.
+    pub fn consume_at(&mut self, events: &[ObservedEvent], at: SystemTime) {
         for observed in events {
-            self.consume_event(observed, None);
+            self.consume_event(observed, None, at);
         }
     }
 
-    pub(crate) fn consume_event(&mut self, observed: &ObservedEvent, anchor: Option<GridAnchor>) {
+    /// Finds a block, telling apart identifiers that were never assigned from
+    /// blocks that were discarded.
+    pub fn find(&self, query: BlockQuery) -> Result<&Block, BlockLookupError> {
+        match query {
+            BlockQuery::Last => self
+                .blocks
+                .iter()
+                .rev()
+                .find(|block| matches!(block.state, BlockState::Running | BlockState::Finished))
+                .ok_or(BlockLookupError::NoCommandBlock),
+            BlockQuery::Id(id) => {
+                if let Some(block) = self.blocks.iter().find(|block| block.id == id) {
+                    Ok(block)
+                } else if id == 0 || id > self.next_id {
+                    Err(BlockLookupError::NotFound(id))
+                } else {
+                    Err(BlockLookupError::Evicted(id))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn consume_event(
+        &mut self,
+        observed: &ObservedEvent,
+        anchor: Option<GridAnchor>,
+        at: SystemTime,
+    ) {
         match &observed.event {
             Event::CurrentDirectory { host, path } => {
                 self.cwd = Some(WorkingDirectory {
@@ -153,6 +218,7 @@ impl BlockList {
                         BlockState::Running => {
                             block.state = BlockState::Finished;
                             block.boundaries.finished = Some(observed.end_offset);
+                            block.times.finished = Some(at);
                             block.exit_status = None;
                             if block.grid_anchors.has_anchor() {
                                 block.grid_anchors.end = anchor;
@@ -179,6 +245,7 @@ impl BlockList {
                         let block = self.blocks.last_mut().expect("running block exists");
                         block.state = BlockState::Finished;
                         block.boundaries.finished = Some(observed.end_offset);
+                        block.times.finished = Some(at);
                         if block.grid_anchors.has_anchor() {
                             block.grid_anchors.end = anchor;
                         }
@@ -197,11 +264,13 @@ impl BlockList {
                     block.boundaries.output_start = Some(observed.end_offset);
                     block.grid_anchors.output_start = anchor;
                     block.state = BlockState::Running;
+                    block.times.started = Some(at);
                 } else if current != Some(BlockState::Running) {
                     let mut block = self.new_block();
                     block.boundaries.output_start = Some(observed.end_offset);
                     block.grid_anchors.output_start = anchor;
                     block.state = BlockState::Running;
+                    block.times.started = Some(at);
                     self.push(block);
                 }
             }
@@ -213,6 +282,7 @@ impl BlockList {
                 ) {
                     let block = self.blocks.last_mut().expect("current block exists");
                     block.boundaries.finished = Some(observed.end_offset);
+                    block.times.finished = Some(at);
                     block.exit_status = *exit_status;
                     block.state = BlockState::Finished;
                     if block.grid_anchors.has_anchor() {
@@ -272,6 +342,7 @@ impl BlockList {
             cwd: self.cwd.clone(),
             state: BlockState::Prompt,
             grid_anchors: GridAnchors::default(),
+            times: BlockTimes::default(),
         }
     }
 }
@@ -439,6 +510,72 @@ mod tests {
         assert_eq!(list.blocks()[0].boundaries.input_start, Some(2));
         assert_eq!(list.blocks()[0].boundaries.output_start, Some(3));
         assert_eq!(list.blocks()[0].exit_status, Some(0));
+    }
+
+    #[test]
+    fn block_times_record_command_start_and_finish_wall_clock() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        let mut list = BlockList::default();
+        list.consume_at(&[mark(1, SemanticMark::PromptStart)], at(10));
+        list.consume_at(&[mark(2, SemanticMark::InputStart)], at(11));
+        list.consume_at(&[mark(3, SemanticMark::OutputStart)], at(12));
+        assert_eq!(list.blocks()[0].times.started, Some(at(12)));
+        assert_eq!(list.blocks()[0].times.finished, None);
+        list.consume_at(
+            &[mark(
+                4,
+                SemanticMark::CommandFinished {
+                    exit_status: Some(0),
+                },
+            )],
+            at(15),
+        );
+        assert_eq!(list.blocks()[0].times.finished, Some(at(15)));
+
+        // A running block closed implicitly by the next prompt also finishes.
+        list.consume_at(&[mark(5, SemanticMark::OutputStart)], at(20));
+        list.consume_at(&[mark(6, SemanticMark::PromptStart)], at(23));
+        let implicit = &list.blocks()[1];
+        assert_eq!(implicit.state, BlockState::Finished);
+        assert_eq!(implicit.times.started, Some(at(20)));
+        assert_eq!(implicit.times.finished, Some(at(23)));
+    }
+
+    #[test]
+    fn find_distinguishes_last_command_unknown_and_evicted_ids() {
+        let mut list = blocks(&[
+            mark(1, SemanticMark::PromptStart),
+            mark(2, SemanticMark::OutputStart),
+            mark(
+                3,
+                SemanticMark::CommandFinished {
+                    exit_status: Some(1),
+                },
+            ),
+            mark(4, SemanticMark::PromptStart),
+        ]);
+        // The trailing prompt has no command, so `last` is the finished block.
+        assert_eq!(list.find(BlockQuery::Last).map(|block| block.id), Ok(1));
+        assert_eq!(list.find(BlockQuery::Id(2)).map(|block| block.id), Ok(2));
+        assert_eq!(
+            list.find(BlockQuery::Id(9)),
+            Err(BlockLookupError::NotFound(9))
+        );
+        assert_eq!(
+            list.find(BlockQuery::Id(0)),
+            Err(BlockLookupError::NotFound(0))
+        );
+        list.expire_primary_anchors_before(u64::MAX);
+        list.blocks.retain(|block| block.id != 1);
+        assert_eq!(
+            list.find(BlockQuery::Id(1)),
+            Err(BlockLookupError::Evicted(1))
+        );
+        assert_eq!(
+            BlockList::default().find(BlockQuery::Last),
+            Err(BlockLookupError::NoCommandBlock)
+        );
     }
 
     #[test]

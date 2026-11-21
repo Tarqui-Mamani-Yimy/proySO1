@@ -304,6 +304,28 @@ fn echo_then_prompt() {
 }
 
 #[test]
+fn failed_exec_keeps_status_127_and_the_session() {
+    let _pty_test_guard = serialize_pty_test();
+    let (mut session, _dir) = session();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exec so1sh-no-such-command; echo not-reached");
+    session.exp_string("exec: so1sh-no-such-command: ").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo status=$?");
+    let output = session.exp_string("status=127\r\n").unwrap();
+    assert!(!output.contains("not-reached"), "{output:?}");
+    session.exp_string("$ ").unwrap();
+    // Other special-builtin errors keep reporting 2.
+    submit(&mut session, ". ./so1sh-no-such-file");
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "echo status=$?");
+    session.exp_string("status=2\r\n").unwrap();
+    session.exp_string("$ ").unwrap();
+    submit(&mut session, "exit");
+    exited(&mut session, 0);
+}
+
+#[test]
 fn variables_persist_across_lines() {
     let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
@@ -2878,6 +2900,37 @@ mod command_policy {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("t5")).unwrap(),
             "keep\n"
+        );
+        submit(&mut session, "exit 0");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn relative_write_targets_resolve_against_the_shell_cwd() {
+        let _pty_test_guard = serialize_pty_test();
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().canonicalize().unwrap().join("work");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        // so1sh starts in `dir`; after `cd work` only shell-cwd resolution
+        // (with `..` normalization) turns `sub/../blocked` into this target.
+        let policy = format!("default allow\ndeny write {}/blocked\n", work.display());
+        let mut session = policy_session(&dir, &policy, None);
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "cd work");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo no > sub/../blocked");
+        session
+            .exp_string("sub/../blocked: denied by policy")
+            .unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo yes > sub/allowed; echo done");
+        session.exp_string("done\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        assert!(!work.join("blocked").exists());
+        assert!(!dir.path().join("blocked").exists());
+        assert_eq!(
+            std::fs::read_to_string(work.join("sub/allowed")).unwrap(),
+            "yes\n"
         );
         submit(&mut session, "exit 0");
         exited(&mut session, 0);

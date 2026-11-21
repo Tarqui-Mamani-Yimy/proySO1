@@ -1080,6 +1080,38 @@ mod exec_command {
         );
         assert_eq!(code, 127);
     }
+
+    #[test]
+    fn exec_exports_prefix_assignments_to_the_command() {
+        let (stdout, stderr, code) = run("FOO=bar exec sh -c 'echo $FOO'; echo not-reached");
+        assert_eq!((stdout.as_str(), stderr.as_str(), code), ("bar\n", "", 0));
+    }
+
+    #[test]
+    fn exec_preserves_arguments_with_spaces_and_quotes() {
+        let (stdout, stderr, code) =
+            run(r#"exec printf '[%s]\n' "two words" 'it'\''s' "say \"hi\"" ''; echo not-reached"#);
+        assert_eq!(stderr, "");
+        assert_eq!(stdout, "[two words]\n[it's]\n[say \"hi\"]\n[]\n");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn exec_of_a_non_executable_file_names_it_and_exits_126() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("plain"), "echo should-not-run\n").unwrap();
+        let path = dir.path().join("plain");
+        let (stdout, stderr, code) = run_in(
+            dir.path(),
+            &format!("exec {}; echo not-reached", path.display()),
+        );
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains(&format!("exec: {}: ", path.display())),
+            "unexpected stderr: {stderr}"
+        );
+        assert_eq!(code, 126);
+    }
 }
 
 mod exec_redirects {

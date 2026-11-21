@@ -35,7 +35,7 @@ the session. Piped input, `-c`, and script arguments never source an rc file.
 When `SO1SH_POLICY` is non-empty, the interactive REPL loads that policy file
 before the rc file; a missing, unreadable or invalid file prints one diagnostic
 (`so1sh: policy FILE[:LINE]: ...`) and exits with status 2. One rule per line,
-`#` comments and blank lines ignored: exactly one `default allow|deny`;
+`#` comments (a `#` starting a word, so `/tmp/a#b` keeps it) and blank lines ignored: exactly one `default allow|deny`;
 `allow|deny command NAME...` matches argv[0] or its basename; `allow|deny write
 GLOB...` matches the lexically normalized absolute target of `>`, `>|`, `>>` and
 `<>` with `epsh::glob::fnmatch`. Command and write rules each use first match in
@@ -66,9 +66,10 @@ unreadable fields are omitted). `SO1SH_BANNER=0`, set in the environment or the
 rc file, disables it; the `sysinfo` builtin prints it on demand.
 `fg %n` resumes a job in the foreground and `bg %n` in the background; before each
 prompt so1sh reports changed background jobs (`[n]+ Done/Stopped/Killed`), and
-`exit` with stopped jobs warns once. `exec CMD` replaces the shell with CMD; a
-failed exec exits a non-interactive shell (127 not found, 126 otherwise) and the
-REPL recovers.
+`exit` with stopped jobs warns once. `exec CMD` replaces the shell with CMD and
+passes prefix assignments (`FOO=bar exec cmd`) to it; a failed exec exits a
+non-interactive shell (127 not found, 126 otherwise) and the REPL recovers with
+that status as `$?`.
 
 ## Architecture
 

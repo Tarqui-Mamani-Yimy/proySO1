@@ -16,6 +16,11 @@ use crate::error::ExitStatus;
 pub(crate) enum EvalError {
     Shell(ShellError),
     RecoverableSpecialBuiltin(ExitStatus),
+    /// A failed `exec CMD` (127 not found, 126 otherwise). Like
+    /// `RecoverableSpecialBuiltin`, non-interactive shells exit with it and
+    /// the REPL recovers, but the REPL keeps this status as `$?` instead of
+    /// the 2 it reports for every other special-builtin error.
+    FailedExec(ExitStatus),
 }
 
 pub(crate) type EvalResult<T> = std::result::Result<T, EvalError>;
@@ -30,7 +35,9 @@ impl EvalError {
     fn into_shell_error(self) -> ShellError {
         match self {
             Self::Shell(error) => error,
-            Self::RecoverableSpecialBuiltin(status) => ShellError::Exit(status),
+            Self::RecoverableSpecialBuiltin(status) | Self::FailedExec(status) => {
+                ShellError::Exit(status)
+            }
         }
     }
 }
@@ -1900,13 +1907,18 @@ impl Shell {
                     self.repl_exit_warned = false;
                     self.exit_status = status;
                 }
-                Err(EvalError::RecoverableSpecialBuiltin(n)) => {
+                Err(
+                    error @ (EvalError::RecoverableSpecialBuiltin(n) | EvalError::FailedExec(n)),
+                ) => {
                     self.repl_exit_warned = false;
                     if self.interrupted.take().is_some() {
                         self.exit_status = n;
                         return ControlFlow::Continue(n);
                     }
                     if repl {
+                        if matches!(error, EvalError::FailedExec(_)) {
+                            return self.repl_failed_exec(n);
+                        }
                         return self.repl_shell_error();
                     }
                     self.run_exit_trap();
@@ -1963,6 +1975,18 @@ impl Shell {
         }
 
         ControlFlow::Continue(self.exit_status)
+    }
+
+    /// Recover from a failed `exec CMD` in the REPL, keeping its 127/126 as
+    /// `$?`; `set -e` still ends the session, with that status.
+    fn repl_failed_exec(&mut self, status: ExitStatus) -> ControlFlow<ExitStatus, ExitStatus> {
+        self.exit_status = status;
+        if self.opts.errexit {
+            self.run_exit_trap();
+            ControlFlow::Break(status)
+        } else {
+            ControlFlow::Continue(status)
+        }
     }
 
     fn repl_shell_error(&mut self) -> ControlFlow<ExitStatus, ExitStatus> {
@@ -2499,7 +2523,14 @@ impl Shell {
             return Ok(status);
         }
         // `exec CMD` and `command CMD` would apply redirections (permanently
-        // for exec) before their builtins check CMD, so check it here first.
+        // for exec) before their builtins check CMD, so check it here first:
+        // a denied target must neither create nor truncate redirection
+        // targets, nor leave exec's descriptors rewired. `builtin_exec` and
+        // `builtin_command` deliberately keep their own check (defence in
+        // depth): this one only guards the redirection ordering of the
+        // `eval_simple` path, while theirs guards every way the builtins run.
+        // An allowed target is therefore asked about twice, so policy
+        // callbacks must be side-effect free (or idempotent).
         if self.command_policy.is_some()
             && let Some(target) = crate::builtins::wrapped_command_target(&expanded_args)
             && let Some(status) = self.command_policy_denial(target)
@@ -2947,7 +2978,8 @@ impl Shell {
                     let status = match self.eval_command_internal(cmd) {
                         Ok(s) => s,
                         Err(EvalError::Shell(ShellError::Exit(n)))
-                        | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
+                        | Err(EvalError::RecoverableSpecialBuiltin(n))
+                        | Err(EvalError::FailedExec(n)) => n,
                         Err(_) => ExitStatus::FAILURE,
                     };
                     sys::exit_child(status);
@@ -3065,7 +3097,8 @@ impl Shell {
                 let status = match self.eval_command_internal(body) {
                     Ok(s) => s,
                     Err(EvalError::Shell(ShellError::Exit(n)))
-                    | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
+                    | Err(EvalError::RecoverableSpecialBuiltin(n))
+                    | Err(EvalError::FailedExec(n)) => n,
                     Err(_) => ExitStatus::FAILURE,
                 };
                 // Run subshell's own EXIT trap if it set one
@@ -3105,7 +3138,8 @@ impl Shell {
                 let status = match self.eval_command_internal(cmd) {
                     Ok(s) => s,
                     Err(EvalError::Shell(ShellError::Exit(n)))
-                    | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
+                    | Err(EvalError::RecoverableSpecialBuiltin(n))
+                    | Err(EvalError::FailedExec(n)) => n,
                     Err(_) => ExitStatus::FAILURE,
                 };
                 sys::exit_child(status);
@@ -3247,7 +3281,8 @@ impl Shell {
                 let status = match self.eval_command_internal(cmd) {
                     Ok(s) => s,
                     Err(EvalError::Shell(ShellError::Exit(n)))
-                    | Err(EvalError::RecoverableSpecialBuiltin(n)) => n,
+                    | Err(EvalError::RecoverableSpecialBuiltin(n))
+                    | Err(EvalError::FailedExec(n)) => n,
                     Err(_) => ExitStatus::FAILURE,
                 };
                 self.run_exit_trap();
@@ -3433,6 +3468,48 @@ mod tests {
         let mut shell = Shell::new();
         shell.run_script("X=hello");
         assert_eq!(shell.get_var("X"), Some("hello"));
+    }
+
+    #[test]
+    fn repl_failed_exec_keeps_its_not_found_or_not_executable_status() {
+        let stderr = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut shell = Shell::builder()
+            .stdout_sink(Arc::new(Mutex::new(Vec::<u8>::new())))
+            .stderr_sink(stderr.clone())
+            .build();
+        assert!(matches!(
+            shell.eval_repl_line("exec /nonexistent/epsh-no-such-command"),
+            ControlFlow::Continue(status) if status.code() == 127
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain-file");
+        std::fs::write(&plain, "not a program\n").unwrap();
+        assert!(matches!(
+            shell.eval_repl_line(&format!("exec {}", plain.display())),
+            ControlFlow::Continue(status) if status.code() == 126
+        ));
+        let stderr = String::from_utf8(stderr.lock().unwrap().clone()).unwrap();
+        assert!(stderr.contains("exec: /nonexistent/epsh-no-such-command: "));
+        assert!(stderr.contains(&format!("exec: {}: ", plain.display())));
+    }
+
+    #[test]
+    fn repl_other_special_builtin_errors_keep_status_two() {
+        let mut shell = Shell::builder()
+            .stdout_sink(Arc::new(Mutex::new(Vec::<u8>::new())))
+            .stderr_sink(Arc::new(Mutex::new(Vec::<u8>::new())))
+            .build();
+        // `.` of a missing file carries 127 internally, yet the REPL reports 2.
+        for line in [". /nonexistent/epsh-no-such-file", ".", "break foo"] {
+            assert!(
+                matches!(
+                    shell.eval_repl_line(line),
+                    ControlFlow::Continue(status) if status.code() == 2
+                ),
+                "{line}"
+            );
+        }
     }
 
     #[test]

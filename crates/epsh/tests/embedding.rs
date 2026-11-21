@@ -2261,6 +2261,19 @@ mod command_policy {
     }
 
     #[test]
+    fn allowed_builtin_command_substitution_still_captures_output() {
+        let dir = tempdir().unwrap();
+        // Only `touch` is denied, so `echo` is allowed. The in-process `$(…)`
+        // shortcut is off under a policy, so this exercises the fork path.
+        let run = run_with_policy(dir.path(), &["touch"], "", "x=$(echo hi); echo \"$x\"");
+        assert_eq!(run.status, 0);
+        assert_eq!(run.stdout, "hi\n");
+        assert_eq!(run.stderr, "");
+        // The substitution runs in a forked child the parent cannot record.
+        assert_eq!(run.calls, vec![argv(&["echo", "hi"])]);
+    }
+
+    #[test]
     fn allowed_commands_run_unchanged() {
         let dir = tempdir().unwrap();
         let run = run_with_policy(dir.path(), &[], "", "echo hi; touch created");

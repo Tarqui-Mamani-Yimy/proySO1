@@ -144,7 +144,7 @@ impl Shell {
             "test" | "[" => Some(self.builtin_test(args)),
             "read" => Some(self.builtin_read(args)),
             "local" => Some(self.builtin_local(args)),
-            "exec" => return self.builtin_exec(args, redirs, span).map(Some),
+            "exec" => return self.builtin_exec(args, _assigns, redirs, span).map(Some),
             "command" => Some(self.builtin_command(args, span)?),
             "type" => Some(self.builtin_type(args)),
             "wait" => Some(self.builtin_wait(args)),
@@ -613,6 +613,7 @@ impl Shell {
     fn builtin_exec(
         &mut self,
         args: &[String],
+        assigns: &[Assignment],
         _redirs: &[Redir],
         _span: Span,
     ) -> crate::eval::EvalResult<ExitStatus> {
@@ -621,13 +622,22 @@ impl Shell {
             return Ok(ExitStatus::SUCCESS);
         }
 
+        // Defence in depth: `eval_simple` already checked this target before
+        // opening redirections (see its comment); this check keeps `exec`
+        // policed on its own, whatever path reaches the builtin.
         if let Some(status) = self.command_policy_denial(&args[1..]) {
             return Ok(status);
         }
 
         // exec with command — replace the shell with args[1..] (args[0] is "exec").
         let args_bytes: Vec<ShellBytes> = args[1..].iter().cloned().map(Into::into).collect();
-        let env = self.vars.env_for_command_os(&[]);
+        // Prefix assignments (`FOO=bar exec CMD`) are exported to CMD.
+        let mut assign_bytes = Vec::with_capacity(assigns.len());
+        for assign in assigns {
+            let value = self.expand_string(&assign.value)?;
+            assign_bytes.push((assign.name.clone(), ShellBytes::from_str_lossless(&value)));
+        }
+        let env = self.vars.env_for_command_os(&assign_bytes);
         let _ = std::env::set_current_dir(&self.cwd);
         let err = exec::execve_with_env(&args_bytes[0], &args_bytes, &env);
         self.err_msg(&format!("exec: {}: {err}", args[1]));
@@ -637,8 +647,8 @@ impl Shell {
             ExitStatus::NOT_EXECUTABLE
         };
         // A failed exec is a special-builtin error: non-interactive shells
-        // exit with it, the interactive REPL recovers.
-        Err(self.special_builtin_error(status))
+        // exit with it, the interactive REPL recovers and keeps the status.
+        Err(crate::eval::EvalError::FailedExec(status))
     }
 
     fn builtin_command(
@@ -688,6 +698,8 @@ impl Shell {
         }
 
         let new_args: Vec<String> = args[i..].to_vec();
+        // Defence in depth, as in `builtin_exec`: `eval_simple` checked this
+        // target before redirections; the builtin still checks it itself.
         if let Some(status) = self.command_policy_denial(&new_args) {
             return Ok(status);
         }
@@ -698,7 +710,10 @@ impl Shell {
             Ok(Some(status)) => Ok(status),
             // `command` turns a special-builtin usage failure into an ordinary
             // command status so the rest of a compound list can run.
-            Err(crate::eval::EvalError::RecoverableSpecialBuiltin(_)) => Ok(ExitStatus::MISUSE),
+            Err(
+                crate::eval::EvalError::RecoverableSpecialBuiltin(_)
+                | crate::eval::EvalError::FailedExec(_),
+            ) => Ok(ExitStatus::MISUSE),
             Ok(None) if self.has_external_handler() => self
                 .call_external_handler(&new_args, &[])
                 .map_err(crate::eval::EvalError::from),

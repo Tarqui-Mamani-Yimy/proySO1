@@ -1,7 +1,8 @@
 //! Opt-in command and write policy for the interactive shell (`SO1SH_POLICY`).
 //!
-//! The policy file holds one rule per line; `#` starts a comment and blank
-//! lines are ignored. Exactly one `default allow` or `default deny` line is
+//! The policy file holds one rule per line; a `#` that begins a word (at the
+//! start of the line or after whitespace) starts a comment, so `/tmp/a#b`
+//! keeps its `#`, and blank lines are ignored. Exactly one `default allow` or `default deny` line is
 //! required. `allow|deny command NAME...` rules match `argv[0]` or its
 //! basename; `allow|deny write GLOB...` rules match the lexically normalized
 //! absolute target of a writable redirection with `epsh::glob::fnmatch`.
@@ -48,7 +49,7 @@ pub fn parse(source: &str) -> Result<Policy, ParseError> {
             line: Some(line),
             message,
         };
-        let text = raw.split_once('#').map_or(raw, |(rule, _)| rule);
+        let text = strip_comment(raw);
         let mut words = text.split_whitespace();
         let Some(directive) = words.next() else {
             continue;
@@ -102,6 +103,18 @@ pub fn parse(source: &str) -> Result<Policy, ParseError> {
     })
 }
 
+/// Drop a trailing comment: `#` counts only when it begins a word.
+fn strip_comment(line: &str) -> &str {
+    let mut previous = None;
+    for (index, ch) in line.char_indices() {
+        if ch == '#' && previous.is_none_or(char::is_whitespace) {
+            return &line[..index];
+        }
+        previous = Some(ch);
+    }
+    line
+}
+
 impl Policy {
     /// Decide a command by its `argv[0]` bytes.
     pub fn command_action(&self, argv0: &[u8]) -> Action {
@@ -150,8 +163,11 @@ pub fn normalize_target(cwd: &Path, target: &Path) -> PathBuf {
 pub fn load(path: &Path) -> Result<Policy, String> {
     let shown = path.display();
     let source = std::fs::read(path).map_err(|error| format!("so1sh: policy {shown}: {error}"))?;
-    let source = String::from_utf8(source)
-        .map_err(|_| format!("so1sh: policy {shown}: file is not valid UTF-8"))?;
+    let source = String::from_utf8(source).map_err(|error| {
+        let valid = &error.as_bytes()[..error.utf8_error().valid_up_to()];
+        let line = 1 + valid.iter().filter(|&&byte| byte == b'\n').count();
+        format!("so1sh: policy {shown}:{line}: file is not valid UTF-8")
+    })?;
     parse(&source).map_err(|error| match error.line {
         Some(line) => format!("so1sh: policy {shown}:{line}: {}", error.message),
         None => format!("so1sh: policy {shown}: {}", error.message),
@@ -170,8 +186,12 @@ pub fn install(shell: &mut Shell, policy: Policy) {
         }
     }));
     shell.set_redirect_open_handler(Box::new(move |request: &RedirectOpen<'_>| {
-        // epsh already resolves targets against the shell cwd; the process cwd
-        // only backs a target that is somehow still relative.
+        // epsh hands over `request.path` already joined to the shell cwd.
+        // so1sh's shell cwd is absolute, so the path is absolute and
+        // `normalize_target` ignores `cwd` (joining an absolute path replaces
+        // the base). The process cwd, or `/` when it cannot be read, would
+        // only be the base for a relative path, which arises only if an
+        // embedder gave the shell a relative cwd.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         match policy.write_action(&normalize_target(&cwd, request.path)) {
             Action::Allow => None,
@@ -251,6 +271,35 @@ mod tests {
             parse("# header\n\n   \ndefault deny # trailing\nallow command ls # list\n").unwrap();
         assert_eq!(policy.command_action(b"ls"), Action::Allow);
         assert_eq!(policy.command_action(b"rm"), Action::Deny);
+    }
+
+    #[test]
+    fn hash_inside_a_token_is_part_of_the_pattern() {
+        let policy = parse("default allow\ndeny write /tmp/a#b\n").unwrap();
+        assert_eq!(policy.write_action(Path::new("/tmp/a#b")), Action::Deny);
+        assert_eq!(policy.write_action(Path::new("/tmp/a")), Action::Allow);
+    }
+
+    #[test]
+    fn hash_starting_a_token_starts_a_comment() {
+        let policy = parse("default allow\ndeny command rm # comment\n\t#indented\n").unwrap();
+        assert_eq!(policy.command_action(b"rm"), Action::Deny);
+        assert_eq!(policy.command_action(b"#"), Action::Allow);
+        assert_eq!(policy.command_action(b"comment"), Action::Allow);
+    }
+
+    #[test]
+    fn invalid_utf8_diagnostic_names_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy");
+        std::fs::write(&path, b"default allow\n\ndeny command r\xffm\n").unwrap();
+        assert_eq!(
+            load(&path).unwrap_err(),
+            format!(
+                "so1sh: policy {}:3: file is not valid UTF-8",
+                path.display()
+            )
+        );
     }
 
     #[test]

@@ -273,6 +273,30 @@ fn wait_returns_the_finished_block_and_times_out_without_a_newer_one() {
 }
 
 #[test]
+fn wait_times_out_on_schedule_when_the_server_never_answers() {
+    let scratch = Scratch::new();
+    let socket = scratch.root.join("silent.sock");
+    // The listener queues the connection but never reads or answers it.
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let started = Instant::now();
+    let output = Command::new(CTL)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["wait", "--timeout", "0.5"])
+        .env_remove("SO1TERM_SOCKET")
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(500), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "so1ctl: TIMEOUT: no command block finished within 0.5s"
+    );
+}
+
+#[test]
 fn server_exits_when_the_last_shell_exits() {
     let scratch = Scratch::new();
     let mut server = scratch.spawn("exit");

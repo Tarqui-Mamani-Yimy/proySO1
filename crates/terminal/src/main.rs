@@ -1809,8 +1809,13 @@ impl TerminalWindow {
                 let active = tabs.active_index().unwrap_or(0);
                 let values: Vec<_> = tabs.tabs().iter().enumerate().map(|(index, tab)| {
                     let panes: Vec<_> = tab.layout_tree().panes().iter().map(|pane_id| {
-                        let pane = self.panes.get(pane_id);
-                        serde_json::json!({"id": pane_id.0, "cwd": pane.map(|pane| pane.cwd.to_string_lossy().into_owned()).unwrap_or_default(), "title": pane.map(|pane| pane.title.clone()).unwrap_or_default(), "focused": index == active && tab.active_pane() == *pane_id, "state": pane.map_or("unknown", |pane| pane.model.blocks().activity().as_str()), "last_exit_status": pane.and_then(|pane| pane.model.blocks().last_exit_status())})
+                        let pane = self.panes.get(pane_id).map(|pane| control::ListPane {
+                            cwd: &pane.cwd,
+                            title: &pane.title,
+                            model: &pane.model,
+                        });
+                        let focused = index == active && tab.active_pane() == *pane_id;
+                        control::list_pane_entry(pane_id.0, focused, pane)
                     }).collect();
                     serde_json::json!({"index": index, "active": index == active, "panes": panes})
                 }).collect();

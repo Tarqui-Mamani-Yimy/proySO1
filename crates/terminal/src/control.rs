@@ -1,7 +1,8 @@
 pub use so1_term_core::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
-    ControlRequest, ControlResponse, MAX_REQUEST_LINE_BYTES, NO_COMMAND_BLOCK, TextScope,
-    block_result, parse_request, parse_response, serialize_request, serialize_response,
+    ControlRequest, ControlResponse, ListPane, MAX_REQUEST_LINE_BYTES, NO_COMMAND_BLOCK, TextScope,
+    block_result, list_pane_entry, parse_request, parse_response, serialize_request,
+    serialize_response,
 };
 
 /// Longest accepted `so1term-server --session` name.
@@ -50,7 +51,8 @@ mod transport {
     };
 
     const MAX_CONNECTIONS: usize = 16;
-    const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Socket read/write timeout of one control request, on both ends.
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     static TERMINATION_SOCKET_PATH: std::sync::atomic::AtomicPtr<libc::c_char> =
         std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
@@ -395,9 +397,29 @@ mod transport {
         Ok(())
     }
 
+    /// Sends one request and reads its response, waiting at most
+    /// [`REQUEST_TIMEOUT`] for the response.
     pub fn send_request(path: &Path, request: &ControlRequest) -> io::Result<ControlResponse> {
-        let mut stream = UnixStream::connect(path)?;
+        let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        exchange(stream, request)
+    }
+
+    /// Like [`send_request`], but both writing the request and reading the
+    /// response time out after `timeout`, which must be non-zero. A timeout
+    /// fails with [`io::ErrorKind::WouldBlock`] or [`io::ErrorKind::TimedOut`].
+    pub fn send_request_with_timeout(
+        path: &Path,
+        request: &ControlRequest,
+        timeout: Duration,
+    ) -> io::Result<ControlResponse> {
+        let stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        exchange(stream, request)
+    }
+
+    fn exchange(mut stream: UnixStream, request: &ControlRequest) -> io::Result<ControlResponse> {
         stream
             .write_all(&serialize_request(request).map_err(|e| io::Error::other(e.to_string()))?)?;
         let reader = BufReader::new(stream);
@@ -489,8 +511,8 @@ mod transport {
 
 #[cfg(unix)]
 pub use transport::{
-    AttachConnection, AttachHook, ControlServer, peer_uid_matches, runtime_directory, send_request,
-    validate_directory_metadata,
+    AttachConnection, AttachHook, ControlServer, REQUEST_TIMEOUT, peer_uid_matches,
+    runtime_directory, send_request, send_request_with_timeout, validate_directory_metadata,
 };
 
 #[cfg(not(unix))]

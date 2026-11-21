@@ -357,6 +357,29 @@ pub fn block_result(
     Ok(Value::Object(result))
 }
 
+/// A live pane as the `list` command describes it.
+#[derive(Clone, Copy)]
+pub struct ListPane<'a> {
+    pub cwd: &'a std::path::Path,
+    pub title: &'a str,
+    pub model: &'a crate::model::Model,
+}
+
+/// Builds one pane entry of the `list` command result, shared by the window
+/// and the session server so both report the same fields. A pane id with no
+/// live pane (`None`) reports an empty cwd and title, state `unknown`, and a
+/// null `last_exit_status`.
+pub fn list_pane_entry(id: u64, focused: bool, pane: Option<ListPane<'_>>) -> Value {
+    json!({
+        "id": id,
+        "cwd": pane.map(|pane| pane.cwd.to_string_lossy().into_owned()).unwrap_or_default(),
+        "title": pane.map(|pane| pane.title.to_owned()).unwrap_or_default(),
+        "focused": focused,
+        "state": pane.map_or("unknown", |pane| pane.model.blocks().activity().as_str()),
+        "last_exit_status": pane.and_then(|pane| pane.model.blocks().last_exit_status()),
+    })
+}
+
 pub fn parse_request(line: &[u8]) -> Result<ControlRequest, ControlError> {
     if line.len() > MAX_REQUEST_LINE_BYTES {
         return Err(ControlError::new(
@@ -831,6 +854,61 @@ mod tests {
         assert_eq!(result["command"], serde_json::Value::Null);
         assert_eq!(result["command_unavailable"], "anchors-missing");
         assert!(result["duration_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn list_pane_entry_describes_a_pane_or_falls_back_to_defaults() {
+        use super::{ListPane, list_pane_entry};
+        let mut model = crate::model::Model::new(20, 4);
+        model.feed(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\false\r\n\x1b]133;C\x1b\\");
+        model.feed(b"\x1b]133;D;1\x1b\\\x1b]133;A\x1b\\$ ");
+        let pane = ListPane {
+            cwd: std::path::Path::new("/srv/app"),
+            title: "build",
+            model: &model,
+        };
+        let entry = list_pane_entry(3, true, Some(pane));
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "id": 3,
+                "cwd": "/srv/app",
+                "title": "build",
+                "focused": true,
+                "state": "idle",
+                "last_exit_status": 1,
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"cwd":"/srv/app","focused":true,"id":3,"last_exit_status":1,"state":"idle","title":"build"}"#
+        );
+
+        let mut running = crate::model::Model::new(20, 4);
+        running.feed(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\sleep 9\r\n\x1b]133;C\x1b\\");
+        let entry = list_pane_entry(
+            4,
+            false,
+            Some(ListPane {
+                cwd: std::path::Path::new(""),
+                title: "",
+                model: &running,
+            }),
+        );
+        assert_eq!(entry["state"], "running");
+        assert_eq!(entry["last_exit_status"], serde_json::Value::Null);
+
+        assert_eq!(
+            list_pane_entry(9, false, None),
+            serde_json::json!({
+                "id": 9,
+                "cwd": "",
+                "title": "",
+                "focused": false,
+                "state": "unknown",
+                "last_exit_status": null,
+            })
+        );
     }
 
     #[test]

@@ -53,10 +53,7 @@ fn run() -> Result<(), String> {
     };
     let response = control::send_request(&socket, &request).map_err(|error| error.to_string())?;
     match response.outcome {
-        ControlOutcome::Success(value) => println!(
-            "{}",
-            serde_json::to_string(&value).map_err(|error| error.to_string())?
-        ),
+        ControlOutcome::Success(value) => print_json(&value)?,
         ControlOutcome::Failure(error) => {
             return Err(format!("{}: {}", error.code.as_str(), error.message));
         }
@@ -101,6 +98,18 @@ fn resolve_socket(socket: Option<std::path::PathBuf>) -> Result<std::path::PathB
     Ok(path)
 }
 
+/// Timeout of `so1ctl wait` when `--timeout` is not given.
+#[cfg(unix)]
+const DEFAULT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Pause between two `block` requests of `so1ctl wait`.
+#[cfg(unix)]
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Shortest socket timeout of a `wait` request; a zero timeout is invalid.
+#[cfg(unix)]
+const MIN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Arguments of the client-side `wait` command.
 #[cfg(unix)]
 #[derive(Debug, PartialEq)]
@@ -117,15 +126,16 @@ fn parse_wait(args: Vec<String>) -> Result<WaitArgs, String> {
     let mut wait = WaitArgs {
         pane: None,
         after: None,
-        timeout: std::time::Duration::from_secs(600),
+        timeout: DEFAULT_WAIT_TIMEOUT,
     };
     let (mut pane_seen, mut after_seen, mut timeout_seen) = (false, false, false);
-    let mut index = 0;
-    while index < args.len() {
-        let value = args
-            .get(index + 1)
-            .ok_or_else(|| format!("{} requires a value", args[index]));
-        match args[index].as_str() {
+    // Every wait option takes a value, so arguments are consumed in pairs.
+    for pair in args.chunks(2) {
+        let option = pair[0].as_str();
+        let value = pair
+            .get(1)
+            .ok_or_else(|| format!("{option} requires a value"));
+        match option {
             "--pane" if !pane_seen => {
                 pane_seen = true;
                 wait.pane = Some(
@@ -144,19 +154,17 @@ fn parse_wait(args: Vec<String>) -> Result<WaitArgs, String> {
             }
             "--timeout" if !timeout_seen => {
                 timeout_seen = true;
-                let seconds = value?
+                wait.timeout = value?
                     .parse::<f64>()
                     .ok()
                     .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
                     .ok_or("--timeout must be a non-negative number of seconds")?;
-                wait.timeout = seconds;
             }
             "--pane" | "--after" | "--timeout" => {
-                return Err(format!("{} may only be supplied once", args[index]));
+                return Err(format!("{option} may only be supplied once"));
             }
-            arg => return Err(format!("unexpected argument for wait: {arg}")),
+            _ => return Err(format!("unexpected argument for wait: {option}")),
         }
-        index += 2;
     }
     Ok(wait)
 }
@@ -168,6 +176,37 @@ fn wait_deadline(timeout: std::time::Duration) -> Option<std::time::Instant> {
     std::time::Instant::now().checked_add(timeout)
 }
 
+/// Socket timeout of one `wait` request at `now`: the time left before the
+/// deadline, capped at the normal request timeout and never below
+/// [`MIN_REQUEST_TIMEOUT`], so a slow server cannot hold `wait` past
+/// `--timeout`.
+#[cfg(unix)]
+fn request_timeout(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    let cap = so1_terminal::control::REQUEST_TIMEOUT;
+    deadline
+        .map_or(cap, |deadline| deadline.saturating_duration_since(now))
+        .clamp(MIN_REQUEST_TIMEOUT, cap)
+}
+
+/// Prints a control result as one line of JSON.
+#[cfg(unix)]
+fn print_json(value: &serde_json::Value) -> Result<(), String> {
+    let line = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    println!("{line}");
+    Ok(())
+}
+
+/// Whether a `block` result is the one `wait` returns: finished, and newer
+/// than `--after` when that was given.
+#[cfg(unix)]
+fn is_awaited_block(block: &serde_json::Value, after: Option<u64>) -> bool {
+    let newer = after.is_none_or(|after| block["id"].as_u64().is_some_and(|id| id > after));
+    newer && block["state"] == "finished"
+}
+
 /// Polls the `block` command until the pane's newest command block (newer
 /// than `--after`, when given) has finished, then prints it.
 #[cfg(unix)]
@@ -175,33 +214,39 @@ fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), Strin
     use so1_terminal::control::{
         self, ControlCommand, ControlErrorCode, ControlOutcome, ControlRequest,
     };
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let deadline = wait_deadline(wait.timeout);
-    let mut id = 1;
-    loop {
+    let deadline_passed = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+    let timed_out = || {
+        let what = wait.after.map_or("no command block".to_owned(), |after| {
+            format!("no block newer than {after}")
+        });
+        format!(
+            "TIMEOUT: {what} finished within {}s",
+            wait.timeout.as_secs_f64()
+        )
+    };
+    for request_id in 1.. {
         let request = ControlRequest {
-            id,
+            id: request_id,
             command: ControlCommand::Block {
                 pane: wait.pane,
                 block: None,
             },
         };
-        id += 1;
-        let response =
-            control::send_request(socket, &request).map_err(|error| error.to_string())?;
+        let timeout = request_timeout(deadline, Instant::now());
+        let response = match control::send_request_with_timeout(socket, &request, timeout) {
+            Ok(response) => response,
+            // The request was cut short by the deadline, not by a failure.
+            Err(_) if deadline_passed() => return Err(timed_out()),
+            Err(error) => return Err(error.to_string()),
+        };
         match response.outcome {
-            ControlOutcome::Success(block) => {
-                let newer = wait
-                    .after
-                    .is_none_or(|after| block["id"].as_u64().is_some_and(|id| id > after));
-                if newer && block["state"] == "finished" {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&block).map_err(|error| error.to_string())?
-                    );
-                    return Ok(());
-                }
+            ControlOutcome::Success(block) if is_awaited_block(&block, wait.after) => {
+                return print_json(&block);
             }
+            // The newest block is still running or not newer than `--after`.
+            ControlOutcome::Success(_) => {}
             // No command has run yet: keep waiting for the first one.
             ControlOutcome::Failure(error)
                 if error.code == ControlErrorCode::NotFound
@@ -210,17 +255,12 @@ fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), Strin
                 return Err(format!("{}: {}", error.code.as_str(), error.message));
             }
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let what = wait.after.map_or("no command block".to_owned(), |after| {
-                format!("no block newer than {after}")
-            });
-            return Err(format!(
-                "TIMEOUT: {what} finished within {}s",
-                wait.timeout.as_secs_f64()
-            ));
+        if deadline_passed() {
+            return Err(timed_out());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(WAIT_POLL_INTERVAL);
     }
+    unreachable!("request ids are unbounded")
 }
 
 #[cfg(unix)]
@@ -337,6 +377,28 @@ mod wait_tests {
         assert!(super::wait_deadline(Duration::from_secs(1)).is_some());
         assert_eq!(super::wait_deadline(Duration::MAX), None);
         assert!(super::parse_wait(vec!["--timeout".into(), "1e19".into()]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_wait_request_is_bounded_by_the_time_left_before_the_deadline() {
+        use super::request_timeout;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let cap = so1_terminal::control::REQUEST_TIMEOUT;
+        assert_eq!(cap, Duration::from_secs(30));
+        assert_eq!(
+            request_timeout(Some(now + Duration::from_millis(250)), now),
+            Duration::from_millis(250)
+        );
+        assert_eq!(request_timeout(Some(now + cap * 2), now), cap);
+        assert_eq!(request_timeout(None, now), cap);
+        // A deadline already reached still yields a usable, non-zero timeout.
+        assert_eq!(request_timeout(Some(now), now), Duration::from_millis(1));
+        assert_eq!(
+            request_timeout(Some(now), now + Duration::from_secs(1)),
+            Duration::from_millis(1)
+        );
     }
 
     #[cfg(unix)]

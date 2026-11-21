@@ -211,6 +211,12 @@ impl BlockList {
 
     /// Finds a block, telling apart identifiers that were never assigned from
     /// blocks that were discarded.
+    ///
+    /// Block ids are assigned monotonically from 1, so `next_id` is the newest
+    /// assigned id. An id in `1..=next_id` that is no longer retained was
+    /// evicted (dropped with its scrollback rows or by the `MAX_BLOCKS` limit)
+    /// and yields [`BlockLookupError::Evicted`]; `0` or any id above `next_id`
+    /// was never assigned and yields [`BlockLookupError::NotFound`].
     pub fn find(&self, query: BlockQuery) -> Result<&Block, BlockLookupError> {
         match query {
             BlockQuery::Last => self
@@ -651,6 +657,73 @@ mod tests {
         assert_eq!(
             BlockList::default().find(BlockQuery::Last),
             Err(BlockLookupError::NoCommandBlock)
+        );
+    }
+
+    #[test]
+    fn find_treats_the_newest_assigned_id_as_the_evicted_boundary() {
+        let mut list = blocks(&[
+            mark(1, SemanticMark::PromptStart),
+            mark(2, SemanticMark::OutputStart),
+            mark(
+                3,
+                SemanticMark::CommandFinished {
+                    exit_status: Some(0),
+                },
+            ),
+        ]);
+        // Block 1 is the newest assigned id (`next_id`) and is still retained.
+        assert_eq!(list.find(BlockQuery::Id(1)).map(|block| block.id), Ok(1));
+        // One past the newest assigned id was never assigned.
+        assert_eq!(
+            list.find(BlockQuery::Id(2)),
+            Err(BlockLookupError::NotFound(2))
+        );
+        // Once the newest block is gone its id reads as evicted, not unknown.
+        list.blocks.clear();
+        assert_eq!(
+            list.find(BlockQuery::Id(1)),
+            Err(BlockLookupError::Evicted(1))
+        );
+        assert_eq!(
+            list.find(BlockQuery::Id(2)),
+            Err(BlockLookupError::NotFound(2))
+        );
+    }
+
+    #[test]
+    fn find_reports_blocks_dropped_by_the_block_limit_as_evicted() {
+        let commands = MAX_BLOCKS as u64 + 1;
+        let events: Vec<_> = (0..commands)
+            .flat_map(|index| {
+                let offset = index * 3;
+                [
+                    mark(offset + 1, SemanticMark::PromptStart),
+                    mark(offset + 2, SemanticMark::OutputStart),
+                    mark(
+                        offset + 3,
+                        SemanticMark::CommandFinished {
+                            exit_status: Some(0),
+                        },
+                    ),
+                ]
+            })
+            .collect();
+        let list = blocks(&events);
+
+        assert_eq!(list.blocks().len(), MAX_BLOCKS);
+        assert_eq!(
+            list.find(BlockQuery::Id(1)),
+            Err(BlockLookupError::Evicted(1))
+        );
+        assert_eq!(list.find(BlockQuery::Id(2)).map(|block| block.id), Ok(2));
+        assert_eq!(
+            list.find(BlockQuery::Id(commands)).map(|block| block.id),
+            Ok(commands)
+        );
+        assert_eq!(
+            list.find(BlockQuery::Id(commands + 1)),
+            Err(BlockLookupError::NotFound(commands + 1))
         );
     }
 

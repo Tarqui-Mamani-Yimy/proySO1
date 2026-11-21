@@ -46,7 +46,7 @@ use crate::attach::{
 use crate::blocks::GridAnchor;
 use crate::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
-    ControlRequest, ControlResponse, TextScope,
+    ControlRequest, ControlResponse, ListPane, TextScope, list_pane_entry,
 };
 use crate::graphics::{self, DecodeJob, DecodedImage, GraphicsCompletion};
 use crate::graphics_pipeline::{GraphicsHost, PaneGraphics, SharedGraphics, frame_placements};
@@ -489,15 +489,13 @@ impl Session {
                     .panes()
                     .iter()
                     .map(|pane_id| {
-                        let pane = self.panes.get(pane_id);
-                        serde_json::json!({
-                            "id": pane_id.0,
-                            "cwd": pane.map(|pane| pane.cwd.to_string_lossy().into_owned()).unwrap_or_default(),
-                            "title": pane.map(|pane| pane.title.clone()).unwrap_or_default(),
-                            "focused": index == active && tab.active_pane() == *pane_id,
-                            "state": pane.map_or("unknown", |pane| pane.model.blocks().activity().as_str()),
-                            "last_exit_status": pane.and_then(|pane| pane.model.blocks().last_exit_status()),
-                        })
+                        let pane = self.panes.get(pane_id).map(|pane| ListPane {
+                            cwd: &pane.cwd,
+                            title: &pane.title,
+                            model: &pane.model,
+                        });
+                        let focused = index == active && tab.active_pane() == *pane_id;
+                        list_pane_entry(pane_id.0, focused, pane)
                     })
                     .collect();
                 serde_json::json!({"index": index, "active": index == active, "panes": panes})

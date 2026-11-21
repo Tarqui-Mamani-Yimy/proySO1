@@ -106,9 +106,10 @@ const DEFAULT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[cfg(unix)]
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Shortest socket timeout of a `wait` request; a zero timeout is invalid.
+/// Shortest socket timeout of a `wait` request, so even `--timeout 0` gets one
+/// real probe of the server (a zero socket timeout is also invalid).
 #[cfg(unix)]
-const MIN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
+const MIN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Arguments of the client-side `wait` command.
 #[cfg(unix)]
@@ -237,8 +238,17 @@ fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), Strin
         let timeout = request_timeout(deadline, Instant::now());
         let response = match control::send_request_with_timeout(socket, &request, timeout) {
             Ok(response) => response,
-            // The request was cut short by the deadline, not by a failure.
-            Err(_) if deadline_passed() => return Err(timed_out()),
+            // The request was cut short by the deadline, not by a failure;
+            // any other transport error is reported as it is.
+            Err(error)
+                if deadline_passed()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                return Err(timed_out());
+            }
             Err(error) => return Err(error.to_string()),
         };
         match response.outcome {
@@ -382,23 +392,24 @@ mod wait_tests {
     #[cfg(unix)]
     #[test]
     fn each_wait_request_is_bounded_by_the_time_left_before_the_deadline() {
-        use super::request_timeout;
+        use super::{MIN_REQUEST_TIMEOUT, request_timeout};
         use std::time::{Duration, Instant};
         let now = Instant::now();
         let cap = so1_terminal::control::REQUEST_TIMEOUT;
         assert_eq!(cap, Duration::from_secs(30));
         assert_eq!(
-            request_timeout(Some(now + Duration::from_millis(250)), now),
-            Duration::from_millis(250)
+            request_timeout(Some(now + Duration::from_secs(2)), now),
+            Duration::from_secs(2)
         );
         assert_eq!(request_timeout(Some(now + cap * 2), now), cap);
         assert_eq!(request_timeout(None, now), cap);
-        // A deadline already reached still yields a usable, non-zero timeout.
-        assert_eq!(request_timeout(Some(now), now), Duration::from_millis(1));
+        // A deadline already reached still leaves time for one real probe.
+        assert_eq!(request_timeout(Some(now), now), MIN_REQUEST_TIMEOUT);
         assert_eq!(
             request_timeout(Some(now), now + Duration::from_secs(1)),
-            Duration::from_millis(1)
+            MIN_REQUEST_TIMEOUT
         );
+        assert_eq!(MIN_REQUEST_TIMEOUT, Duration::from_millis(250));
     }
 
     #[cfg(unix)]

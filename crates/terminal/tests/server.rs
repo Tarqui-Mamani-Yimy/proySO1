@@ -297,6 +297,45 @@ fn wait_times_out_on_schedule_when_the_server_never_answers() {
 }
 
 #[test]
+fn wait_reports_transport_errors_instead_of_a_timeout() {
+    let scratch = Scratch::new();
+    let missing = scratch.root.join("no-such.sock");
+    let output = Command::new(CTL)
+        .args([
+            "--socket",
+            missing.to_str().unwrap(),
+            "wait",
+            "--timeout",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("TIMEOUT"), "{stderr}");
+    assert!(stderr.contains("No such file or directory"), "{stderr}");
+}
+
+#[test]
+fn wait_with_a_zero_timeout_still_probes_once() {
+    let scratch = Scratch::new();
+    let _server = scratch.spawn("probe");
+    stdout(&scratch.ctl(
+        "probe",
+        &[
+            "send-text",
+            "printf '\\033]133;C\\033\\\\'; printf '\\033]133;D;6\\033\\\\'\n",
+        ],
+    ));
+    wait_until("finished block", || {
+        let output = scratch.ctl("probe", &["block"]);
+        output.status.success() && json(&output)["state"] == "finished"
+    });
+    let block = json(&scratch.ctl("probe", &["wait", "--timeout", "0"]));
+    assert_eq!(block["exit_status"], 6);
+}
+
+#[test]
 fn server_exits_when_the_last_shell_exits() {
     let scratch = Scratch::new();
     let mut server = scratch.spawn("exit");

@@ -709,11 +709,10 @@ impl Shell {
         match self.try_builtin_with_embedder(&new_args[0], &new_args, &[], span) {
             Ok(Some(status)) => Ok(status),
             // `command` turns a special-builtin usage failure into an ordinary
-            // command status so the rest of a compound list can run.
-            Err(
-                crate::eval::EvalError::RecoverableSpecialBuiltin(_)
-                | crate::eval::EvalError::FailedExec(_),
-            ) => Ok(ExitStatus::MISUSE),
+            // command status so the rest of a compound list can run. A failed
+            // `exec` stays fatal (dash and bash exit with 127/126 there too),
+            // so `FailedExec` propagates through the `Err(error)` arm below.
+            Err(crate::eval::EvalError::RecoverableSpecialBuiltin(_)) => Ok(ExitStatus::MISUSE),
             Ok(None) if self.has_external_handler() => self
                 .call_external_handler(&new_args, &[])
                 .map_err(crate::eval::EvalError::from),

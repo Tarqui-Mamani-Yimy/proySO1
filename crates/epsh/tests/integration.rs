@@ -1059,6 +1059,17 @@ mod exec_command {
     use super::*;
 
     #[test]
+    fn command_exec_of_a_missing_command_still_exits_127_like_dash() {
+        let (stdout, stderr, code) = run("command exec no-such-command-xyz; echo after");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains("exec: no-such-command-xyz: "),
+            "unexpected stderr: {stderr}"
+        );
+        assert_eq!(code, 127);
+    }
+
+    #[test]
     fn exec_replaces_the_shell_with_the_named_command() {
         let (stdout, stderr, code) = run("exec echo hi; echo not-reached");
         assert_eq!((stdout.as_str(), stderr.as_str(), code), ("hi\n", "", 0));

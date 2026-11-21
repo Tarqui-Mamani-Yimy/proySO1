@@ -149,7 +149,8 @@ Cada fase termina con algo **usable** y con tests en verde.
 ### Fase 6 — Capa de agentes (opcional)
 - [ ] Chequeo de permisos de comandos de agentes vía AST de epsh.
 - [ ] Estado por panel de agente (trabajando / bloqueado / ocioso).
-- [ ] Integración con Pi por su modo RPC.
+- [ ] Contrato genérico para agentes vía `so1ctl` (metadatos de bloques, `wait`, `status`).
+  Sin integración específica con Pi: cualquier agente, Pi incluido, es un cliente más.
 
 ## 6. Licencias
 

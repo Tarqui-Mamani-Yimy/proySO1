@@ -2715,3 +2715,15 @@ t="pre${v}post"; echo "$t" ${#t}"#,
     );
     assert!(!stdout.contains('\u{FFFE}'));
 }
+
+/// With `set -f`, quoted text keeps its characters and no escape markers.
+#[test]
+fn quoted_glob_characters_survive_noglob_without_markers() {
+    let (stdout, stderr, code) =
+        run(r#"set -f; v="a*"; printf "<%s>" "*" "a\\b" "$v" "[x]" $v; echo"#);
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("<*><a\\b><a*><[x]><a*>\n", 0),
+        "stderr: {stderr}"
+    );
+}

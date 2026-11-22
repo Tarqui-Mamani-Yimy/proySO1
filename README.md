@@ -6,6 +6,22 @@ It primarily exists so that Rust-based coding agents can execute shell commands 
 than shelling out to bash. It's a library first, binary second.
 
 It's not an interactive shell, but an interactive shell could be built on top of it.
+This workspace builds one: **Shellux** (the interactive shell) and **Nulix** (a GPU terminal).
+
+## Installing Shellux and Nulix
+
+Prebuilt binaries are published on the GitHub Releases page for Linux x86_64 and
+macOS arm64. Install with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Tarqui-Mamani-Yimy/proySO1/main/install.sh | sh                # shellux + epsh
+curl -fsSL https://raw.githubusercontent.com/Tarqui-Mamani-Yimy/proySO1/main/install.sh | PACKAGE=nulix sh  # nulix, nulix-server, nulixctl
+```
+
+The script verifies the release checksum and installs into `~/.local/bin`
+(`PREFIX=/usr/local` changes that; `VERSION=X.Y.Z` pins a release). Homebrew
+formulas and AUR `shellux-bin` / `nulix-bin` packages are generated from
+`packaging/`. Other platforms build from source with `cargo build --release`.
 
 ## Why not just use bash?
 

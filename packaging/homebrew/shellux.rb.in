@@ -1,0 +1,29 @@
+# Homebrew formula template; scripts/render-packaging.sh fills the @...@ fields.
+class Shellux < Formula
+  desc "Interactive POSIX shell built on the epsh engine"
+  homepage "https://github.com/Tarqui-Mamani-Yimy/proySO1"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/Tarqui-Mamani-Yimy/proySO1/releases/download/v@VERSION@/shellux-@VERSION@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHELLUX_DARWIN_SHA256@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/Tarqui-Mamani-Yimy/proySO1/releases/download/v@VERSION@/shellux-@VERSION@-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "@SHELLUX_LINUX_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "bin/shellux", "bin/epsh"
+  end
+
+  test do
+    assert_equal "42", shell_output("#{bin}/shellux -c 'echo $((6*7))'").strip
+  end
+end

@@ -171,6 +171,26 @@ A control `attach` request upgrades its connection to the attach stream (`crates
 
 `nulix --session NAME` opens the window as the session's attached client (`nulix --help` lists the option; an invalid NAME exits with status 2). It connects to the session socket, or starts `nulix-server --session NAME` (the binary next to `nulix`, else from `PATH`) in a new session with null stdio and waits up to 5 seconds for it to listen. It attaches once its window size has been unchanged for 150 ms, so a window manager's resize right after mapping never reaches the server as a provisional `Hello` size (a width change reflows the panes and drops kitty placements). The window keeps the standalone keybindings (pane, tab, block, copy/paste), but routes their actions to the server. It owns no PTYs, models or control listener: it renders the server's layout and per-pane frames through the same renderer input as the standalone window, encodes keys locally with the focused frame's keyboard modes, and sends input, resize, scroll, selection, block, copy and tab/pane actions to the server. Closing the window detaches and exits 0 while the session keeps running; a server `Exit` closes the window, and a broken stream closes it with one diagnostic (status 1). Client mode shows kitty graphics: frames carry the projected placements, and before a frame places an image the server sends an `image` announcement and its RGBA data in contiguous chunks of at most 4 MiB, once per image per attached client (again after re-attach); `image-removed` reports freed or replaced data. Image lines are never dropped. A new image starts only while less than 256 MiB of earlier image lines are queued for the client, and a started image is queued whole, so a single image larger than 256 MiB still reaches the client; a client whose backlog is still above 256 MiB when another image must start gets an `IMAGE_BACKLOG` error and is detached. The client checks announced sizes, chunk contiguity, the 10,000 px dimension limit and a 512 MiB total, skips placements whose image is still incomplete, and renders the rest with the standalone window's texture cache and z-order code; textures are released when images are removed or their pane goes away. Plain `nulix` remains the standalone window.
 
+## Packaging
+
+Releases ship two packages per target (`x86_64-unknown-linux-gnu`,
+`aarch64-apple-darwin`): `shellux-X.Y.Z-TARGET.tar.gz` (`bin/shellux`, `bin/epsh`,
+`LICENSE`, `LICENSE-epsh`, `README.md`) and `nulix-X.Y.Z-TARGET.tar.gz`
+(`bin/nulix`, `bin/nulix-server`, `bin/nulixctl`, `LICENSE`, `README.md`,
+`nulix.conf.example`), each with a `.sha256` file. `scripts/package.sh` builds and
+packages them (`VERSION`, `OUT`, `SKIP_BUILD=1`); X.Y.Z is the `shellux` crate version.
+`.github/workflows/ci.yml` runs `make ci` and the install test on Linux and macOS;
+`.github/workflows/release.yml` runs on `vX.Y.Z` tags (the tag must equal the shellux
+version), tests, packages both targets and creates the GitHub Release with `gh`.
+`install.sh` (`PACKAGE=shellux|nulix`, `VERSION`, `PREFIX`, `REPO`, `BASE_URL`)
+downloads the matching tarball, refuses a checksum mismatch or an unsupported
+platform, and installs into `$PREFIX/bin` (default `~/.local/bin`).
+`scripts/render-packaging.sh VERSION DIST OUT` fills the Homebrew formulas
+(`packaging/homebrew/*.rb.in`; `nulix` depends on `shellux`) and the AUR
+`shellux-bin` / `nulix-bin` PKGBUILDs plus `.SRCINFO` with a release's checksums.
+Publishing a tag, a Homebrew tap or AUR packages is a separate, explicitly
+authorized step.
+
 ## Embedding API
 
 ```rust
@@ -246,6 +266,7 @@ assert!(!is_builtin("rm"));
 cargo test --workspace
 cargo test -p shellux --test repl                        # PTY REPL tests
 cargo test -p nulix --test tui                           # TUI smoke matrix (less, top, fzf, man; skips missing)
+sh scripts/test-install.sh                               # package, install and render packaging (SKIP_BUILD=1 reuses builds)
 cargo run -p shellux                                     # interactive on a TTY
 make ci                                               # both crates + conformance
 cargo test -p epsh --test api_stability                      # API surface regression

@@ -1,0 +1,23 @@
+# AUR PKGBUILD template; scripts/render-packaging.sh fills the @...@ fields.
+pkgname=nulix-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="GPU terminal with panes, blocks and persistent sessions"
+arch=('x86_64')
+url="https://github.com/Tarqui-Mamani-Yimy/proySO1"
+license=('MIT')
+depends=('shellux' 'glibc' 'gcc-libs' 'libxkbcommon' 'wayland' 'vulkan-icd-loader')
+optdepends=('libx11: X11 sessions' 'libxcursor: X11 cursors')
+provides=('nulix')
+conflicts=('nulix')
+source_x86_64=("$url/releases/download/v$pkgver/nulix-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@NULIX_LINUX_SHA256@')
+
+package() {
+  cd "nulix-$pkgver-x86_64-unknown-linux-gnu"
+  install -Dm755 bin/nulix "$pkgdir/usr/bin/nulix"
+  install -Dm755 bin/nulix-server "$pkgdir/usr/bin/nulix-server"
+  install -Dm755 bin/nulixctl "$pkgdir/usr/bin/nulixctl"
+  install -Dm644 nulix.conf.example "$pkgdir/usr/share/doc/nulix/nulix.conf.example"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

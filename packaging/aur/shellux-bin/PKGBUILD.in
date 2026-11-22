@@ -1,0 +1,21 @@
+# AUR PKGBUILD template; scripts/render-packaging.sh fills the @...@ fields.
+pkgname=shellux-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Interactive POSIX shell built on the epsh engine"
+arch=('x86_64')
+url="https://github.com/Tarqui-Mamani-Yimy/proySO1"
+license=('MIT')
+depends=('glibc' 'gcc-libs')
+provides=('shellux' 'epsh')
+conflicts=('shellux' 'epsh')
+source_x86_64=("$url/releases/download/v$pkgver/shellux-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@SHELLUX_LINUX_SHA256@')
+
+package() {
+  cd "shellux-$pkgver-x86_64-unknown-linux-gnu"
+  install -Dm755 bin/shellux "$pkgdir/usr/bin/shellux"
+  install -Dm755 bin/epsh "$pkgdir/usr/bin/epsh"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSE-epsh "$pkgdir/usr/share/licenses/$pkgname/LICENSE-epsh"
+}

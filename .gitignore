@@ -2,3 +2,4 @@
 .atl/
 .codegraph/
 rustc-ice-*.txt
+/dist

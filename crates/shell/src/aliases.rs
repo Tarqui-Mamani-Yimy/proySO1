@@ -1,7 +1,7 @@
 //! Interactive aliases: the alias table, the `alias`/`unalias` builtins and
 //! alias expansion of interactive REPL lines.
 //!
-//! epsh stays alias-free by design. so1sh expands aliases only in lines typed
+//! epsh stays alias-free by design. shellux expands aliases only in lines typed
 //! at the interactive prompt, before handing them to epsh; `-c`, scripts,
 //! piped input and files sourced with `.` are never expanded.
 //!
@@ -273,7 +273,7 @@ pub(crate) fn lock(aliases: &SharedAliases) -> MutexGuard<'_, Aliases> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Register `alias` and `unalias` as so1sh embedder builtins sharing one table.
+/// Register `alias` and `unalias` as shellux embedder builtins sharing one table.
 pub(crate) fn register(shell: &mut Shell) -> Result<SharedAliases, String> {
     let aliases = SharedAliases::default();
     let alias_table = aliases.clone();

@@ -1,4 +1,4 @@
-//! End-to-end tests for the `so1term-server` attach stream (Phase 5 T11b/T11d).
+//! End-to-end tests for the `nulix-server` attach stream (Phase 5 T11b/T11d).
 //!
 //! Each test runs the real server binary with an isolated `XDG_RUNTIME_DIR`,
 //! upgrades a control connection with the `attach` request, and drives the
@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use alacritty_terminal::selection::SelectionType;
-use so1_terminal::{
+use nulix::{
     attach::{
         BlockOp, ClientMessage, CopySource, FramePlacement, LayoutAction, LayoutFrame, PaneFrame,
         SelectionOp, ServerMessage, SplitDirection, cells_from_runs, encode_client, parse_server,
@@ -28,8 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SERVER: &str = env!("CARGO_BIN_EXE_so1term-server");
-const CTL: &str = env!("CARGO_BIN_EXE_so1ctl");
+const SERVER: &str = env!("CARGO_BIN_EXE_nulix-server");
+const CTL: &str = env!("CARGO_BIN_EXE_nulixctl");
 const WAIT: Duration = Duration::from_secs(10);
 /// Window metrics used by most tests: 100x30 cells of 8x16 px.
 const HELLO: ClientMessage = ClientMessage::Hello {
@@ -49,7 +49,7 @@ struct Scratch {
 impl Scratch {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "so1term-attach-test-{}-{}",
+            "nulix-attach-test-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
@@ -61,19 +61,19 @@ impl Scratch {
 
     fn socket(&self, session: &str) -> PathBuf {
         self.root
-            .join("so1term")
-            .join(format!("so1term-server-{session}.sock"))
+            .join("nulix")
+            .join(format!("nulix-server-{session}.sock"))
     }
 
     fn spawn(&self, session: &str) -> Server {
         let child = Command::new(SERVER)
             .args(["--session", session])
             .env("XDG_RUNTIME_DIR", &self.root)
-            .env("SO1TERM_SHELL", "/bin/sh")
-            // Never read the developer's own so1term.conf.
-            .env("SO1TERM_CONFIG", "/dev/null")
+            .env("NULIX_SHELL", "/bin/sh")
+            // Never read the developer's own nulix.conf.
+            .env("NULIX_CONFIG", "/dev/null")
             .env("PS1", "$ ")
-            .env_remove("SO1TERM_SOCKET")
+            .env_remove("NULIX_SOCKET")
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -92,7 +92,7 @@ impl Scratch {
             .arg("--socket")
             .arg(self.socket(session))
             .args(args)
-            .env_remove("SO1TERM_SOCKET")
+            .env_remove("NULIX_SOCKET")
             .output()
             .unwrap()
     }
@@ -447,7 +447,7 @@ fn visible_panes(layout: &LayoutFrame) -> Vec<u64> {
 fn ctl_json(output: &Output) -> serde_json::Value {
     assert!(
         output.status.success(),
-        "so1ctl failed: {}",
+        "nulixctl failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
@@ -826,14 +826,14 @@ fn last_shell_exit_sends_exit_before_the_server_stops() {
 }
 
 #[test]
-fn so1ctl_works_while_attached_and_shutdown_sends_exit() {
+fn nulixctl_works_while_attached_and_shutdown_sends_exit() {
     let scratch = Scratch::new();
     let mut server = scratch.spawn("ctl");
     let mut client = scratch.attach_hello("ctl");
     let list = ctl_json(&scratch.ctl("ctl", &["list"]));
     assert_eq!(list["tabs"].as_array().unwrap().len(), 1);
     ctl_json(&scratch.ctl("ctl", &["new-tab"]));
-    client.recv_until("layout after so1ctl new-tab", |message| match message {
+    client.recv_until("layout after nulixctl new-tab", |message| match message {
         ServerMessage::Layout(layout) if layout.tabs.len() == 2 => Some(()),
         _ => None,
     });

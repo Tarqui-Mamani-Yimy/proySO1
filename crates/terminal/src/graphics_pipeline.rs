@@ -1,6 +1,6 @@
 //! Shared kitty graphics pipeline for one pane's PTY output (Phase 5 T11d).
 //!
-//! The standalone so1term window and the headless `so1term-server` session run
+//! The standalone nulix window and the headless `nulix-server` session run
 //! the same code here, so kitty graphics behave identically in both:
 //!
 //! 1. [`PaneGraphics::receive`] splits PTY bytes into ordered text and APC

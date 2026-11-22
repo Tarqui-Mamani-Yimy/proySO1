@@ -1,20 +1,20 @@
 #[cfg(unix)]
 fn main() {
     if let Err(error) = run() {
-        eprintln!("so1ctl: {error}");
+        eprintln!("nulixctl: {error}");
         std::process::exit(1);
     }
 }
 
 #[cfg(not(unix))]
 fn main() {
-    eprintln!("so1ctl: local control is unsupported on Windows in v1");
+    eprintln!("nulixctl: local control is unsupported on Windows in v1");
     std::process::exit(1);
 }
 
 #[cfg(unix)]
 fn run() -> Result<(), String> {
-    use so1_terminal::control::{self, ControlOutcome, ControlRequest};
+    use nulix::control::{self, ControlOutcome, ControlRequest};
     use std::{
         env,
         path::PathBuf,
@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Usage: so1ctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], wait [--pane ID] [--after ID] [--timeout SECS] (default 600), shutdown (so1term-server only)"
+            "Usage: nulixctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], wait [--pane ID] [--after ID] [--timeout SECS] (default 600), shutdown (nulix-server only)"
         );
         return Ok(());
     }
@@ -61,14 +61,13 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Picks the control socket: `--socket`, then `SO1TERM_SOCKET`, then the only
-/// so1term socket in the runtime directory.
+/// Picks the control socket: `--socket`, then `NULIX_SOCKET`, then the only
+/// nulix socket in the runtime directory.
 #[cfg(unix)]
 fn resolve_socket(socket: Option<std::path::PathBuf>) -> Result<std::path::PathBuf, String> {
-    use so1_terminal::control;
+    use nulix::control;
     use std::{env, path::PathBuf};
-    let path = if let Some(path) =
-        socket.or_else(|| env::var_os("SO1TERM_SOCKET").map(PathBuf::from))
+    let path = if let Some(path) = socket.or_else(|| env::var_os("NULIX_SOCKET").map(PathBuf::from))
     {
         path
     } else {
@@ -81,28 +80,26 @@ fn resolve_socket(socket: Option<std::path::PathBuf>) -> Result<std::path::PathB
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("so1term-") && name.ends_with(".sock"))
+                    .is_some_and(|name| name.starts_with("nulix-") && name.ends_with(".sock"))
             })
             .collect::<Vec<_>>();
         sockets.sort();
         match sockets.len() {
-            0 => return Err("no so1term socket found; start so1term or set SO1TERM_SOCKET".into()),
+            0 => return Err("no nulix socket found; start nulix or set NULIX_SOCKET".into()),
             1 => sockets.remove(0),
             _ => {
-                return Err(
-                    "multiple so1term sockets found; set --socket or SO1TERM_SOCKET".into(),
-                );
+                return Err("multiple nulix sockets found; set --socket or NULIX_SOCKET".into());
             }
         }
     };
     Ok(path)
 }
 
-/// Timeout of `so1ctl wait` when `--timeout` is not given.
+/// Timeout of `nulixctl wait` when `--timeout` is not given.
 #[cfg(unix)]
 const DEFAULT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Pause between two `block` requests of `so1ctl wait`.
+/// Pause between two `block` requests of `nulixctl wait`.
 #[cfg(unix)]
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -186,7 +183,7 @@ fn request_timeout(
     deadline: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> std::time::Duration {
-    let cap = so1_terminal::control::REQUEST_TIMEOUT;
+    let cap = nulix::control::REQUEST_TIMEOUT;
     deadline
         .map_or(cap, |deadline| deadline.saturating_duration_since(now))
         .clamp(MIN_REQUEST_TIMEOUT, cap)
@@ -212,9 +209,7 @@ fn is_awaited_block(block: &serde_json::Value, after: Option<u64>) -> bool {
 /// than `--after`, when given) has finished, then prints it.
 #[cfg(unix)]
 fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), String> {
-    use so1_terminal::control::{
-        self, ControlCommand, ControlErrorCode, ControlOutcome, ControlRequest,
-    };
+    use nulix::control::{self, ControlCommand, ControlErrorCode, ControlOutcome, ControlRequest};
     use std::time::Instant;
     let deadline = wait_deadline(wait.timeout);
     let deadline_passed = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
@@ -277,8 +272,8 @@ fn wait_for_block(socket: &std::path::Path, wait: &WaitArgs) -> Result<(), Strin
 fn parse_command(
     command_name: &str,
     args: Vec<String>,
-) -> Result<so1_terminal::control::ControlCommand, String> {
-    use so1_terminal::control::{ControlCommand, ControlDirection, TextScope};
+) -> Result<nulix::control::ControlCommand, String> {
+    use nulix::control::{ControlCommand, ControlDirection, TextScope};
     let (allow_pane, allow_direction, allow_scope, allow_text, allow_id) = match command_name {
         "list" | "new-tab" | "shutdown" => (false, false, false, false, false),
         "split" => (true, true, false, false, false),
@@ -395,7 +390,7 @@ mod wait_tests {
         use super::{MIN_REQUEST_TIMEOUT, request_timeout};
         use std::time::{Duration, Instant};
         let now = Instant::now();
-        let cap = so1_terminal::control::REQUEST_TIMEOUT;
+        let cap = nulix::control::REQUEST_TIMEOUT;
         assert_eq!(cap, Duration::from_secs(30));
         assert_eq!(
             request_timeout(Some(now + Duration::from_secs(2)), now),
@@ -458,7 +453,7 @@ mod tests {
     #[test]
     fn cli_argument_validation_matches_each_command_shape() {
         use super::parse_command;
-        use so1_terminal::control::{ControlCommand, ControlDirection, TextScope};
+        use nulix::control::{ControlCommand, ControlDirection, TextScope};
         let cases = [
             ("list", vec![], Ok(ControlCommand::List)),
             ("new-tab", vec![], Ok(ControlCommand::NewTab)),

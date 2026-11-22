@@ -1,13 +1,13 @@
-//! TUI smoke matrix: real full-screen programs inside a headless `so1term-server` pane.
+//! TUI smoke matrix: real full-screen programs inside a headless `nulix-server` pane.
 //!
 //! Each test runs one installed program (`less`, `top`, `fzf`, `man`) in a pane
-//! driven through the real `so1ctl` binary: the program must take over the screen
+//! driven through the real `nulixctl` binary: the program must take over the screen
 //! (alternate screen, so earlier shell output is hidden; `top` redraws the
 //! primary screen instead), react to keys, quit with
 //! its normal key, and hand the pane back to the shell with the earlier output
 //! visible again and a new command working. A program that is not installed makes
 //! its test pass early with a "skipped" note; nothing is ever installed.
-//! The manual counterpart for so1term windows is `docs/tui-smoke-checklist.md`.
+//! The manual counterpart for nulix windows is `docs/tui-smoke-checklist.md`.
 #![cfg(unix)]
 
 use std::{
@@ -20,8 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SERVER: &str = env!("CARGO_BIN_EXE_so1term-server");
-const CTL: &str = env!("CARGO_BIN_EXE_so1ctl");
+const SERVER: &str = env!("CARGO_BIN_EXE_nulix-server");
+const CTL: &str = env!("CARGO_BIN_EXE_nulixctl");
 const WAIT: Duration = Duration::from_secs(15);
 const SESSION: &str = "tui";
 /// Printed before each program starts; hidden while it owns the alternate screen.
@@ -52,7 +52,7 @@ struct Pane {
 impl Pane {
     fn start() -> Self {
         let root = env::temp_dir().join(format!(
-            "so1term-tui-test-{}-{}",
+            "nulix-tui-test-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
@@ -63,9 +63,9 @@ impl Pane {
         let server = Command::new(SERVER)
             .args(["--session", SESSION])
             .env("XDG_RUNTIME_DIR", &root)
-            .env("SO1TERM_SHELL", "/bin/sh")
-            // Never read the developer's own so1term.conf.
-            .env("SO1TERM_CONFIG", "/dev/null")
+            .env("NULIX_SHELL", "/bin/sh")
+            // Never read the developer's own nulix.conf.
+            .env("NULIX_CONFIG", "/dev/null")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("LANG", "C.UTF-8")
@@ -81,7 +81,7 @@ impl Pane {
             .env_remove("LESSOPEN")
             .env_remove("LESSCLOSE")
             .env_remove("NO_COLOR")
-            .env_remove("SO1TERM_SOCKET")
+            .env_remove("NULIX_SOCKET")
             .current_dir(&home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -99,8 +99,8 @@ impl Pane {
 
     fn socket(&self) -> PathBuf {
         self.root
-            .join("so1term")
-            .join(format!("so1term-server-{SESSION}.sock"))
+            .join("nulix")
+            .join(format!("nulix-server-{SESSION}.sock"))
     }
 
     fn ctl(&self, args: &[&str]) -> Output {
@@ -108,7 +108,7 @@ impl Pane {
             .arg("--socket")
             .arg(self.socket())
             .args(args)
-            .env_remove("SO1TERM_SOCKET")
+            .env_remove("NULIX_SOCKET")
             .output()
             .unwrap()
     }

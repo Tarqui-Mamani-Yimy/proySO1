@@ -1,6 +1,6 @@
-//! Attached GUI client of a `so1term-server` session (Phase 5 T11c).
+//! Attached GUI client of a `nulix-server` session (Phase 5 T11c).
 //!
-//! `so1term --session NAME` does not own PTYs or VT models. It connects to the
+//! `nulix --session NAME` does not own PTYs or VT models. It connects to the
 //! session server (starting it when absent, see [`ensure_server`]), upgrades a
 //! control connection to an attach stream ([`AttachConnection`]), and renders
 //! what the server reports. [`RemoteView`] is the pure client-side store: it
@@ -676,10 +676,10 @@ fn push_unique(rects: &mut Vec<Rect>, rect: Rect) {
     }
 }
 
-/// `so1term-server` next to `current_exe` when present, otherwise the bare name
+/// `nulix-server` next to `current_exe` when present, otherwise the bare name
 /// so the spawn searches `PATH`.
 pub fn server_program(current_exe: Option<&Path>) -> PathBuf {
-    let name = format!("so1term-server{}", std::env::consts::EXE_SUFFIX);
+    let name = format!("nulix-server{}", std::env::consts::EXE_SUFFIX);
     current_exe
         .and_then(Path::parent)
         .map(|dir| dir.join(&name))
@@ -716,10 +716,10 @@ mod transport {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-    /// Returns the socket of session `session`, starting `so1term-server` when
+    /// Returns the socket of session `session`, starting `nulix-server` when
     /// no live server answers on it.
     ///
-    /// The server binary is the `so1term-server` next to the current
+    /// The server binary is the `nulix-server` next to the current
     /// executable, falling back to `PATH`. It runs in a new session (`setsid`)
     /// with null stdio so it outlives this window and its terminal.
     pub fn ensure_server(session: &str) -> io::Result<PathBuf> {
@@ -783,7 +783,7 @@ mod transport {
                     return Ok(socket);
                 }
                 return Err(io::Error::other(format!(
-                    "so1term-server for session {session} exited before its socket accepted connections ({status})"
+                    "nulix-server for session {session} exited before its socket accepted connections ({status})"
                 )));
             }
             if Instant::now() >= deadline {
@@ -793,7 +793,7 @@ mod transport {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "so1term-server for session {session} did not accept connections within {} ms",
+                        "nulix-server for session {session} did not accept connections within {} ms",
                         timeout.as_millis()
                     ),
                 ));
@@ -870,7 +870,7 @@ mod transport {
             };
             connection.send(&metrics.hello())?;
             thread::Builder::new()
-                .name("so1term-attach-reader".into())
+                .name("nulix-attach-reader".into())
                 .spawn(move || read_stream(reader, on_event))?;
             Ok(connection)
         }
@@ -1629,16 +1629,16 @@ mod tests {
     #[test]
     fn server_program_prefers_the_sibling_binary_then_path() {
         let dir = scratch_dir("program");
-        let exe = dir.join("so1term");
+        let exe = dir.join("nulix");
         assert_eq!(
             server_program(Some(&exe)),
-            std::path::PathBuf::from("so1term-server")
+            std::path::PathBuf::from("nulix-server")
         );
-        std::fs::write(dir.join("so1term-server"), b"").unwrap();
-        assert_eq!(server_program(Some(&exe)), dir.join("so1term-server"));
+        std::fs::write(dir.join("nulix-server"), b"").unwrap();
+        assert_eq!(server_program(Some(&exe)), dir.join("nulix-server"));
         assert_eq!(
             server_program(None),
-            std::path::PathBuf::from("so1term-server")
+            std::path::PathBuf::from("nulix-server")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1647,7 +1647,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "so1term-remote-{tag}-{}-{}",
+            "nulix-remote-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1858,7 +1858,7 @@ mod tests {
             let path = ensure_server_in(
                 &dir,
                 "live",
-                Path::new("/nonexistent/so1term-server"),
+                Path::new("/nonexistent/nulix-server"),
                 Duration::from_millis(100),
             )
             .unwrap();
@@ -1880,7 +1880,7 @@ mod tests {
             let error = ensure_server_in(
                 &dir,
                 "missing",
-                Path::new("/nonexistent/so1term-server"),
+                Path::new("/nonexistent/nulix-server"),
                 Duration::from_secs(5),
             )
             .unwrap_err();

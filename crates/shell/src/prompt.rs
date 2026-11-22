@@ -1,4 +1,4 @@
-//! Prompt expansion and the default so1sh prompt (see odd/tasks/shell-prompt-banner.md, T1).
+//! Prompt expansion and the default shellux prompt (see odd/tasks/shell-prompt-banner.md, T1).
 //!
 //! An explicitly set `PS1`/`PS2` keeps full user control: it undergoes POSIX
 //! parameter expansion through [`Shell::expand_prompt`] before each prompt and

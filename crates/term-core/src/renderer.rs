@@ -441,7 +441,7 @@ pub fn grid_size(width: u32, height: u32, cell_width: f32, cell_height: f32) -> 
     (cols.max(1), rows.max(1))
 }
 
-/// Colours used to resolve symbolic cell colours. `Default` is so1term's
+/// Colours used to resolve symbolic cell colours. `Default` is nulix's
 /// built-in theme; a configuration file may override any entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {

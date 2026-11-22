@@ -44,10 +44,10 @@ pub enum ControlCommand {
         pane: Option<u64>,
         block: Option<u64>,
     },
-    /// Stops a persistent `so1term-server` session; windows refuse it.
+    /// Stops a persistent `nulix-server` session; windows refuse it.
     Shutdown,
     /// Upgrades this connection to the attach stream (`crate::attach`) of a
-    /// `so1term-server` session; windows refuse it.
+    /// `nulix-server` session; windows refuse it.
     Attach,
 }
 
@@ -272,7 +272,7 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
 }
 
 /// Ends the `NOT_FOUND` message of a `block` request for a pane that has not
-/// run any command yet; `so1ctl wait` keeps polling on it.
+/// run any command yet; `nulixctl wait` keeps polling on it.
 pub const NO_COMMAND_BLOCK: &str = "has not run a command";
 
 /// Builds the `block` command result for one pane's model, shared by the

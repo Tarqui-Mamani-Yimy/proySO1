@@ -1,11 +1,11 @@
 # so1Shell — Interactive Shell on epsh
 
 The workspace contains `epsh`, the non-interactive, embeddable POSIX engine,
-and `so1sh` (working name), a minimal interactive shell using that engine.
-`so1sh` uses reedline on a TTY, with `PS1` (default `$ `), `PS2` (default
+and `shellux` (Shellux), a minimal interactive shell using that engine.
+`shellux` uses reedline on a TTY, with `PS1` (default `$ `), `PS2` (default
 `> `), persistent history, multiline input, and status-aware `exit` and EOF.
 Variables/cwd/functions persist; Ctrl-R searches history, Ctrl-C clears input.
-History uses `$SO1SH_HISTFILE`, otherwise `$HOME/.so1sh_history`; without either
+History uses `$SHELLUX_HISTFILE`, otherwise `$HOME/.shellux_history`; without either
 variable it stays in memory. History I/O errors are reported without ending
 the session. History paths retain OS bytes. Reedline accepts Unicode strings:
 invalid UTF-8 in PS1/PS2 is replaced for display only, and interactive input
@@ -26,15 +26,15 @@ tty, one diagnostic is printed and editing continues without terminal job contro
 If background stops are discarded, acquisition retries at 10 ms intervals and
 falls back after 1 second without foreground permission. Modes are captured only
 after foreground acquisition; fallback commands cannot take another owner's tty.
-Before the first interactive prompt, startup sources non-empty `$SO1SH_RC`, or
-the existing `$HOME/.so1shrc` when HOME is non-empty. It runs through `.` in the
+Before the first interactive prompt, startup sources non-empty `$SHELLUX_RC`, or
+the existing `$HOME/.shelluxrc` when HOME is non-empty. It runs through `.` in the
 persistent shell, so prompts, variables, functions and cwd can be configured.
 Missing defaults are silent; explicit missing files and rc errors are reported
 with normal REPL recovery (including `set -e` semantics). `exit` in the rc ends
 the session. Piped input, `-c`, and script arguments never source an rc file.
-When `SO1SH_POLICY` is non-empty, the interactive REPL loads that policy file
+When `SHELLUX_POLICY` is non-empty, the interactive REPL loads that policy file
 before the rc file; a missing, unreadable or invalid file prints one diagnostic
-(`so1sh: policy FILE[:LINE]: ...`) and exits with status 2. One rule per line,
+(`shellux: policy FILE[:LINE]: ...`) and exits with status 2. One rule per line,
 `#` comments (a `#` starting a word, so `/tmp/a#b` keeps it) and blank lines ignored: exactly one `default allow|deny`;
 `allow|deny command NAME...` matches argv[0] or its basename; `allow|deny write
 GLOB...` matches the lexically normalized absolute target of `>`, `>|`, `>>` and
@@ -47,7 +47,7 @@ unchanged, and commands run through `eval` are checked too. A denied write
 prints `PATH: denied by policy` and aborts the rest of the line like any failed
 redirection. A `default deny` policy also governs startup and exit: the rc file
 is sourced through `.`, so it needs `allow command .`, and `exit` needs
-`allow command exit`. Piped input, `-c` and scripts ignore `SO1SH_POLICY`. It is not a sandbox:
+`allow command exit`. Piped input, `-c` and scripts ignore `SHELLUX_POLICY`. It is not a sandbox:
 programs that run other programs (`env`, `xargs`, `sh -c`, interpreters),
 symlinks in write targets, and reads are not policed.
 `PS1` and `PS2` undergo POSIX parameter expansion before each prompt (heredoc-body
@@ -62,7 +62,7 @@ used only when stdout is a terminal and `NO_COLOR` is unset or empty. After the 
 file and before the first prompt, an interactive session prints a system banner
 (distro ASCII logo for Debian, Ubuntu, Arch, Fedora or a generic one, then
 user@host, OS, kernel, shell, terminal, CPU, RAM, disk usage of `/` and uptime;
-unreadable fields are omitted). `SO1SH_BANNER=0`, set in the environment or the
+unreadable fields are omitted). `SHELLUX_BANNER=0`, set in the environment or the
 rc file, disables it; the `sysinfo` builtin prints it on demand.
 Aliases live only in the interactive shell (epsh stays alias-free): `alias` lists
 `alias name='value'` sorted by name, `alias name` prints one, `alias name=value`
@@ -81,7 +81,7 @@ the rc file itself) are never expanded. Alias names complete and highlight as
 commands. The builtins are registered by the REPL only, so `-c`, scripts and piped
 input neither define nor expand aliases.
 `fg %n` resumes a job in the foreground and `bg %n` in the background; before each
-prompt so1sh reports changed background jobs (`[n]+ Done/Stopped/Killed`), and
+prompt shellux reports changed background jobs (`[n]+ Done/Stopped/Killed`), and
 `exit` with stopped jobs warns once. `exec CMD` replaces the shell with CMD and
 passes prefix assignments (`FOO=bar exec cmd`) to it; a failed exec exits a
 non-interactive shell (127 not found, 126 otherwise) and the REPL recovers with
@@ -92,7 +92,7 @@ that status as `$?`.
 ```
 Cargo.toml        Virtual workspace: crates/epsh, crates/shell, crates/term-core, and crates/terminal
 crates/term-core/
-  src/lib.rs      Headless terminal state library (so1-term-core) and public module declarations
+  src/lib.rs      Headless terminal state library (nulix-core) and public module declarations
   src/model.rs    VT model, snapshots, selection state, and OSC/block integration
   src/blocks.rs   Shell-integration block state and stable grid anchors
   src/block_navigation.rs Block navigation targets and retained-grid text extraction
@@ -105,35 +105,35 @@ crates/term-core/
   src/renderer.rs Renderer-independent grid, color, block, and image projection helpers
   src/control.rs Versioned JSON-lines control request/response types and parser
 crates/shell/
-  src/main.rs     so1sh binary, selects the REPL for TTY input
+  src/main.rs     shellux binary, selects the REPL for TTY input
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
   src/jobs.rs     Job table, job specs and the `jobs`, `fg` and `bg` builtins
   src/aliases.rs  Alias table, `alias`/`unalias` builtins and REPL-line alias expansion
   src/completion.rs Tab completion of commands, paths and variables
-  src/highlighter.rs Syntax highlighting from the epsh lexer (SO1SH_HIGHLIGHT=0 disables it)
+  src/highlighter.rs Syntax highlighting from the epsh lexer (SHELLUX_HIGHLIGHT=0 disables it)
   src/history_hint.rs Ghost-text hints from history
-  src/policy.rs   Opt-in `SO1SH_POLICY` command/write policy parser and hooks
+  src/policy.rs   Opt-in `SHELLUX_POLICY` command/write policy parser and hooks
   src/prompt.rs   PS1/PS2 expansion and the default prompt (cwd, git branch, status)
   src/sysinfo.rs  Startup system banner, distro logos and the `sysinfo` builtin
   tests/repl.rs   PTY end-to-end interactive tests (rexpect)
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/terminal/
-  src/main.rs     so1term window/event loop, per-pane PTYs/models, input routing, and GPU renderer
+  src/main.rs     nulix window/event loop, per-pane PTYs/models, input routing, and GPU renderer
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
   src/config.rs   Startup `key = value` configuration file (fonts, shell, scrollback, palette)
-  src/control.rs  Unix-domain control transport, peer credentials, and so1ctl client transport
-  src/bin/so1ctl.rs Local control API CLI
-  src/bin/so1term-server.rs Persistent headless session server binary
-  src/session.rs  Headless session (tabs, panes, PTY + VT model) owned by so1term-server
+  src/control.rs  Unix-domain control transport, peer credentials, and nulixctl client transport
+  src/bin/nulixctl.rs Local control API CLI
+  src/bin/nulix-server.rs Persistent headless session server binary
+  src/session.rs  Headless session (tabs, panes, PTY + VT model) owned by nulix-server
   src/graphics_pipeline.rs Shared kitty graphics pipeline (APC split, ingest, decode, placements) for window and server panes
-  src/remote.rs   so1term --session client: server autostart, attach stream, RemoteView frame store
+  src/remote.rs   nulix --session client: server autostart, attach stream, RemoteView frame store
   src/pty.rs      portable-pty lifecycle, reader thread, resize, and teardown
   src/selection.rs Click tracking and pure mouse-selection routing
 crates/epsh/src/
   lib.rs          Public API, module declarations
   main.rs         Thin epsh CLI binary entry point
-  cli.rs          Shared option/script/stdin dispatch for epsh and so1sh
+  cli.rs          Shared option/script/stdin dispatch for epsh and shellux
   ast.rs          AST types: Command, Word, WordPart, Redir, ParamExpr
   lexer.rs        Single-pass lexer with unified word-part builder
   parser.rs       Recursive-descent parser, heredoc body reading
@@ -151,25 +151,25 @@ crates/epsh/src/
   sys.rs          Thin libc wrappers
 ```
 
-Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarded temporary-file data with bounded base64/zlib decoding. Images are capped at 128 MiB per pane and 512 MiB per process, with dimensions capped at 10,000 per axis and oldest-image eviction. File and temporary-file transmission are denied unless `SO1TERM_GRAPHICS_ALLOWED_ROOTS` lists one or more roots using the platform path-list separator; empty and non-existent roots are ignored, and existing roots are canonicalized once at startup. Files must be absolute regular files beneath an allowed root, with bounded size/offset; Unix opens each canonical path component relative to a retained root descriptor with `O_NOFOLLOW` and verifies opened-file identity. In-root symlinks are allowed only when their canonical target remains in an allowed root. Temporary files must additionally be beneath the canonical system temp root or an allowed root, include `tty-graphics-protocol` in the full path, and are deleted only after a guarded successful read and a matching inode check. Windows currently denies both file media because an equivalent no-follow guard is not implemented. Shared memory remains unsupported. Display actions `a=T` and `a=p` are enabled with per-pane GPU texture caching and pane-clipped placement rendering. Negative z-index images render beneath text; z below -1073741824 also renders beneath cell backgrounds; non-negative z renders above text, with placement order breaking ties. Placements use stable-row anchors, follow scrollback, are scoped to primary/alternate screens, invalidate on width reflow, and support kitty delete selectors; uppercase deletes free unreferenced image data and their GPU textures are released on the next redraw. Cursor movement follows the placement rectangle unless `C=1`. Unicode placeholders and animation remain unsupported, as does shared memory; Windows file transmission remains denied.
+Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarded temporary-file data with bounded base64/zlib decoding. Images are capped at 128 MiB per pane and 512 MiB per process, with dimensions capped at 10,000 per axis and oldest-image eviction. File and temporary-file transmission are denied unless `NULIX_GRAPHICS_ALLOWED_ROOTS` lists one or more roots using the platform path-list separator; empty and non-existent roots are ignored, and existing roots are canonicalized once at startup. Files must be absolute regular files beneath an allowed root, with bounded size/offset; Unix opens each canonical path component relative to a retained root descriptor with `O_NOFOLLOW` and verifies opened-file identity. In-root symlinks are allowed only when their canonical target remains in an allowed root. Temporary files must additionally be beneath the canonical system temp root or an allowed root, include `tty-graphics-protocol` in the full path, and are deleted only after a guarded successful read and a matching inode check. Windows currently denies both file media because an equivalent no-follow guard is not implemented. Shared memory remains unsupported. Display actions `a=T` and `a=p` are enabled with per-pane GPU texture caching and pane-clipped placement rendering. Negative z-index images render beneath text; z below -1073741824 also renders beneath cell backgrounds; non-negative z renders above text, with placement order breaking ties. Placements use stable-row anchors, follow scrollback, are scoped to primary/alternate screens, invalidate on width reflow, and support kitty delete selectors; uppercase deletes free unreferenced image data and their GPU textures are released on the next redraw. Cursor movement follows the placement rectangle unless `C=1`. Unicode placeholders and animation remain unsupported, as does shared memory; Windows file transmission remains denied.
 
-## so1term Local Control
+## Nulix Local Control
 
-On Unix, each running `so1term` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/so1term/so1term-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/so1term-<uid>/so1term-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
+On Unix, each running `nulix` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/nulix/nulix-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/nulix-<uid>/nulix-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
 
-`SO1TERM_SOCKET` is inherited by every pane shell and tells `so1ctl` which instance to address. Set `SO1TERM_CONTROL=0` before launching `so1term` to disable the listener. `so1ctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, `get-text` (screen or last finished block output), `block`, `wait`, and `shutdown` (only `so1term-server` accepts it); use `so1ctl --help` for argument syntax. `list` reports for every pane `state` (`unknown` before any shell-integration mark, `idle` at a prompt, `running` between OSC 133 `C` and `D`) and `last_exit_status` (the newest finished command's status, or null). `block [--pane ID] [--id N]` describes one block (default: the newest block that ran a command) as `pane`, `id`, `state`, `command`, `cwd`, `exit_status`, `started_at_ms`, `finished_at_ms` and `duration_ms` (Unix milliseconds, null when unknown); when the command text is no longer retained, `command` is null and `command_unavailable` is `anchors-missing` or `alternate-screen`. Unknown ids return `NOT_FOUND` and blocks discarded with their scrollback return `EVICTED`. `wait [--pane ID] [--after ID] [--timeout SECS]` is client-side: it polls `block` every 50 ms until the newest command block (newer than `--after`, when given) has finished, prints it, and exits 1 with `TIMEOUT` after SECS (default 600). Each request gets at least 250 ms, so `--timeout 0` still probes once; transport errors (for example a missing socket) are reported as they are, never as `TIMEOUT`. To wait for a command you send, read `block` first and pass its id as `--after`, so the previous block is never mistaken for the new one. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `so1ctl` reports that local control is unsupported there.
+`NULIX_SOCKET` is inherited by every pane shell and tells `nulixctl` which instance to address. Set `NULIX_CONTROL=0` before launching `nulix` to disable the listener. `nulixctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, `get-text` (screen or last finished block output), `block`, `wait`, and `shutdown` (only `nulix-server` accepts it); use `nulixctl --help` for argument syntax. `list` reports for every pane `state` (`unknown` before any shell-integration mark, `idle` at a prompt, `running` between OSC 133 `C` and `D`) and `last_exit_status` (the newest finished command's status, or null). `block [--pane ID] [--id N]` describes one block (default: the newest block that ran a command) as `pane`, `id`, `state`, `command`, `cwd`, `exit_status`, `started_at_ms`, `finished_at_ms` and `duration_ms` (Unix milliseconds, null when unknown); when the command text is no longer retained, `command` is null and `command_unavailable` is `anchors-missing` or `alternate-screen`. Unknown ids return `NOT_FOUND` and blocks discarded with their scrollback return `EVICTED`. `wait [--pane ID] [--after ID] [--timeout SECS]` is client-side: it polls `block` every 50 ms until the newest command block (newer than `--after`, when given) has finished, prints it, and exits 1 with `TIMEOUT` after SECS (default 600). Each request gets at least 250 ms, so `--timeout 0` still probes once; transport errors (for example a missing socket) are reported as they are, never as `TIMEOUT`. To wait for a command you send, read `block` first and pass its id as `--after`, so the previous block is never mistaken for the new one. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `nulixctl` reports that local control is unsupported there.
 
-## so1term Configuration
+## Nulix Configuration
 
-At startup `so1term` and `so1term-server` read a `key = value` file (`crates/terminal/src/config.rs`, no dependency): `$SO1TERM_CONFIG` when non-empty, else `$XDG_CONFIG_HOME/so1term/so1term.conf`, else `$HOME/.config/so1term/so1term.conf`. Blank lines and lines starting with `#` are ignored (colours start with `#`, so there are no end-of-line comments). Keys: `font` (font file; a leading `~/` is relative to HOME), `font_size` (6-72), `shell`, `scrollback` (0-100000 lines, default 10000), `foreground`, `background`, `cursor` (block cursor fill; unset inverts the cell) and `color0`..`color15`, all colours `#rrggbb`. `SO1TERM_FONT`, `SO1TERM_FONT_SIZE` and `SO1TERM_SHELL` override the file. A missing default file is silent; a missing explicit file, a line without `=`, an unknown key or a bad value prints `so1term: config FILE[:LINE]: MESSAGE` and that key keeps its default, so the window still opens. Fonts and colours apply in the window (also as a `--session` client, whose frames carry symbolic colours); `shell` and `scrollback` apply where panes live (the standalone window or `so1term-server`). Changes need a restart; hot reload is not implemented. Example: `docs/so1term.conf.example`.
+At startup `nulix` and `nulix-server` read a `key = value` file (`crates/terminal/src/config.rs`, no dependency): `$NULIX_CONFIG` when non-empty, else `$XDG_CONFIG_HOME/nulix/nulix.conf`, else `$HOME/.config/nulix/nulix.conf`. Blank lines and lines starting with `#` are ignored (colours start with `#`, so there are no end-of-line comments). Keys: `font` (font file; a leading `~/` is relative to HOME), `font_size` (6-72), `shell`, `scrollback` (0-100000 lines, default 10000), `foreground`, `background`, `cursor` (block cursor fill; unset inverts the cell) and `color0`..`color15`, all colours `#rrggbb`. `NULIX_FONT`, `NULIX_FONT_SIZE` and `NULIX_SHELL` override the file. A missing default file is silent; a missing explicit file, a line without `=`, an unknown key or a bad value prints `nulix: config FILE[:LINE]: MESSAGE` and that key keeps its default, so the window still opens. Fonts and colours apply in the window (also as a `--session` client, whose frames carry symbolic colours); `shell` and `scrollback` apply where panes live (the standalone window or `nulix-server`). Changes need a restart; hot reload is not implemented. Example: `docs/nulix.conf.example`.
 
-## so1term Persistent Sessions
+## Nulix Persistent Sessions
 
-`so1term-server [--session NAME]` runs a headless session that owns its shell PTYs and terminal models and outlives every client. NAME defaults to `default` and must be 1-64 ASCII letters, digits, `-` or `_` (otherwise exit status 2). The server listens on `<runtime dir>/so1term-server-<NAME>.sock` with the same directory, permission, peer-uid, and stale-socket rules as the window listener, and exports that path as `SO1TERM_SOCKET` to its pane shells. Clients such as `so1ctl --socket PATH` may connect and disconnect at any time while the shells keep running (detach). Starting a second server for a live session name fails with `session NAME is already running` (exit status 1); a socket left by a killed server is detected as stale and replaced. The server exits with status 0 and removes its socket when its last shell exits or on `so1ctl shutdown`, which terminates the remaining shells; a so1term window refuses `shutdown`. It ignores SIGHUP so closing the launching terminal does not end the session, and SIGTERM unlinks the socket. Panes use a virtual 80x24 grid of 8x16 px cells until an attached client supplies geometry, which then persists after detach. Server panes run the same kitty graphics pipeline as window panes (`graphics_pipeline.rs`): replies go to the pane PTY, `SO1TERM_GRAPHICS_ALLOWED_ROOTS` applies to the server process, and decoding runs off the server loop. Windows reports that persistent sessions are unsupported.
+`nulix-server [--session NAME]` runs a headless session that owns its shell PTYs and terminal models and outlives every client. NAME defaults to `default` and must be 1-64 ASCII letters, digits, `-` or `_` (otherwise exit status 2). The server listens on `<runtime dir>/nulix-server-<NAME>.sock` with the same directory, permission, peer-uid, and stale-socket rules as the window listener, and exports that path as `NULIX_SOCKET` to its pane shells. Clients such as `nulixctl --socket PATH` may connect and disconnect at any time while the shells keep running (detach). Starting a second server for a live session name fails with `session NAME is already running` (exit status 1); a socket left by a killed server is detected as stale and replaced. The server exits with status 0 and removes its socket when its last shell exits or on `nulixctl shutdown`, which terminates the remaining shells; a nulix window refuses `shutdown`. It ignores SIGHUP so closing the launching terminal does not end the session, and SIGTERM unlinks the socket. Panes use a virtual 80x24 grid of 8x16 px cells until an attached client supplies geometry, which then persists after detach. Server panes run the same kitty graphics pipeline as window panes (`graphics_pipeline.rs`): replies go to the pane PTY, `NULIX_GRAPHICS_ALLOWED_ROOTS` applies to the server process, and decoding runs off the server loop. Windows reports that persistent sessions are unsupported.
 
-A control `attach` request upgrades its connection to the attach stream (`crates/term-core/src/attach.rs`, JSON lines up to 16 MiB, no read timeout). Only one client may be attached; another attach gets `operation-refused` "another client is attached to session NAME". After the client's `Hello` the server adopts its pixel and cell size, replies `Welcome`, then sends `Layout` and full per-pane `Frame`s. The server owns view state (scrollback position, selection, block navigation) and sends per-pane frames with sequence numbers: deltas carry only changed rows, while cursor, selection, input modes, block decorations, title and cwd are always complete; full frames follow attach, resize, tab switches, `Resync` and dropped deltas. Each client has a reader and a writer thread; the writer queue holds at most 64 frames / 8 MiB (excess deltas are dropped and the pane gets a full frame) and 1024 other messages (beyond that the client is detached). When the session ends an attached client receives `Exit` (`shutdown` or `last-shell-exited`) before the server exits, and attaches racing the shutdown are refused; so1ctl requests keep working while a client is attached.
+A control `attach` request upgrades its connection to the attach stream (`crates/term-core/src/attach.rs`, JSON lines up to 16 MiB, no read timeout). Only one client may be attached; another attach gets `operation-refused` "another client is attached to session NAME". After the client's `Hello` the server adopts its pixel and cell size, replies `Welcome`, then sends `Layout` and full per-pane `Frame`s. The server owns view state (scrollback position, selection, block navigation) and sends per-pane frames with sequence numbers: deltas carry only changed rows, while cursor, selection, input modes, block decorations, title and cwd are always complete; full frames follow attach, resize, tab switches, `Resync` and dropped deltas. Each client has a reader and a writer thread; the writer queue holds at most 64 frames / 8 MiB (excess deltas are dropped and the pane gets a full frame) and 1024 other messages (beyond that the client is detached). When the session ends an attached client receives `Exit` (`shutdown` or `last-shell-exited`) before the server exits, and attaches racing the shutdown are refused; nulixctl requests keep working while a client is attached.
 
-`so1term --session NAME` opens the window as the session's attached client (`so1term --help` lists the option; an invalid NAME exits with status 2). It connects to the session socket, or starts `so1term-server --session NAME` (the binary next to `so1term`, else from `PATH`) in a new session with null stdio and waits up to 5 seconds for it to listen. It attaches once its window size has been unchanged for 150 ms, so a window manager's resize right after mapping never reaches the server as a provisional `Hello` size (a width change reflows the panes and drops kitty placements). The window keeps the standalone keybindings (pane, tab, block, copy/paste), but routes their actions to the server. It owns no PTYs, models or control listener: it renders the server's layout and per-pane frames through the same renderer input as the standalone window, encodes keys locally with the focused frame's keyboard modes, and sends input, resize, scroll, selection, block, copy and tab/pane actions to the server. Closing the window detaches and exits 0 while the session keeps running; a server `Exit` closes the window, and a broken stream closes it with one diagnostic (status 1). Client mode shows kitty graphics: frames carry the projected placements, and before a frame places an image the server sends an `image` announcement and its RGBA data in contiguous chunks of at most 4 MiB, once per image per attached client (again after re-attach); `image-removed` reports freed or replaced data. Image lines are never dropped. A new image starts only while less than 256 MiB of earlier image lines are queued for the client, and a started image is queued whole, so a single image larger than 256 MiB still reaches the client; a client whose backlog is still above 256 MiB when another image must start gets an `IMAGE_BACKLOG` error and is detached. The client checks announced sizes, chunk contiguity, the 10,000 px dimension limit and a 512 MiB total, skips placements whose image is still incomplete, and renders the rest with the standalone window's texture cache and z-order code; textures are released when images are removed or their pane goes away. Plain `so1term` remains the standalone window.
+`nulix --session NAME` opens the window as the session's attached client (`nulix --help` lists the option; an invalid NAME exits with status 2). It connects to the session socket, or starts `nulix-server --session NAME` (the binary next to `nulix`, else from `PATH`) in a new session with null stdio and waits up to 5 seconds for it to listen. It attaches once its window size has been unchanged for 150 ms, so a window manager's resize right after mapping never reaches the server as a provisional `Hello` size (a width change reflows the panes and drops kitty placements). The window keeps the standalone keybindings (pane, tab, block, copy/paste), but routes their actions to the server. It owns no PTYs, models or control listener: it renders the server's layout and per-pane frames through the same renderer input as the standalone window, encodes keys locally with the focused frame's keyboard modes, and sends input, resize, scroll, selection, block, copy and tab/pane actions to the server. Closing the window detaches and exits 0 while the session keeps running; a server `Exit` closes the window, and a broken stream closes it with one diagnostic (status 1). Client mode shows kitty graphics: frames carry the projected placements, and before a frame places an image the server sends an `image` announcement and its RGBA data in contiguous chunks of at most 4 MiB, once per image per attached client (again after re-attach); `image-removed` reports freed or replaced data. Image lines are never dropped. A new image starts only while less than 256 MiB of earlier image lines are queued for the client, and a started image is queued whole, so a single image larger than 256 MiB still reaches the client; a client whose backlog is still above 256 MiB when another image must start gets an `IMAGE_BACKLOG` error and is detached. The client checks announced sizes, chunk contiguity, the 10,000 px dimension limit and a 512 MiB total, skips placements whose image is still incomplete, and renders the rest with the standalone window's texture cache and z-order code; textures are released when images are removed or their pane goes away. Plain `nulix` remains the standalone window.
 
 ## Embedding API
 
@@ -244,9 +244,9 @@ assert!(!is_builtin("rm"));
 
 ```sh
 cargo test --workspace
-cargo test -p so1sh --test repl                        # PTY REPL tests
-cargo test -p so1-terminal --test tui                  # TUI smoke matrix (less, top, fzf, man; skips missing)
-cargo run -p so1sh                                     # interactive on a TTY
+cargo test -p shellux --test repl                        # PTY REPL tests
+cargo test -p nulix --test tui                           # TUI smoke matrix (less, top, fzf, man; skips missing)
+cargo run -p shellux                                     # interactive on a TTY
 make ci                                               # both crates + conformance
 cargo test -p epsh --test api_stability                      # API surface regression
 cargo test -p epsh --test embedding                          # embedding API tests
@@ -257,7 +257,7 @@ sh crates/epsh/tests/stress/run.sh ./target/debug/epsh dash  # performance vs da
 perl filter-tests.pl check.t > check-epsh.t                  # regenerate filtered tests
 ```
 
-Manual so1term checks for nvim, tmux, htop, fzf, lazygit, less, top and man
+Manual nulix checks for nvim, tmux, htop, fzf, lazygit, less, top and man
 (resize, mouse, kitty keys, colours, shortcut pass-through) live in
 `docs/tui-smoke-checklist.md`.
 
@@ -387,7 +387,7 @@ primitives for an interactive shell to be built on top:
 Everything else (prompt, history, line editing, `fg`/`bg`/`jobs`) is the
 interactive shell's responsibility.
 
-so1sh emits terminal shell-integration metadata when running interactively and
+shellux emits terminal shell-integration metadata when running interactively and
 stdout is the acquired controlling terminal. OSC 7 reports the current working
 directory before each prompt; OSC 133 uses `A` for prompt start, `B` for the
 end of the primary prompt/start of input, `C` before each accepted command
@@ -396,15 +396,15 @@ cancelled with Ctrl-C before acceptance emits no `C` or `D`; the next prompt
 starts a fresh block. Multiline PS2 input remains within one block. Metadata is
 written to the terminal, not through shell output or command redirections.
 Sequences use the 7-bit ST terminator (`ESC \\`). Set
-`SO1SH_SHELL_INTEGRATION=0` to disable all shell-integration sequences.
-On Unix interactive TTYs, so1sh also enables reedline's kitty keyboard
+`SHELLUX_SHELL_INTEGRATION=0` to disable all shell-integration sequences.
+On Unix interactive TTYs, shellux also enables reedline's kitty keyboard
 enhancement when the terminal answers its bounded capability probe. Set
-`SO1SH_KITTY_KEYBOARD=0` to opt out; terminals that do not answer continue
+`SHELLUX_KITTY_KEYBOARD=0` to opt out; terminals that do not answer continue
 with legacy key handling after the probe timeout. Windows shell-side kitty
 keyboard consumption is not currently supported. The enhancement is popped
 before shell commands run so child programs receive the terminal's prior mode.
 
-so1term enables alacritty_terminal's kitty keyboard parser and exposes the
+nulix enables alacritty_terminal's kitty keyboard parser and exposes the
 active per-screen flags to its key encoder. With no flags, key bytes remain on
 the existing xterm path. Kitty mode supports disambiguation, key event types,
 alternate key codes, all-keys CSI-u reporting, and associated text. winit 0.30
@@ -414,7 +414,7 @@ bits are currently always clear in GUI-originated events. Lock state starts
 unknown and is tracked from key events while the window is open. This implements the
 terminal side only; shell-side protocol consumption is Phase 5 T2.
 
-In `so1term`, Ctrl+Shift+Up/Down (Cmd+Up/Down on macOS) navigates to the
+In `nulix`, Ctrl+Shift+Up/Down (Cmd+Up/Down on macOS) navigates to the
 previous/next anchored block prompt. Ctrl+Shift+A (Cmd+Shift+A on macOS)
 selects the block output at or below the viewport focus, falling back to the
 most recent finished block. Ctrl+Shift+O copies that selected block's output;
@@ -430,7 +430,7 @@ state; a running block remains Running until its D mark, and cleared rows are
 not re-anchored. While the alternate screen is active, block navigation/copy
 shortcuts pass through to the application and block decorations are hidden.
 Alacritty/vte 0.26 recognizes DECSET 1049 but not the common 47/1047 aliases;
-so1term normalizes those aliases to 1049 screen switching so TUI output remains
+nulix normalizes those aliases to 1049 screen switching so TUI output remains
 on the alternate grid.
 
 Pane layout uses `Horizontal` for left/right splits and `Vertical` for top/bottom
@@ -458,12 +458,12 @@ focused shell. On macOS use `Cmd+Shift+T/Q` and `Cmd+1..9`; Ctrl+Tab cycling
 remains unchanged.
 `Ctrl+Shift+W` still closes only the focused pane, and closes its tab if that was
 the tab's last pane. A tab label is the active pane's OSC 7 cwd basename, or
-`so1sh` until a cwd mark arrives. OSC 0/2 titles override the cwd basename for
+`shellux` until a cwd mark arrives. OSC 0/2 titles override the cwd basename for
 the active pane's tab label and window title; a terminal title reset returns to
 the cwd basename. The active tab uses a stronger accent background and brighter
 text. Hidden tabs continue draining and applying PTY output but do not request
 redraws. The final pane of the final tab exits the window. These bindings are
-reserved by so1term and do not replace block navigation (`Ctrl+Shift+Up/Down`).
+reserved by nulix and do not replace block navigation (`Ctrl+Shift+Up/Down`).
 
 ### Embedder Builtins
 
@@ -528,7 +528,7 @@ parser capability.
 
 - Job control builtins (fg, bg, jobs) — use `external_handler` + `Stopped`
 - Interactive features (prompt, history, line editing) — use rustyline/reedline
-- Aliases in epsh — so1sh expands them in its interactive REPL only (`crates/shell/src/aliases.rs`)
+- Aliases in epsh — shellux expands them in its interactive REPL only (`crates/shell/src/aliases.rs`)
 - Here-strings (`<<<`)
 - Extended globs (`@(...)`, `+(...)`, etc.)
 - Arrays, typeset, select (ksh extensions)

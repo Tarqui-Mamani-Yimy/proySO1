@@ -6,11 +6,11 @@ use glyphon::{
     TextRenderer, Viewport,
 };
 use graphics::{DecodeJob, DecodedImage, GraphicsCompletion, GraphicsStore};
-use so1_terminal::control::{
+use nulix::control::{
     self as control, ControlCommand, ControlError, ControlErrorCode, ControlOutcome,
     ControlRequest, ControlResponse, ControlServer, TextScope,
 };
-use so1_terminal::{
+use nulix::{
     PaneRenderInput,
     attach::{
         BlockOp, ClientMessage, CopySource, FocusDirection as RemoteFocusDirection, LayoutAction,
@@ -58,7 +58,7 @@ use winit::{
 
 enum UserEvent {
     PtyOutput(PaneId),
-    GraphicsDecoded(PaneId, so1_terminal::blocks::GridAnchor, GraphicsCompletion),
+    GraphicsDecoded(PaneId, nulix::blocks::GridAnchor, GraphicsCompletion),
     Control(ControlRequest, std::sync::mpsc::SyncSender<ControlResponse>),
     Remote(RemoteEvent),
 }
@@ -90,7 +90,7 @@ struct TerminalWindow {
     remote: Option<RemoteClient>,
 }
 
-/// Window state of `so1term --session NAME`: the server owns PTYs and models,
+/// Window state of `nulix --session NAME`: the server owns PTYs and models,
 /// so this holds only the attach stream, the frame store, and per-pane
 /// pointer/glyph state that stays local to the window.
 struct RemoteClient {
@@ -222,7 +222,7 @@ impl ConsumedKeyPresses {
     }
 }
 struct Pane {
-    pty: so1_terminal::pty::Pty,
+    pty: nulix::pty::Pty,
     model: Model,
     graphics: PaneGraphics,
     title: String,
@@ -261,7 +261,7 @@ impl Pane {
                 let _ = pty.write(reply);
             },
             &mut |event| {
-                if let so1_terminal::osc::Event::CurrentDirectory { path, .. } = event {
+                if let nulix::osc::Event::CurrentDirectory { path, .. } = event {
                     let text = String::from_utf8_lossy(&path).into_owned();
                     *cwd = PathBuf::from(text);
                     *title = pane_tab_title(cwd, explicit_title.as_deref());
@@ -319,12 +319,7 @@ impl GraphicsHost for WindowGraphicsHost<'_> {
         }
     }
 
-    fn start_decode(
-        &mut self,
-        pane: PaneId,
-        anchor: so1_terminal::blocks::GridAnchor,
-        job: DecodeJob,
-    ) {
+    fn start_decode(&mut self, pane: PaneId, anchor: nulix::blocks::GridAnchor, job: DecodeJob) {
         let sender = self.proxy.clone();
         std::thread::spawn(move || {
             let completion = graphics::decode_transfer(job);
@@ -487,7 +482,7 @@ fn upload_image_texture(
 
 fn append_image_quad_vertices(
     vertices: &mut Vec<ImageVertex>,
-    quad: so1_terminal::renderer::ImageQuad,
+    quad: nulix::renderer::ImageQuad,
     width: f32,
     height: f32,
 ) {
@@ -703,16 +698,19 @@ fn modifier_event_state(
     let active = kind != KeyEventKind::Release;
     if let TerminalKey::Modifier(modifier) = key {
         match modifier {
-            so1_terminal::keyboard::ModifierKey::LeftShift
-            | so1_terminal::keyboard::ModifierKey::RightShift => modifiers.shift = active,
-            so1_terminal::keyboard::ModifierKey::LeftControl
-            | so1_terminal::keyboard::ModifierKey::RightControl => modifiers.control = active,
-            so1_terminal::keyboard::ModifierKey::LeftAlt
-            | so1_terminal::keyboard::ModifierKey::RightAlt => modifiers.alt = active,
-            so1_terminal::keyboard::ModifierKey::LeftSuper
-            | so1_terminal::keyboard::ModifierKey::RightSuper => modifiers.super_key = active,
-            so1_terminal::keyboard::ModifierKey::CapsLock => {}
-            so1_terminal::keyboard::ModifierKey::NumLock => {}
+            nulix::keyboard::ModifierKey::LeftShift | nulix::keyboard::ModifierKey::RightShift => {
+                modifiers.shift = active
+            }
+            nulix::keyboard::ModifierKey::LeftControl
+            | nulix::keyboard::ModifierKey::RightControl => modifiers.control = active,
+            nulix::keyboard::ModifierKey::LeftAlt | nulix::keyboard::ModifierKey::RightAlt => {
+                modifiers.alt = active
+            }
+            nulix::keyboard::ModifierKey::LeftSuper | nulix::keyboard::ModifierKey::RightSuper => {
+                modifiers.super_key = active
+            }
+            nulix::keyboard::ModifierKey::CapsLock => {}
+            nulix::keyboard::ModifierKey::NumLock => {}
         }
     }
     modifiers
@@ -724,7 +722,7 @@ fn key_from_winit<'a>(
     physical: winit::keyboard::PhysicalKey,
     kitty_active: bool,
 ) -> Option<KeyInput<'a>> {
-    use so1_terminal::keyboard::ModifierKey;
+    use nulix::keyboard::ModifierKey;
     use winit::keyboard::KeyCode;
 
     let physical_numpad = match physical {
@@ -745,44 +743,44 @@ fn key_from_winit<'a>(
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad0),
                 Key::Named(NamedKey::Insert),
-            ) => Some(so1_terminal::keyboard::KeypadKey::Insert),
+            ) => Some(nulix::keyboard::KeypadKey::Insert),
             (winit::keyboard::PhysicalKey::Code(KeyCode::Numpad1), Key::Named(NamedKey::End)) => {
-                Some(so1_terminal::keyboard::KeypadKey::End)
+                Some(nulix::keyboard::KeypadKey::End)
             }
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad2),
                 Key::Named(NamedKey::ArrowDown),
-            ) => Some(so1_terminal::keyboard::KeypadKey::Down),
+            ) => Some(nulix::keyboard::KeypadKey::Down),
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad3),
                 Key::Named(NamedKey::PageDown),
-            ) => Some(so1_terminal::keyboard::KeypadKey::PageDown),
+            ) => Some(nulix::keyboard::KeypadKey::PageDown),
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad4),
                 Key::Named(NamedKey::ArrowLeft),
-            ) => Some(so1_terminal::keyboard::KeypadKey::Left),
+            ) => Some(nulix::keyboard::KeypadKey::Left),
             (winit::keyboard::PhysicalKey::Code(KeyCode::Numpad5), Key::Named(NamedKey::Clear)) => {
-                Some(so1_terminal::keyboard::KeypadKey::Begin)
+                Some(nulix::keyboard::KeypadKey::Begin)
             }
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad6),
                 Key::Named(NamedKey::ArrowRight),
-            ) => Some(so1_terminal::keyboard::KeypadKey::Right),
+            ) => Some(nulix::keyboard::KeypadKey::Right),
             (winit::keyboard::PhysicalKey::Code(KeyCode::Numpad7), Key::Named(NamedKey::Home)) => {
-                Some(so1_terminal::keyboard::KeypadKey::Home)
+                Some(nulix::keyboard::KeypadKey::Home)
             }
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad8),
                 Key::Named(NamedKey::ArrowUp),
-            ) => Some(so1_terminal::keyboard::KeypadKey::Up),
+            ) => Some(nulix::keyboard::KeypadKey::Up),
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::Numpad9),
                 Key::Named(NamedKey::PageUp),
-            ) => Some(so1_terminal::keyboard::KeypadKey::PageUp),
+            ) => Some(nulix::keyboard::KeypadKey::PageUp),
             (
                 winit::keyboard::PhysicalKey::Code(KeyCode::NumpadDecimal),
                 Key::Named(NamedKey::Delete),
-            ) => Some(so1_terminal::keyboard::KeypadKey::Delete),
+            ) => Some(nulix::keyboard::KeypadKey::Delete),
             _ => None,
         };
         if let Some(key) = keypad_navigation {
@@ -796,25 +794,25 @@ fn key_from_winit<'a>(
         }
         let keypad = match physical {
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadDecimal) => {
-                Some(so1_terminal::keyboard::KeypadKey::Decimal)
+                Some(nulix::keyboard::KeypadKey::Decimal)
             }
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadDivide) => {
-                Some(so1_terminal::keyboard::KeypadKey::Divide)
+                Some(nulix::keyboard::KeypadKey::Divide)
             }
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadMultiply) => {
-                Some(so1_terminal::keyboard::KeypadKey::Multiply)
+                Some(nulix::keyboard::KeypadKey::Multiply)
             }
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadSubtract) => {
-                Some(so1_terminal::keyboard::KeypadKey::Subtract)
+                Some(nulix::keyboard::KeypadKey::Subtract)
             }
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadAdd) => {
-                Some(so1_terminal::keyboard::KeypadKey::Add)
+                Some(nulix::keyboard::KeypadKey::Add)
             }
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadEqual) => {
-                Some(so1_terminal::keyboard::KeypadKey::Equal)
+                Some(nulix::keyboard::KeypadKey::Equal)
             }
             winit::keyboard::PhysicalKey::Code(KeyCode::NumpadComma) => {
-                Some(so1_terminal::keyboard::KeypadKey::Separator)
+                Some(nulix::keyboard::KeypadKey::Separator)
             }
             _ => None,
         };
@@ -1074,7 +1072,7 @@ fn push_overlay_rect(
             1.0 - y1 / viewport_height * 2.0,
         ],
     ];
-    let color = color.map(so1_terminal::renderer::srgb_to_linear);
+    let color = color.map(nulix::renderer::srgb_to_linear);
     for point in [0, 1, 2, 0, 2, 3] {
         vertices.push(RectVertex {
             position: points[point],
@@ -1107,9 +1105,9 @@ impl TerminalWindow {
             let control_server = start_control_server(proxy.clone());
             if let Some(server) = &control_server {
                 // The value is established before any pane PTY is created and is inherited by every pane shell.
-                unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path().as_os_str()) };
+                unsafe { std::env::set_var("NULIX_SOCKET", server.socket_path().as_os_str()) };
             } else {
-                unsafe { std::env::remove_var("SO1TERM_SOCKET") };
+                unsafe { std::env::remove_var("NULIX_SOCKET") };
             }
             control_server
         };
@@ -1142,8 +1140,8 @@ impl TerminalWindow {
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let window = Arc::new(
             event_loop
-                .create_window(WindowAttributes::default().with_title("so1term"))
-                .map_err(|e| format!("could not create so1term window: {e}"))?,
+                .create_window(WindowAttributes::default().with_title("nulix"))
+                .map_err(|e| format!("could not create nulix window: {e}"))?,
         );
         window.set_ime_allowed(true);
         let size = window.inner_size();
@@ -1162,7 +1160,7 @@ impl TerminalWindow {
             format!("could not find a GPU adapter compatible with the window surface: {e}")
         })?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("so1term device"),
+            label: Some("nulix device"),
             ..Default::default()
         }))
         .map_err(|e| format!("could not initialize GPU device: {e}"))?;
@@ -1171,19 +1169,19 @@ impl TerminalWindow {
             .ok_or_else(|| "GPU adapter does not support the window surface".to_owned())?;
         surface.configure(&device, &config);
         let mut font_system = FontSystem::new();
-        // SO1TERM_FONT / SO1TERM_FONT_SIZE override the config file's keys.
-        let term_config = so1_terminal::config::current();
-        if let Some(font) = std::env::var_os("SO1TERM_FONT")
+        // NULIX_FONT / NULIX_FONT_SIZE override the config file's keys.
+        let term_config = nulix::config::current();
+        if let Some(font) = std::env::var_os("NULIX_FONT")
             .map(PathBuf::from)
             .or_else(|| term_config.font.clone())
         {
             font_system.db_mut().load_font_file(font).ok();
         }
-        let font_size = std::env::var("SO1TERM_FONT_SIZE")
+        let font_size = std::env::var("NULIX_FONT_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|value: &f32| {
-                value.is_finite() && so1_terminal::config::FONT_SIZE_RANGE.contains(value)
+                value.is_finite() && nulix::config::FONT_SIZE_RANGE.contains(value)
             })
             .or(term_config.font_size)
             .unwrap_or(14.0);
@@ -1417,7 +1415,7 @@ impl TerminalWindow {
     ) -> Result<Pane, String> {
         let wakeup = Arc::new(WakeupGate::default());
         let notify_wakeup = Arc::clone(&wakeup);
-        let pty = so1_terminal::pty::Pty::spawn_shell_notified(
+        let pty = nulix::pty::Pty::spawn_shell_notified(
             cwd.clone(),
             cols as u16,
             rows as u16,
@@ -1430,11 +1428,7 @@ impl TerminalWindow {
         .map_err(|error| format!("could not start shell PTY for pane {}: {error}", pane_id.0))?;
         Ok(Pane {
             pty,
-            model: Model::with_scrollback_limit(
-                cols,
-                rows,
-                so1_terminal::config::current().scrollback,
-            ),
+            model: Model::with_scrollback_limit(cols, rows, nulix::config::current().scrollback),
             graphics: PaneGraphics::default(),
             title: cwd_basename_title(&cwd),
             explicit_title: None,
@@ -1761,8 +1755,8 @@ impl TerminalWindow {
     fn refresh_window_title(&self) {
         let Some(window) = &self.window else { return };
         if let Some(remote) = &self.remote {
-            let title = remote.view.active_title().unwrap_or("so1sh");
-            window.set_title(&format!("so1term — {title}"));
+            let title = remote.view.active_title().unwrap_or("shellux");
+            window.set_title(&format!("nulix — {title}"));
             return;
         }
         let title = self
@@ -1771,8 +1765,8 @@ impl TerminalWindow {
             .and_then(TabSet::active)
             .and_then(|tab| self.panes.get(&tab.active_pane()))
             .map(|pane| pane.title.as_str())
-            .unwrap_or("so1sh");
-        window.set_title(&format!("so1term — {title}"));
+            .unwrap_or("shellux");
+        window.set_title(&format!("nulix — {title}"));
     }
 
     fn new_tab(&mut self) -> Result<(), String> {
@@ -1979,13 +1973,13 @@ impl TerminalWindow {
             ControlCommand::Shutdown => {
                 return fail(
                     ControlErrorCode::OperationRefused,
-                    "shutdown is only supported by so1term-server".into(),
+                    "shutdown is only supported by nulix-server".into(),
                 );
             }
             ControlCommand::Attach => {
                 return fail(
                     ControlErrorCode::OperationRefused,
-                    "attach is only supported by so1term-server".into(),
+                    "attach is only supported by nulix-server".into(),
                 );
             }
         };
@@ -2012,10 +2006,7 @@ impl TerminalWindow {
         };
         let Some(active) = tabs.active() else { return };
         let panes = active.layout_tree().panes();
-        if matches!(
-            tabs.close_active(),
-            so1_terminal::layout::TabCloseResult::LastTab
-        ) {
+        if matches!(tabs.close_active(), nulix::layout::TabCloseResult::LastTab) {
             self.panes.clear();
             self.graphics.store = GraphicsStore::default();
             if let Some(gpu) = self.gpu.as_mut() {
@@ -2051,7 +2042,7 @@ impl TerminalWindow {
         match action {
             TabAction::New => {
                 if let Err(error) = self.new_tab() {
-                    eprintln!("so1term: {error}");
+                    eprintln!("nulix: {error}");
                 }
             }
             TabAction::Close => self.close_active_tab(event_loop),
@@ -2083,7 +2074,7 @@ impl TerminalWindow {
             match Clipboard::new() {
                 Ok(clipboard) => self.clipboard = Some(clipboard),
                 Err(error) => {
-                    eprintln!("so1term: clipboard initialization failed: {error}");
+                    eprintln!("nulix: clipboard initialization failed: {error}");
                     return None;
                 }
             }
@@ -2107,7 +2098,7 @@ impl TerminalWindow {
             return;
         };
         if let Err(error) = clipboard.set_text(text) {
-            eprintln!("so1term: clipboard copy failed: {error}");
+            eprintln!("nulix: clipboard copy failed: {error}");
         }
     }
 
@@ -2133,7 +2124,7 @@ impl TerminalWindow {
             return;
         };
         if let Err(error) = clipboard.set_text(text) {
-            eprintln!("so1term: clipboard copy failed: {error}");
+            eprintln!("nulix: clipboard copy failed: {error}");
         }
     }
 
@@ -2156,15 +2147,14 @@ impl TerminalWindow {
         match action {
             BlockShortcut::Previous => {
                 if let Some(pane) = self.focused_pane_mut() {
-                    pane.model.navigate_block(
-                        so1_terminal::block_navigation::NavigationDirection::Previous,
-                    );
+                    pane.model
+                        .navigate_block(nulix::block_navigation::NavigationDirection::Previous);
                 }
             }
             BlockShortcut::Next => {
                 if let Some(pane) = self.focused_pane_mut() {
                     pane.model
-                        .navigate_block(so1_terminal::block_navigation::NavigationDirection::Next);
+                        .navigate_block(nulix::block_navigation::NavigationDirection::Next);
                 }
             }
             BlockShortcut::Select => {
@@ -2184,7 +2174,7 @@ impl TerminalWindow {
             .and_then(|clipboard| match clipboard.get_text() {
                 Ok(text) => Some(text),
                 Err(error) => {
-                    eprintln!("so1term: clipboard paste failed: {error}");
+                    eprintln!("nulix: clipboard paste failed: {error}");
                     None
                 }
             }) {
@@ -2196,7 +2186,7 @@ impl TerminalWindow {
             .is_some_and(|modes| modes.bracketed_paste);
         let bytes = encode_paste(&text, bracketed);
         if let Err(error) = self.write_focused(&bytes) {
-            eprintln!("so1term: clipboard paste write failed: {error}");
+            eprintln!("nulix: clipboard paste write failed: {error}");
         }
         self.scroll_focused_to_bottom();
         self.request_redraw();
@@ -2214,16 +2204,16 @@ impl TerminalWindow {
                     && let Some(clipboard) = self.clipboard()
                     && let Err(error) = clipboard.set_text(text)
                 {
-                    eprintln!("so1term: clipboard copy failed: {error}");
+                    eprintln!("nulix: clipboard copy failed: {error}");
                 }
             }
             RemoteEvent::Message(ServerMessage::LayoutResult { error, .. }) => {
                 if let Some(error) = error {
-                    eprintln!("so1term: {error}");
+                    eprintln!("nulix: {error}");
                 }
             }
             RemoteEvent::Message(ServerMessage::Error { code, message }) => {
-                eprintln!("so1term: session server error ({code}): {message}");
+                eprintln!("nulix: session server error ({code}): {message}");
             }
             RemoteEvent::Message(ServerMessage::Exit { .. }) => {
                 remote.closing = true;
@@ -2263,7 +2253,7 @@ impl TerminalWindow {
                         }
                     }
                     if let ImageChange::Rejected(reason) = change {
-                        eprintln!("so1term: dropped kitty image from session server: {reason}");
+                        eprintln!("nulix: dropped kitty image from session server: {reason}");
                     }
                     self.request_redraw();
                 }
@@ -2273,7 +2263,7 @@ impl TerminalWindow {
                 if !remote.closing {
                     remote.closing = true;
                     eprintln!(
-                        "so1term: {}",
+                        "nulix: {}",
                         diagnostic
                             .as_deref()
                             .unwrap_or("session server closed the attach stream")
@@ -2358,7 +2348,7 @@ impl TerminalWindow {
                         self.panes
                             .get(&tab.active_pane())
                             .map(|pane| pane.title.clone())
-                            .unwrap_or_else(|| "so1sh".into())
+                            .unwrap_or_else(|| "shellux".into())
                     })
                     .collect()
             });
@@ -2379,14 +2369,10 @@ impl TerminalWindow {
                 return Ok(FrameRecovery::RetryAfter(self.surface_retry.next_delay()));
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
-                return Ok(so1_terminal::renderer::frame_recovery(
-                    SurfaceFailure::Timeout,
-                ));
+                return Ok(nulix::renderer::frame_recovery(SurfaceFailure::Timeout));
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(so1_terminal::renderer::frame_recovery(
-                    SurfaceFailure::Occluded,
-                ));
+                return Ok(nulix::renderer::frame_recovery(SurfaceFailure::Occluded));
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(
@@ -2429,7 +2415,7 @@ impl TerminalWindow {
                     let images = frame_placements(&pane.graphics.placements, &pane.model);
                     (input, &mut pane.glyphs, images)
                 };
-            let cells = input.render_cells(&so1_terminal::config::current().palette);
+            let cells = input.render_cells(&nulix::config::current().palette);
             gpu.vertices.clear();
             let width = gpu.config.width as f32;
             let height = gpu.config.height as f32;
@@ -2612,14 +2598,12 @@ impl TerminalWindow {
             let layer_items: Vec<_> = frame_images
                 .iter()
                 .enumerate()
-                .map(
-                    |(index, placement)| so1_terminal::renderer::ImageLayerItem {
-                        z: placement.z,
-                        insertion: index as u64,
-                    },
-                )
+                .map(|(index, placement)| nulix::renderer::ImageLayerItem {
+                    z: placement.z,
+                    insertion: index as u64,
+                })
                 .collect();
-            let buckets = so1_terminal::renderer::bucket_image_layers(&layer_items);
+            let buckets = nulix::renderer::bucket_image_layers(&layer_items);
             gpu.image_vertices.clear();
             let mut draw_layer = |indices: &[usize]| -> Vec<TextureDraw> {
                 let mut draws = Vec::new();
@@ -2633,9 +2617,9 @@ impl TerminalWindow {
                     if !gpu.textures.contains_key(&key) {
                         continue;
                     }
-                    let quad = so1_terminal::renderer::project_image_quad(
-                        so1_terminal::renderer::ImageQuadInput {
-                            pane: so1_terminal::renderer::PixelRect {
+                    let quad =
+                        nulix::renderer::project_image_quad(nulix::renderer::ImageQuadInput {
+                            pane: nulix::renderer::PixelRect {
                                 x: layout.rect.x as f32,
                                 y: layout.rect.y as f32,
                                 width: layout.rect.width as f32,
@@ -2655,8 +2639,7 @@ impl TerminalWindow {
                                 placement.source_height,
                             ),
                             image: (image.width, image.height),
-                        },
-                    );
+                        });
                     if let Some(quad) = quad {
                         let start = gpu.image_vertices.len() as u32;
                         append_image_quad_vertices(&mut gpu.image_vertices, quad, width, height);
@@ -2672,7 +2655,7 @@ impl TerminalWindow {
             let image_required = gpu.image_vertices.len() * std::mem::size_of::<ImageVertex>();
             if image_required > gpu.image_vertex_buffer_capacity_bytes {
                 gpu.image_vertex_buffer_capacity_bytes =
-                    so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+                    nulix::renderer::next_vertex_buffer_capacity_bytes(
                         gpu.image_vertex_buffer_capacity_bytes,
                         image_required,
                     );
@@ -2691,7 +2674,7 @@ impl TerminalWindow {
                 );
             }
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
-            let capacity = so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+            let capacity = nulix::renderer::next_vertex_buffer_capacity_bytes(
                 gpu.vertex_buffer_capacity_bytes,
                 required,
             );
@@ -2711,7 +2694,7 @@ impl TerminalWindow {
             let mut encoder = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("so1term pane renderer"),
+                    label: Some("nulix pane renderer"),
                 });
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2725,10 +2708,10 @@ impl TerminalWindow {
                                 wgpu::LoadOp::Load
                             } else {
                                 wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: so1_terminal::config::current().palette.clear_color()[0],
-                                    g: so1_terminal::config::current().palette.clear_color()[1],
-                                    b: so1_terminal::config::current().palette.clear_color()[2],
-                                    a: so1_terminal::config::current().palette.clear_color()[3],
+                                    r: nulix::config::current().palette.clear_color()[0],
+                                    g: nulix::config::current().palette.clear_color()[1],
+                                    b: nulix::config::current().palette.clear_color()[2],
+                                    a: nulix::config::current().palette.clear_color()[3],
                                 })
                             },
                             store: wgpu::StoreOp::Store,
@@ -2790,7 +2773,7 @@ impl TerminalWindow {
             let mut encoder = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("so1term empty surface"),
+                    label: Some("nulix empty surface"),
                 });
             {
                 let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2801,10 +2784,10 @@ impl TerminalWindow {
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: so1_terminal::config::current().palette.clear_color()[0],
-                                g: so1_terminal::config::current().palette.clear_color()[1],
-                                b: so1_terminal::config::current().palette.clear_color()[2],
-                                a: so1_terminal::config::current().palette.clear_color()[3],
+                                r: nulix::config::current().palette.clear_color()[0],
+                                g: nulix::config::current().palette.clear_color()[1],
+                                b: nulix::config::current().palette.clear_color()[2],
+                                a: nulix::config::current().palette.clear_color()[3],
                             }),
                             store: wgpu::StoreOp::Store,
                         },
@@ -2830,7 +2813,7 @@ impl TerminalWindow {
             }
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
             if required > gpu.vertex_buffer_capacity_bytes {
-                let capacity = so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+                let capacity = nulix::renderer::next_vertex_buffer_capacity_bytes(
                     gpu.vertex_buffer_capacity_bytes,
                     required,
                 );
@@ -2847,7 +2830,7 @@ impl TerminalWindow {
             let mut encoder = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("so1term pane dividers"),
+                    label: Some("nulix pane dividers"),
                 });
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2919,7 +2902,7 @@ impl TerminalWindow {
             }
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
             if required > gpu.vertex_buffer_capacity_bytes {
-                let capacity = so1_terminal::renderer::next_vertex_buffer_capacity_bytes(
+                let capacity = nulix::renderer::next_vertex_buffer_capacity_bytes(
                     gpu.vertex_buffer_capacity_bytes,
                     required,
                 );
@@ -2977,7 +2960,7 @@ impl TerminalWindow {
             let mut encoder = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("so1term tab bar"),
+                    label: Some("nulix tab bar"),
                 });
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3048,7 +3031,7 @@ impl TerminalWindow {
     fn finish_graphics(
         &mut self,
         pane_id: PaneId,
-        anchor: so1_terminal::blocks::GridAnchor,
+        anchor: nulix::blocks::GridAnchor,
         completion: GraphicsCompletion,
     ) {
         let mut host = WindowGraphicsHost {
@@ -3089,7 +3072,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
             return;
         }
         if let Err(e) = self.initialize(event_loop) {
-            eprintln!("so1term: {e}");
+            eprintln!("nulix: {e}");
             self.failed = true;
             event_loop.exit();
             return;
@@ -3154,7 +3137,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     }
                     Ok(FrameRecovery::WaitForEvent) => {}
                     Err(e) => {
-                        eprintln!("so1term: {e}");
+                        eprintln!("nulix: {e}");
                         self.failed = true;
                         event_loop.exit();
                     }
@@ -3246,14 +3229,14 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 match pane_action(&event.logical_key, mods, cfg!(target_os = "macos")) {
                     Some(PaneAction::SplitRight) => {
                         if let Err(error) = self.split_focused(Direction::Horizontal) {
-                            eprintln!("so1term: {error}");
+                            eprintln!("nulix: {error}");
                         }
                         self.consumed_keys.mark(event.physical_key);
                         return;
                     }
                     Some(PaneAction::SplitDown) => {
                         if let Err(error) = self.split_focused(Direction::Vertical) {
-                            eprintln!("so1term: {error}");
+                            eprintln!("nulix: {error}");
                         }
                         self.consumed_keys.mark(event.physical_key);
                         return;
@@ -3549,7 +3532,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 gpu.cell_height,
             );
             if let Err(error) = remote.attach(metrics, self.proxy.clone()) {
-                eprintln!("so1term: {error}");
+                eprintln!("nulix: {error}");
                 remote.closing = true;
                 self.failed = true;
                 event_loop.exit();
@@ -3576,22 +3559,22 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
 }
 
 const USAGE: &str = "\
-Usage: so1term [--session NAME]
+Usage: nulix [--session NAME]
 
-Opens a so1term window running a local shell.
+Opens a nulix window running a local shell.
 
 Options:
-  --session NAME  Attach the window to the persistent so1term-server session
+  --session NAME  Attach the window to the persistent nulix-server session
                   NAME, starting the server when it is not running. NAME is
                   1-64 ASCII letters, digits, '-' or '_'. Closing the window
                   detaches and leaves the session running.
   -h, --help      Print this help.
 
-Configuration is read at startup from $SO1TERM_CONFIG, else
-$XDG_CONFIG_HOME/so1term/so1term.conf (default ~/.config/so1term/so1term.conf):
+Configuration is read at startup from $NULIX_CONFIG, else
+$XDG_CONFIG_HOME/nulix/nulix.conf (default ~/.config/nulix/nulix.conf):
 `key = value` lines for font, font_size, shell, scrollback, foreground,
-background, cursor and color0..color15 (#rrggbb). SO1TERM_FONT,
-SO1TERM_FONT_SIZE and SO1TERM_SHELL override the file.
+background, cursor and color0..color15 (#rrggbb). NULIX_FONT,
+NULIX_FONT_SIZE and NULIX_SHELL override the file.
 ";
 
 /// What the command line asks the window to do.
@@ -3638,17 +3621,17 @@ fn main() {
             0
         }
         Ok(WindowArgs::Standalone) => {
-            so1_terminal::config::init();
+            nulix::config::init();
             run_terminal(None)
         }
         Ok(WindowArgs::Session(session)) => {
             // The client applies fonts and colours; the server reads the same
             // file for `shell` and `scrollback`.
-            so1_terminal::config::init();
+            nulix::config::init();
             run_session_client(&session)
         }
         Err(error) => {
-            eprintln!("so1term: {error}");
+            eprintln!("nulix: {error}");
             eprint!("{USAGE}");
             2
         }
@@ -3658,17 +3641,17 @@ fn main() {
     }
 }
 
-/// `so1term --session NAME`: make sure the session server runs, then open the
+/// `nulix --session NAME`: make sure the session server runs, then open the
 /// window as its attached client.
 fn run_session_client(session: &str) -> i32 {
     if cfg!(not(unix)) {
-        eprintln!("so1term: persistent sessions are unsupported on this platform");
+        eprintln!("nulix: persistent sessions are unsupported on this platform");
         return 1;
     }
-    match so1_terminal::remote::ensure_server(session) {
+    match nulix::remote::ensure_server(session) {
         Ok(socket) => run_terminal(Some(socket)),
         Err(error) => {
-            eprintln!("so1term: could not reach session {session}: {error}");
+            eprintln!("nulix: could not reach session {session}: {error}");
             1
         }
     }
@@ -3678,13 +3661,13 @@ fn run_terminal(session_socket: Option<PathBuf>) -> i32 {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("so1term: could not initialize the window event loop: {e}");
+            eprintln!("nulix: could not initialize the window event loop: {e}");
             return 1;
         }
     };
     let mut app = TerminalWindow::new(event_loop.create_proxy(), session_socket);
     if let Err(error) = event_loop.run_app(&mut app) {
-        eprintln!("so1term: window event loop failed: {error}");
+        eprintln!("nulix: window event loop failed: {error}");
         return 1;
     }
     if app.failed {
@@ -3696,13 +3679,13 @@ fn run_terminal(session_socket: Option<PathBuf>) -> i32 {
 fn start_control_server(proxy: EventLoopProxy<UserEvent>) -> Option<ControlServer> {
     #[cfg(unix)]
     {
-        if std::env::var_os("SO1TERM_CONTROL").as_deref() == Some(std::ffi::OsStr::new("0")) {
+        if std::env::var_os("NULIX_CONTROL").as_deref() == Some(std::ffi::OsStr::new("0")) {
             return None;
         }
         let directory = match control::runtime_directory() {
             Ok(path) => path,
             Err(error) => {
-                eprintln!("so1term: unable to resolve control runtime directory: {error}");
+                eprintln!("nulix: unable to resolve control runtime directory: {error}");
                 return None;
             }
         };
@@ -3736,7 +3719,7 @@ fn start_control_server(proxy: EventLoopProxy<UserEvent>) -> Option<ControlServe
         }) {
             Ok(server) => Some(server),
             Err(error) => {
-                eprintln!("so1term: unable to start local control socket: {error}");
+                eprintln!("nulix: unable to start local control socket: {error}");
                 None
             }
         }
@@ -3760,10 +3743,10 @@ mod tests {
         selection_target, tab_action_changes_geometry, tab_bar_height, tab_content_rect,
         tab_index_at, tab_shortcut, tab_style,
     };
-    use so1_terminal::keyboard::Modifiers;
-    use so1_terminal::layout::{PaneId, PaneLayout, Rect};
-    use so1_terminal::model::{Model, ModelEvent};
-    use so1_terminal::selection::PointerState;
+    use nulix::keyboard::Modifiers;
+    use nulix::layout::{PaneId, PaneLayout, Rect};
+    use nulix::model::{Model, ModelEvent};
+    use nulix::selection::PointerState;
     use winit::keyboard::{Key, NamedKey};
 
     fn window_args(args: &[&str]) -> Result<super::WindowArgs, String> {
@@ -3987,7 +3970,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             kitty.key,
-            TerminalKey::NumpadKey(so1_terminal::keyboard::KeypadKey::Home)
+            TerminalKey::NumpadKey(nulix::keyboard::KeypadKey::Home)
         );
     }
 
@@ -4000,7 +3983,7 @@ mod tests {
         let kitty = key_from_winit(&home, None, physical, true).unwrap();
         assert_eq!(
             kitty.key,
-            TerminalKey::NumpadKey(so1_terminal::keyboard::KeypadKey::Home)
+            TerminalKey::NumpadKey(nulix::keyboard::KeypadKey::Home)
         );
     }
 
@@ -4021,13 +4004,13 @@ mod tests {
         let modifiers = Modifiers::default();
         let pressed = modifier_event_state(
             modifiers,
-            TerminalKey::Modifier(so1_terminal::keyboard::ModifierKey::LeftControl),
+            TerminalKey::Modifier(nulix::keyboard::ModifierKey::LeftControl),
             KeyEventKind::Press,
         );
         assert!(pressed.control);
         let released = modifier_event_state(
             pressed,
-            TerminalKey::Modifier(so1_terminal::keyboard::ModifierKey::LeftControl),
+            TerminalKey::Modifier(nulix::keyboard::ModifierKey::LeftControl),
             KeyEventKind::Release,
         );
         assert!(!released.control);
@@ -4035,7 +4018,7 @@ mod tests {
 
     #[test]
     fn failed_new_tab_spawn_rolls_back_the_empty_tab() {
-        use so1_terminal::layout::{CellSize, TabSet};
+        use nulix::layout::{CellSize, TabSet};
         let mut tabs = TabSet::new(Rect::new(0, 0, 800, 600), CellSize::new(10, 10), 4, 5, 3);
         let original = tabs.active().unwrap().id();
         let mut spawn_attempted = false;
@@ -4065,7 +4048,7 @@ mod tests {
         assert_eq!(pane_tab_title(cwd, None), "project");
         assert_eq!(pane_tab_title(cwd, Some("custom title")), "custom title");
         assert_eq!(pane_tab_title(cwd, None), "project", "reset returns to cwd");
-        assert_eq!(cwd_basename_title(std::path::Path::new("/")), "so1sh");
+        assert_eq!(cwd_basename_title(std::path::Path::new("/")), "shellux");
         let mut explicit_title = None;
         assert_eq!(
             apply_title_event(
@@ -4117,7 +4100,7 @@ mod tests {
 
     #[test]
     fn hidden_tab_output_does_not_request_a_redraw_for_the_active_tab() {
-        use so1_terminal::layout::{CellSize, TabSet};
+        use nulix::layout::{CellSize, TabSet};
         let mut tabs = TabSet::new(Rect::new(0, 0, 800, 600), CellSize::new(10, 10), 4, 5, 3);
         let first = tabs.active().unwrap().active_pane();
         tabs.add_tab();
@@ -4138,7 +4121,7 @@ mod tests {
 
     #[test]
     fn pane_exit_uses_the_same_close_lifecycle_and_returns_resized_siblings() {
-        use so1_terminal::layout::{CellSize, Direction, TabSet};
+        use nulix::layout::{CellSize, Direction, TabSet};
         let mut tabs = TabSet::new(Rect::new(0, 0, 1200, 600), CellSize::new(10, 10), 4, 5, 3);
         let left = tabs.active().unwrap().active_pane();
         let right = tabs
@@ -4222,9 +4205,7 @@ mod tests {
         );
         assert_eq!(
             pane_action(&Key::Named(NamedKey::ArrowLeft), control_alt, false),
-            Some(PaneAction::Focus(
-                so1_terminal::layout::FocusDirection::Left
-            ))
+            Some(PaneAction::Focus(nulix::layout::FocusDirection::Left))
         );
         assert_eq!(
             pane_action(&Key::Named(NamedKey::ArrowUp), control_shift, false),
@@ -4251,9 +4232,7 @@ mod tests {
         );
         assert_eq!(
             pane_action(&Key::Named(NamedKey::ArrowDown), command_alt, true),
-            Some(PaneAction::Focus(
-                so1_terminal::layout::FocusDirection::Down
-            ))
+            Some(PaneAction::Focus(nulix::layout::FocusDirection::Down))
         );
     }
 
@@ -4268,7 +4247,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let first_mark = "PANE_ALPHA_MARK";
         let second_mark = "PANE_BETA_MARK";
-        let first_pty = so1_terminal::pty::Pty::spawn_with_args(
+        let first_pty = nulix::pty::Pty::spawn_with_args(
             "/bin/sh",
             ["-c", "printf PANE_ALPHA_MARK; sleep 0.1"],
             &cwd,
@@ -4276,7 +4255,7 @@ mod tests {
             24,
         )
         .expect("spawn first PTY");
-        let second_pty = so1_terminal::pty::Pty::spawn_with_args(
+        let second_pty = nulix::pty::Pty::spawn_with_args(
             "/bin/sh",
             ["-c", "printf PANE_BETA_MARK; sleep 0.1"],
             &cwd,

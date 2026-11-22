@@ -1,7 +1,7 @@
-//! End-to-end tests for the `so1term-server` persistent session server (Phase 5 T10).
+//! End-to-end tests for the `nulix-server` persistent session server (Phase 5 T10).
 //!
 //! Each test runs the real server binary with an isolated `XDG_RUNTIME_DIR` and
-//! drives it through the real `so1ctl` binary over the private control socket.
+//! drives it through the real `nulixctl` binary over the private control socket.
 #![cfg(unix)]
 
 use std::{
@@ -14,8 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SERVER: &str = env!("CARGO_BIN_EXE_so1term-server");
-const CTL: &str = env!("CARGO_BIN_EXE_so1ctl");
+const SERVER: &str = env!("CARGO_BIN_EXE_nulix-server");
+const CTL: &str = env!("CARGO_BIN_EXE_nulixctl");
 const WAIT: Duration = Duration::from_secs(10);
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -28,7 +28,7 @@ struct Scratch {
 impl Scratch {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "so1term-server-test-{}-{}",
+            "nulix-server-test-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
@@ -40,8 +40,8 @@ impl Scratch {
 
     fn socket(&self, session: &str) -> PathBuf {
         self.root
-            .join("so1term")
-            .join(format!("so1term-server-{session}.sock"))
+            .join("nulix")
+            .join(format!("nulix-server-{session}.sock"))
     }
 
     fn server(&self, args: &[&str]) -> Command {
@@ -49,10 +49,10 @@ impl Scratch {
         command
             .args(args)
             .env("XDG_RUNTIME_DIR", &self.root)
-            .env("SO1TERM_SHELL", "/bin/sh")
-            // Never read the developer's own so1term.conf.
-            .env("SO1TERM_CONFIG", "/dev/null")
-            .env_remove("SO1TERM_SOCKET")
+            .env("NULIX_SHELL", "/bin/sh")
+            // Never read the developer's own nulix.conf.
+            .env("NULIX_CONFIG", "/dev/null")
+            .env_remove("NULIX_SOCKET")
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -72,7 +72,7 @@ impl Scratch {
             .arg("--socket")
             .arg(self.socket(session))
             .args(args)
-            .env_remove("SO1TERM_SOCKET")
+            .env_remove("NULIX_SOCKET")
             .output()
             .unwrap()
     }
@@ -125,7 +125,7 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 fn stdout(output: &Output) -> String {
     assert!(
         output.status.success(),
-        "so1ctl failed: {}",
+        "nulixctl failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout.clone()).unwrap()
@@ -182,7 +182,7 @@ fn pane_shells_inherit_the_server_socket() {
     let _server = scratch.spawn("env");
     stdout(&scratch.ctl(
         "env",
-        &["send-text", "printf 'sock=%s\\n' \"$SO1TERM_SOCKET\"\n"],
+        &["send-text", "printf 'sock=%s\\n' \"$NULIX_SOCKET\"\n"],
     ));
     let expected = format!("sock={}", scratch.socket("env").display());
     wait_until("socket variable", || {
@@ -222,7 +222,7 @@ fn block_command_reports_the_last_command_block_and_unknown_ids() {
     assert_eq!(
         String::from_utf8_lossy(&missing.stderr).trim(),
         format!(
-            "so1ctl: NOT_FOUND: block 999 does not exist in pane {}",
+            "nulixctl: NOT_FOUND: block 999 does not exist in pane {}",
             block["pane"]
         )
     );
@@ -270,7 +270,7 @@ fn wait_returns_the_finished_block_and_times_out_without_a_newer_one() {
     assert_eq!(timed_out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&timed_out.stderr).trim(),
-        format!("so1ctl: TIMEOUT: no block newer than {id} finished within 0.5s")
+        format!("nulixctl: TIMEOUT: no block newer than {id} finished within 0.5s")
     );
 }
 
@@ -285,7 +285,7 @@ fn wait_times_out_on_schedule_when_the_server_never_answers() {
         .arg("--socket")
         .arg(&socket)
         .args(["wait", "--timeout", "0.5"])
-        .env_remove("SO1TERM_SOCKET")
+        .env_remove("NULIX_SOCKET")
         .output()
         .unwrap();
     let elapsed = started.elapsed();
@@ -294,7 +294,7 @@ fn wait_times_out_on_schedule_when_the_server_never_answers() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        "so1ctl: TIMEOUT: no command block finished within 0.5s"
+        "nulixctl: TIMEOUT: no command block finished within 0.5s"
     );
 }
 
@@ -425,15 +425,15 @@ fn invalid_session_names_are_rejected() {
     }
 }
 
-/// Starts a server that reads `config` through `SO1TERM_CONFIG`, with or without
-/// the harness `SO1TERM_SHELL` override.
+/// Starts a server that reads `config` through `NULIX_CONFIG`, with or without
+/// the harness `NULIX_SHELL` override.
 fn spawn_with_config(scratch: &Scratch, session: &str, config: &str, env_shell: bool) -> Child {
     let path = scratch.root.join(format!("{session}.conf"));
     fs::write(&path, config).unwrap();
     let mut command = scratch.server(&["--session", session]);
-    command.env("SO1TERM_CONFIG", &path);
+    command.env("NULIX_CONFIG", &path);
     if !env_shell {
-        command.env_remove("SO1TERM_SHELL");
+        command.env_remove("NULIX_SHELL");
     }
     let child = command.spawn().unwrap();
     wait_until("server socket", || scratch.socket(session).exists());
@@ -464,7 +464,7 @@ fn server_config_file_sets_the_shell_and_reports_bad_lines() {
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut server.child.stderr.take().unwrap(), &mut stderr).unwrap();
     let expected = format!(
-        "so1term: config {}:2: unknown key: bogus",
+        "nulix: config {}:2: unknown key: bogus",
         scratch.root.join("cfg.conf").display()
     );
     assert!(

@@ -1,11 +1,11 @@
 //! End-to-end test of the GUI client transport (Phase 5 T11c) against the real
-//! `so1term-server`: `ensure_server` starts the session in an isolated runtime
+//! `nulix-server`: `ensure_server` starts the session in an isolated runtime
 //! directory, the remote.rs attach connection receives Welcome, Layout and a full
 //! Frame, typed input shows up in a later frame, and detaching leaves the
 //! session running.
 #![cfg(unix)]
 
-use so1_terminal::{
+use nulix::{
     attach::{ClientMessage, ServerMessage},
     control::{ControlCommand, ControlOutcome, ControlRequest, send_request},
     remote::{
@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SERVER: &str = env!("CARGO_BIN_EXE_so1term-server");
+const SERVER: &str = env!("CARGO_BIN_EXE_nulix-server");
 const WAIT: Duration = Duration::from_secs(10);
 const SESSION: &str = "remote-client";
 
@@ -80,7 +80,7 @@ fn list_succeeds(socket: &Path) -> bool {
 
 #[test]
 fn ensure_server_attach_input_and_detach_keep_the_session_running() {
-    let root = std::env::temp_dir().join(format!("so1term-remote-client-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("nulix-remote-client-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -97,17 +97,17 @@ fn ensure_server_attach_input_and_detach_keep_the_session_running() {
     // SAFETY: this integration-test binary has a single test, so no other thread reads the environment.
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &root);
-        std::env::set_var("SO1TERM_SHELL", "/bin/sh");
+        std::env::set_var("NULIX_SHELL", "/bin/sh");
         std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
-        std::env::remove_var("SO1TERM_SOCKET");
+        std::env::remove_var("NULIX_SOCKET");
     }
 
     let socket = ensure_server(SESSION).expect("ensure_server starts the session server");
     session.socket = Some(socket.clone());
     assert_eq!(
         socket,
-        root.join("so1term")
-            .join(format!("so1term-server-{SESSION}.sock"))
+        root.join("nulix")
+            .join(format!("nulix-server-{SESSION}.sock"))
     );
     // A second call finds the live server instead of starting another one.
     assert_eq!(ensure_server(SESSION).unwrap(), socket);

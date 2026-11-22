@@ -1,4 +1,4 @@
-//! Attach protocol between a `so1term-server` session and one attached GUI.
+//! Attach protocol between a `nulix-server` session and one attached GUI.
 //!
 //! A control connection is upgraded to a bidirectional attach stream. Both
 //! directions carry newline-delimited JSON: exactly one message per line, at
@@ -1766,7 +1766,7 @@ mod tests {
                 active_tab: 1,
                 tabs: vec![
                     LayoutTab {
-                        title: "so1sh".into(),
+                        title: "shellux".into(),
                         panes: Vec::new(),
                     },
                     LayoutTab {

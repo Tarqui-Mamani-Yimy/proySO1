@@ -1,4 +1,4 @@
-//! Headless terminal session owned by the persistent `so1term-server` (Phase 5 T10).
+//! Headless terminal session owned by the persistent `nulix-server` (Phase 5 T10).
 //!
 //! A [`Session`] owns the tab/pane layout and, for every pane, the shell PTY and
 //! its VT [`Model`]. It has no window, GPU, or event-loop dependency: PTY output
@@ -15,7 +15,7 @@
 //!
 //! Kitty graphics (Phase 5 T11d): every pane runs the shared
 //! [`crate::graphics_pipeline`], exactly like a standalone window pane. Replies
-//! go to the pane PTY, `SO1TERM_GRAPHICS_ALLOWED_ROOTS` guards file media in
+//! go to the pane PTY, `NULIX_GRAPHICS_ALLOWED_ROOTS` guards file media in
 //! this process, and decoding runs on a worker thread whose result comes back
 //! through the [`DecodeNotifier`] and [`Session::finish_graphics`]. The
 //! session records which images were stored or freed ([`ImageEvent`]) so the
@@ -29,13 +29,13 @@
 //! outgoing queue between the server loop and a client's writer thread.
 //!
 //! Threading model: a `Session` is owned by exactly one thread (the
-//! `so1term-server` loop) and is never shared. PTY reader threads only call the
+//! `nulix-server` loop) and is never shared. PTY reader threads only call the
 //! [`OutputNotifier`]; control and attach threads talk to the loop through its
 //! event channel. The only state shared with another thread is the [`Outbox`],
 //! which the caller wraps in a mutex: the loop pushes without ever blocking on
 //! the client, and the writer thread pops and performs the socket writes.
 //!
-//! The title and tab helpers here are also used by the `so1term` window so both
+//! The title and tab helpers here are also used by the `nulix` window so both
 //! frontends name panes and roll back failed tabs the same way.
 
 use crate::attach::{
@@ -79,7 +79,7 @@ pub const MAX_CLIENT_COLS: u32 = 1000;
 /// Largest client window an attached client may request, in cell rows.
 pub const MAX_CLIENT_ROWS: u32 = 500;
 
-// Same layout limits as the so1term window.
+// Same layout limits as the nulix window.
 const DIVIDER_WIDTH: u32 = 4;
 const MIN_PANE_COLS: u32 = 20;
 const MIN_PANE_ROWS: u32 = 5;
@@ -458,7 +458,7 @@ impl Session {
                 effect = ControlEffect::Shutdown;
                 serde_json::json!({"stopping": true})
             }
-            // so1term-server intercepts attach in its listener hook; reaching the
+            // nulix-server intercepts attach in its listener hook; reaching the
             // dispatcher means the listener has no attach support.
             ControlCommand::Attach => {
                 return fail(
@@ -971,7 +971,7 @@ fn cell_pixels(cell: CellSize) -> (f32, f32) {
     (cell.width as f32, cell.height as f32)
 }
 
-/// Window area left for panes below the tab bar, as in the so1term window:
+/// Window area left for panes below the tab bar, as in the nulix window:
 /// a bar of one cell height is reserved only while more than one tab exists.
 pub fn tab_content_rect(window: Rect, tab_count: usize, cell_height: u32) -> Rect {
     let bar = if tab_count <= 1 {
@@ -1304,12 +1304,12 @@ pub fn create_tab_with<T>(
     result
 }
 
-/// Pane title derived from its working directory: the basename, or `so1sh`.
+/// Pane title derived from its working directory: the basename, or `shellux`.
 pub fn cwd_basename_title(cwd: &Path) -> String {
     cwd.file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("so1sh")
+        .unwrap_or("shellux")
         .to_owned()
 }
 
@@ -1453,6 +1453,6 @@ mod tests {
         for invalid in ["", "../x", "a/b", "a b", "ñ", ".", &"x".repeat(65)] {
             assert!(validate_session_name(invalid).is_err(), "{invalid:?}");
         }
-        assert_eq!(session_socket_name("work"), "so1term-server-work.sock");
+        assert_eq!(session_socket_name("work"), "nulix-server-work.sock");
     }
 }

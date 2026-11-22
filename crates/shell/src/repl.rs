@@ -115,34 +115,34 @@ impl Prompt for ShellPrompt {
 
 fn history_path(shell: &Shell) -> Option<PathBuf> {
     shell
-        .get_var_bytes("SO1SH_HISTFILE")
+        .get_var_bytes("SHELLUX_HISTFILE")
         .filter(|v| !v.is_empty())
         .map(|v| PathBuf::from(v.to_os_string()))
         .or_else(|| {
             shell
                 .get_var_bytes("HOME")
                 .filter(|v| !v.is_empty())
-                .map(|v| PathBuf::from(v.to_os_string()).join(".so1sh_history"))
+                .map(|v| PathBuf::from(v.to_os_string()).join(".shellux_history"))
         })
 }
 
 fn startup_rc_command(shell: &Shell) -> Option<&'static str> {
     if shell
-        .get_var_bytes("SO1SH_RC")
+        .get_var_bytes("SHELLUX_RC")
         .is_some_and(|v| !v.is_empty())
     {
-        return Some(". \"$SO1SH_RC\"");
+        return Some(". \"$SHELLUX_RC\"");
     }
     let home = shell.get_var_bytes("HOME").filter(|v| !v.is_empty())?;
-    let path = home.to_path_buf().join(".so1shrc");
+    let path = home.to_path_buf().join(".shelluxrc");
     // Only a missing default is silent; let '.' diagnose other access failures.
-    (!matches!(path.try_exists(), Ok(false))).then_some(". \"$HOME/.so1shrc\"")
+    (!matches!(path.try_exists(), Ok(false))).then_some(". \"$HOME/.shelluxrc\"")
 }
 
-/// Interactive command policy file from a non-empty `SO1SH_POLICY`.
+/// Interactive command policy file from a non-empty `SHELLUX_POLICY`.
 fn policy_path(shell: &Shell) -> Option<PathBuf> {
     shell
-        .get_var_bytes("SO1SH_POLICY")
+        .get_var_bytes("SHELLUX_POLICY")
         .filter(|v| !v.is_empty())
         .map(|v| v.to_path_buf())
 }
@@ -170,22 +170,23 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     }
     let jobs = crate::jobs::register(shell)
-        .map_err(|error| io::Error::other(format!("so1sh: jobs builtin: {error}")))?;
+        .map_err(|error| io::Error::other(format!("shellux: jobs builtin: {error}")))?;
     crate::sysinfo::register_sysinfo_builtin(shell)
-        .map_err(|error| io::Error::other(format!("so1sh: sysinfo builtin: {error}")))?;
+        .map_err(|error| io::Error::other(format!("shellux: sysinfo builtin: {error}")))?;
     let aliases = crate::aliases::register(shell)
-        .map_err(|error| io::Error::other(format!("so1sh: alias builtins: {error}")))?;
+        .map_err(|error| io::Error::other(format!("shellux: alias builtins: {error}")))?;
     shell.suppress_repl_stopped_diagnostic(true);
     let terminal = match crate::terminal::Terminal::acquire() {
         Ok(terminal) => Some(terminal),
         Err(error) => {
-            eprintln!("so1sh: terminal: {error}; continuing without terminal job control");
+            eprintln!("shellux: terminal: {error}; continuing without terminal job control");
             crate::terminal::ignore_prompt_signals()?;
             None
         }
     };
     shell.opts_mut().interactive = true;
-    let shell_integration_enabled = std::env::var("SO1SH_SHELL_INTEGRATION").as_deref() != Ok("0")
+    let shell_integration_enabled = std::env::var("SHELLUX_SHELL_INTEGRATION").as_deref()
+        != Ok("0")
         && terminal
             .as_ref()
             .is_some_and(crate::terminal::Terminal::stdout_is_controlling_tty);
@@ -202,7 +203,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
             return Ok(status.code());
         }
     }
-    // After the rc file, so it can set SO1SH_BANNER=0; before the first prompt.
+    // After the rc file, so it can set SHELLUX_BANNER=0; before the first prompt.
     crate::sysinfo::show_startup_banner(shell);
     let completion_state = CompletionState::new(shell, aliases.clone());
     let completion_menu = Box::new(ColumnarMenu::default().with_name("shell_completion_menu"));
@@ -222,7 +223,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_quick_completions(true)
         .with_edit_mode(edit_mode);
-    let highlighting_enabled = std::env::var("SO1SH_HIGHLIGHT").as_deref() != Ok("0");
+    let highlighting_enabled = std::env::var("SHELLUX_HIGHLIGHT").as_deref() != Ok("0");
     if highlighting_enabled {
         editor = editor
             .with_highlighter(Box::new(ShellHighlighter::new(completion_state.clone())))
@@ -233,7 +234,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     #[cfg(unix)]
     {
         let kitty_keyboard_enabled =
-            terminal.is_some() && std::env::var("SO1SH_KITTY_KEYBOARD").as_deref() != Ok("0");
+            terminal.is_some() && std::env::var("SHELLUX_KITTY_KEYBOARD").as_deref() != Ok("0");
         editor = editor.use_kitty_keyboard_enhancement(kitty_keyboard_enabled);
     }
     if shell_integration_enabled {
@@ -244,7 +245,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     if let Some(path) = history_path(shell) {
         match FileBackedHistory::with_file(reedline::HISTORY_SIZE, path) {
             Ok(history) => editor = editor.with_history(Box::new(history)),
-            Err(error) => eprintln!("so1sh: history: {error}"),
+            Err(error) => eprintln!("shellux: history: {error}"),
         }
     }
     let mut integration_failure_reported = false;
@@ -266,7 +267,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
             Signal::Success(source) => {
                 // Flush before evaluation, including exit, so history survives sessions.
                 if let Err(error) = editor.sync_history() {
-                    eprintln!("so1sh: history: {error}");
+                    eprintln!("shellux: history: {error}");
                 }
                 if let Some(terminal) = &terminal {
                     terminal.reclaim()?;
@@ -325,7 +326,7 @@ fn mark_integration_failure_reported(reported: &mut bool) -> bool {
 
 fn report_integration_error(error: io::Error, reported: &mut bool) {
     if mark_integration_failure_reported(reported) {
-        let _ = writeln!(io::stderr().lock(), "so1sh: shell integration: {error}");
+        let _ = writeln!(io::stderr().lock(), "shellux: shell integration: {error}");
     }
 }
 
@@ -365,11 +366,11 @@ mod tests {
         shell.set_var("HOME", "/private/home").unwrap();
         assert_eq!(
             history_path(&shell),
-            Some(PathBuf::from("/private/home/.so1sh_history"))
+            Some(PathBuf::from("/private/home/.shellux_history"))
         );
         shell
             .set_var_bytes(
-                "SO1SH_HISTFILE",
+                "SHELLUX_HISTFILE",
                 ShellBytes::from_vec(b"history\xff".to_vec()),
             )
             .unwrap();
@@ -384,14 +385,16 @@ mod tests {
         let mut shell = Shell::builder().env_clear().build();
         shell.set_var("HOME", "").unwrap();
         assert_eq!(history_path(&shell), None);
-        shell.set_var("SO1SH_HISTFILE", "").unwrap();
+        shell.set_var("SHELLUX_HISTFILE", "").unwrap();
         assert_eq!(history_path(&shell), None);
         shell.set_var("HOME", "/private/home").unwrap();
         assert_eq!(
             history_path(&shell),
-            Some(PathBuf::from("/private/home/.so1sh_history"))
+            Some(PathBuf::from("/private/home/.shellux_history"))
         );
-        shell.set_var("SO1SH_HISTFILE", "/private/history").unwrap();
+        shell
+            .set_var("SHELLUX_HISTFILE", "/private/history")
+            .unwrap();
         shell.set_var("HOME", "").unwrap();
         assert_eq!(
             history_path(&shell),

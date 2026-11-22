@@ -1,4 +1,4 @@
-//! Opt-in command and write policy for the interactive shell (`SO1SH_POLICY`).
+//! Opt-in command and write policy for the interactive shell (`SHELLUX_POLICY`).
 //!
 //! The policy file holds one rule per line; a `#` that begins a word (at the
 //! start of the line or after whitespace) starts a comment, so `/tmp/a#b`
@@ -171,15 +171,16 @@ pub fn normalize_target(cwd: &Path, target: &Path) -> PathBuf {
 /// Read and parse the policy file, formatting failures as one diagnostic.
 pub fn load(path: &Path) -> Result<Policy, String> {
     let shown = path.display();
-    let source = std::fs::read(path).map_err(|error| format!("so1sh: policy {shown}: {error}"))?;
+    let source =
+        std::fs::read(path).map_err(|error| format!("shellux: policy {shown}: {error}"))?;
     let source = String::from_utf8(source).map_err(|error| {
         let valid = &error.as_bytes()[..error.utf8_error().valid_up_to()];
         let line = 1 + valid.iter().filter(|&&byte| byte == b'\n').count();
-        format!("so1sh: policy {shown}:{line}: file is not valid UTF-8")
+        format!("shellux: policy {shown}:{line}: file is not valid UTF-8")
     })?;
     parse(&source).map_err(|error| match error.line {
-        Some(line) => format!("so1sh: policy {shown}:{line}: {}", error.message),
-        None => format!("so1sh: policy {shown}: {}", error.message),
+        Some(line) => format!("shellux: policy {shown}:{line}: {}", error.message),
+        None => format!("shellux: policy {shown}: {}", error.message),
     })
 }
 
@@ -196,7 +197,7 @@ pub fn install(shell: &mut Shell, policy: Policy) {
     }));
     shell.set_redirect_open_handler(Box::new(move |request: &RedirectOpen<'_>| {
         // epsh hands over `request.path` already joined to the shell cwd.
-        // so1sh's shell cwd is absolute, so the path is absolute and
+        // shellux's shell cwd is absolute, so the path is absolute and
         // `normalize_target` ignores `cwd` (joining an absolute path replaces
         // the base). The process cwd, or `/` when it cannot be read, would
         // only be the base for a relative path, which arises only if an
@@ -315,7 +316,7 @@ mod tests {
         assert_eq!(
             load(&path).unwrap_err(),
             format!(
-                "so1sh: policy {}:3: file is not valid UTF-8",
+                "shellux: policy {}:3: file is not valid UTF-8",
                 path.display()
             )
         );

@@ -1,15 +1,15 @@
-//! `so1term-server`: persistent headless terminal session server (Phase 5 T10/T11b).
+//! `nulix-server`: persistent headless terminal session server (Phase 5 T10/T11b).
 //!
 //! The server owns the shell PTYs and terminal models of one named session and
-//! serves the so1term control protocol on a private Unix socket at
-//! `<runtime dir>/so1term-server-<session>.sock`. Clients (`so1ctl`, and the
-//! so1term window through the attach stream) can connect and disconnect freely;
+//! serves the nulix control protocol on a private Unix socket at
+//! `<runtime dir>/nulix-server-<session>.sock`. Clients (`nulixctl`, and the
+//! nulix window through the attach stream) can connect and disconnect freely;
 //! the shells keep running. The server exits when the last pane closes or on
-//! `so1ctl shutdown`, removing its socket. It ignores SIGHUP so closing the
+//! `nulixctl shutdown`, removing its socket. It ignores SIGHUP so closing the
 //! launching terminal does not end the session.
 //!
 //! Attach: a control connection whose request is `attach` is upgraded to an
-//! attach stream (`so1_term_core::attach`) for at most one client at a time; a
+//! attach stream (`nulix_core::attach`) for at most one client at a time; a
 //! second attach is refused with `OPERATION_REFUSED` while one is attached. An
 //! attached client receives `Exit` (`shutdown` or `last-shell-exited`) before
 //! the server exits.
@@ -47,11 +47,11 @@
 
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: so1term-server [--session NAME]\n\
-Runs a persistent so1term session (default name: default) that outlives its clients.\n\
-Control it with so1ctl; stop it with `so1ctl shutdown` or by exiting its last shell.\n\
-Reads `shell` and `scrollback` from $SO1TERM_CONFIG, else\n\
-$XDG_CONFIG_HOME/so1term/so1term.conf (default ~/.config/so1term/so1term.conf).";
+const USAGE: &str = "Usage: nulix-server [--session NAME]\n\
+Runs a persistent nulix session (default name: default) that outlives its clients.\n\
+Control it with nulixctl; stop it with `nulixctl shutdown` or by exiting its last shell.\n\
+Reads `shell` and `scrollback` from $NULIX_CONFIG, else\n\
+$XDG_CONFIG_HOME/nulix/nulix.conf (default ~/.config/nulix/nulix.conf).";
 
 fn main() -> ExitCode {
     #[cfg(unix)]
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
     }
     #[cfg(not(unix))]
     {
-        eprintln!("so1term-server: persistent sessions are not supported on this platform yet");
+        eprintln!("nulix-server: persistent sessions are not supported on this platform yet");
         ExitCode::from(1)
     }
 }
@@ -83,13 +83,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>, 
         }
     }
     let session = session.unwrap_or_else(|| "default".to_owned());
-    so1_terminal::control::validate_session_name(&session)?;
+    nulix::control::validate_session_name(&session)?;
     Ok(Some(session))
 }
 
 #[cfg(unix)]
 mod unix {
-    use so1_terminal::{
+    use nulix::{
         attach::{
             self, AttachError, AttachErrorCode, ClientMessage, MAX_ATTACH_LINE_BYTES, ServerMessage,
         },
@@ -428,7 +428,7 @@ mod unix {
                 let outbox = outbox.clone();
                 let events = self.events.clone();
                 thread::Builder::new()
-                    .name("so1term-attach-writer".into())
+                    .name("nulix-attach-writer".into())
                     .spawn(move || write_client(writer_stream, outbox, generation, events))
             };
             let reader = {
@@ -437,7 +437,7 @@ mod unix {
                 let alive = alive.clone();
                 let buffered = connection.buffered;
                 thread::Builder::new()
-                    .name("so1term-attach-reader".into())
+                    .name("nulix-attach-reader".into())
                     .spawn(move || {
                         read_client(reader_stream, buffered, generation, events, inflight, alive)
                     })
@@ -454,7 +454,7 @@ mod unix {
                 writer: writer.ok(),
             };
             if client.writer.is_none() || reader.is_err() {
-                eprintln!("so1term-server: cannot start attach client threads");
+                eprintln!("nulix-server: cannot start attach client threads");
                 close_client(client);
                 self.slot.store(false, Ordering::Release);
                 return;
@@ -550,7 +550,7 @@ mod unix {
                 return;
             };
             let line = attach::encode_server(message).unwrap_or_else(|error| {
-                eprintln!("so1term-server: cannot encode attach message: {error}");
+                eprintln!("nulix-server: cannot encode attach message: {error}");
                 attach::encode_server(&ServerMessage::Error {
                     code: error.code.as_str().to_owned(),
                     message: error.message,
@@ -564,7 +564,7 @@ mod unix {
                 queued
             };
             if !queued {
-                eprintln!("so1term-server: attached client stopped reading; detaching it");
+                eprintln!("nulix-server: attached client stopped reading; detaching it");
                 self.detach();
             }
         }
@@ -616,7 +616,7 @@ mod unix {
                             Ok(line) => dropped.extend(outbox.push_frame(pane, line)),
                             Err(error) => {
                                 eprintln!(
-                                    "so1term-server: cannot encode frame for pane {pane}: {error}"
+                                    "nulix-server: cannot encode frame for pane {pane}: {error}"
                                 );
                                 errors.push(ServerMessage::Error {
                                     code: error.code.as_str().to_owned(),
@@ -675,7 +675,7 @@ mod unix {
                             Ok(line) => line,
                             Err(error) => {
                                 eprintln!(
-                                    "so1term-server: cannot encode image {} of pane {}: {error}",
+                                    "nulix-server: cannot encode image {} of pane {}: {error}",
                                     placement.image, frame.pane
                                 );
                                 continue;
@@ -701,7 +701,7 @@ mod unix {
                 return;
             };
             eprintln!(
-                "so1term-server: attached client has more than 256 MiB of image data queued; detaching it"
+                "nulix-server: attached client has more than 256 MiB of image data queued; detaching it"
             );
             let error = attach::encode_server(&session::attach_error(
                 session::ERROR_IMAGE_BACKLOG,
@@ -767,12 +767,12 @@ mod unix {
             Ok(Some(name)) => name,
             Ok(None) => return ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("so1term-server: {message}");
+                eprintln!("nulix-server: {message}");
                 return ExitCode::from(2);
             }
         };
         // Panes take `shell` and `scrollback` from the configuration file.
-        so1_terminal::config::init();
+        nulix::config::init();
         // The session must survive the terminal that launched it.
         unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
 
@@ -800,16 +800,16 @@ mod unix {
         let server = match started {
             Ok(server) => server,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("so1term-server: session {session_name} is already running");
+                eprintln!("nulix-server: session {session_name} is already running");
                 return ExitCode::from(1);
             }
             Err(error) => {
-                eprintln!("so1term-server: cannot start the control socket: {error}");
+                eprintln!("nulix-server: cannot start the control socket: {error}");
                 return ExitCode::from(1);
             }
         };
         // Exported before the first shell starts so every pane inherits it.
-        unsafe { std::env::set_var("SO1TERM_SOCKET", server.socket_path()) };
+        unsafe { std::env::set_var("NULIX_SOCKET", server.socket_path()) };
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let output_events = events.clone();
@@ -823,12 +823,12 @@ mod unix {
         let session = match Session::start(DEFAULT_COLS, DEFAULT_ROWS, cwd, notify, decode) {
             Ok(session) => session,
             Err(error) => {
-                eprintln!("so1term-server: {error}");
+                eprintln!("nulix-server: {error}");
                 return ExitCode::from(1);
             }
         };
         println!(
-            "so1term-server: session {session_name} listening on {}",
+            "nulix-server: session {session_name} listening on {}",
             server.socket_path().display()
         );
 

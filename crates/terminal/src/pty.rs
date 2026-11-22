@@ -123,7 +123,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn drop_terminates_shell_and_background_process_group_promptly() {
-        const CHILD_TEST: &str = "SO1TERM_PTY_DROP_TEST_CHILD";
+        const CHILD_TEST: &str = "NULIX_PTY_DROP_TEST_CHILD";
         if std::env::var_os(CHILD_TEST).is_some() {
             assert_dropped_sleep_is_gone();
             return;
@@ -154,12 +154,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn drop_terminates_so1sh_started_background_process() {
-        let Some(executable) = test_so1sh_executable() else {
-            eprintln!("skip real so1sh background teardown test: Cargo binary unavailable");
+    fn drop_terminates_shellux_started_background_process() {
+        let Some(executable) = test_shellux_executable() else {
+            eprintln!("skip real shellux background teardown test: Cargo binary unavailable");
             return;
         };
-        let unique = format!("so1term-pty-{}", std::process::id());
+        let unique = format!("nulix-pty-{}", std::process::id());
         let rc_path = std::env::temp_dir().join(format!("{unique}.rc"));
         let pid_path = std::env::temp_dir().join(format!("{unique}.pid"));
         std::fs::write(
@@ -168,7 +168,7 @@ mod tests {
         )
         .unwrap();
         let command = format!(
-            "SO1SH_KITTY_KEYBOARD=0 SO1SH_RC='{}' exec '{}'",
+            "SHELLUX_KITTY_KEYBOARD=0 SHELLUX_RC='{}' exec '{}'",
             rc_path.display(),
             executable.display()
         );
@@ -185,7 +185,7 @@ mod tests {
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "so1sh rc did not launch background child"
+                "shellux rc did not launch background child"
             );
             thread::sleep(Duration::from_millis(10));
         };
@@ -193,14 +193,14 @@ mod tests {
         drop(pty);
         assert!(
             started.elapsed() < Duration::from_secs(2),
-            "so1sh PTY drop took {:?}",
+            "shellux PTY drop took {:?}",
             started.elapsed()
         );
         let _ = std::fs::remove_file(rc_path);
         let _ = std::fs::remove_file(pid_path);
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
-            "so1sh background process {pid} survived drop"
+            "shellux background process {pid} survived drop"
         );
     }
 
@@ -208,8 +208,8 @@ mod tests {
     #[test]
     fn drop_sweeps_background_job_after_shell_was_reaped() {
         let executable =
-            test_so1sh_executable().expect("so1sh binary is required for teardown regression");
-        let unique = format!("so1term-reaped-{}", std::process::id());
+            test_shellux_executable().expect("shellux binary is required for teardown regression");
+        let unique = format!("nulix-reaped-{}", std::process::id());
         let rc_path = std::env::temp_dir().join(format!("{unique}.rc"));
         let pid_path = std::env::temp_dir().join(format!("{unique}.pid"));
         std::fs::write(
@@ -221,7 +221,7 @@ mod tests {
         )
         .unwrap();
         let command = format!(
-            "SO1SH_KITTY_KEYBOARD=0 SO1SH_RC='{}' exec '{}'",
+            "SHELLUX_KITTY_KEYBOARD=0 SHELLUX_RC='{}' exec '{}'",
             rc_path.display(),
             executable.display()
         );
@@ -242,7 +242,7 @@ mod tests {
         };
         pty.write(b"exit\n").unwrap();
         while pty.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "so1sh did not exit");
+            assert!(Instant::now() < deadline, "shellux did not exit");
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -371,8 +371,8 @@ use std::{
 };
 
 #[cfg(test)]
-pub(crate) fn test_so1sh_executable() -> Option<PathBuf> {
-    std::env::var_os("CARGO_BIN_EXE_so1sh")
+pub(crate) fn test_shellux_executable() -> Option<PathBuf> {
+    std::env::var_os("CARGO_BIN_EXE_shellux")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .or_else(|| {
@@ -387,7 +387,7 @@ pub(crate) fn test_so1sh_executable() -> Option<PathBuf> {
                     } else {
                         return None;
                     };
-                    let candidate = profile.join("so1sh");
+                    let candidate = profile.join("shellux");
                     candidate.is_file().then_some(candidate)
                 })
                 .next()
@@ -447,7 +447,7 @@ impl Pty {
             let writer = pair.master.take_writer().map_err(other_io)?;
             let (sender, output) = mpsc::channel();
             let reader = thread::Builder::new()
-                .name("so1term-pty-reader".into())
+                .name("nulix-pty-reader".into())
                 .spawn(move || read_output(reader, sender))?;
             Ok((writer, output, reader))
         })?;
@@ -461,7 +461,7 @@ impl Pty {
         })
     }
 
-    /// Spawn the configured shell, preferring a sibling `so1sh` on Unix.
+    /// Spawn the configured shell, preferring a sibling `shellux` on Unix.
     pub fn spawn_shell(cwd: impl AsRef<Path>, cols: u16, rows: u16) -> io::Result<Self> {
         Self::spawn_shell_notified(cwd, cols, rows, || {})
     }
@@ -560,7 +560,7 @@ impl Pty {
             let writer = pair.master.take_writer().map_err(other_io)?;
             let (sender, output) = mpsc::channel();
             let reader = thread::Builder::new()
-                .name("so1term-pty-reader".into())
+                .name("nulix-pty-reader".into())
                 .spawn(move || read_output_notified(reader, sender, notify))?;
             Ok((writer, output, reader))
         })?;
@@ -920,12 +920,12 @@ fn other_io(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-/// The shell chosen by the user: `SO1TERM_SHELL`, else the config file's `shell`.
+/// The shell chosen by the user: `NULIX_SHELL`, else the config file's `shell`.
 fn shell_override() -> Option<std::ffi::OsString> {
-    std::env::var_os("SO1TERM_SHELL").or_else(|| crate::config::current().shell.clone())
+    std::env::var_os("NULIX_SHELL").or_else(|| crate::config::current().shell.clone())
 }
 
-/// Resolve the default so1sh executable, preferring a sibling to PATH.
+/// Resolve the default shellux executable, preferring a sibling to PATH.
 #[cfg(unix)]
 pub fn resolve_shell() -> PathBuf {
     if let Some(value) = shell_override() {
@@ -933,13 +933,13 @@ pub fn resolve_shell() -> PathBuf {
     }
     let sibling = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|p| p.join("so1sh")));
+        .and_then(|exe| exe.parent().map(|p| p.join("shellux")));
     match crate::resolve_shell_choice(
         None,
         sibling.as_ref().is_some_and(|p| p.is_file()),
         crate::default_shell_candidates_for(false),
     ) {
-        "sibling-so1sh" => sibling.unwrap_or_else(|| PathBuf::from("so1sh")),
+        "sibling-shellux" => sibling.unwrap_or_else(|| PathBuf::from("shellux")),
         selected => PathBuf::from(selected),
     }
 }

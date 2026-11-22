@@ -2140,7 +2140,7 @@ impl Shell {
         }
         // Reuse the parser's here-document body reader through a synthetic
         // `: <<DELIM` command whose delimiter is not a line of the prompt.
-        let mut delimiter = b"SO1SH_PROMPT_EOF".to_vec();
+        let mut delimiter = b"SHELLUX_PROMPT_EOF".to_vec();
         while text.split(|&b| b == b'\n').any(|line| line == delimiter) {
             delimiter.push(b'_');
         }
@@ -3406,8 +3406,8 @@ mod tests {
         shell.exit_status = ExitStatus::from(3);
         assert_eq!(prompt(&mut shell, "[$?] ").unwrap(), "[3] ");
         assert_eq!(
-            prompt(&mut shell, "SO1SH_PROMPT_EOF\n$?").unwrap(),
-            "SO1SH_PROMPT_EOF\n3"
+            prompt(&mut shell, "SHELLUX_PROMPT_EOF\n$?").unwrap(),
+            "SHELLUX_PROMPT_EOF\n3"
         );
         assert!(prompt(&mut shell, "${x?boom}").is_err());
         assert_eq!(shell.exit_status(), ExitStatus::from(3));

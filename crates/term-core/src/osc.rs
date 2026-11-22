@@ -313,9 +313,9 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_real_so1sh_shell_integration_bytes() {
+    fn recognizes_real_shellux_shell_integration_bytes() {
         // OSC bytes extracted from a PTY capture of `echo t2-capture` in /tmp
-        // with SO1SH_SHELL_INTEGRATION=1 and a controlling terminal.
+        // with SHELLUX_SHELL_INTEGRATION=1 and a controlling terminal.
         let captured = b"\x1b]7;file://localhost/tmp\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\";
         let mut observer = Observer::new();
         let events = observer.feed(captured);

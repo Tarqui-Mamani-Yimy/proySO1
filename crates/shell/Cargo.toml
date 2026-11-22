@@ -1,5 +1,5 @@
 [package]
-name = "so1sh"
+name = "shellux"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"

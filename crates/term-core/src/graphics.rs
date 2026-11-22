@@ -47,7 +47,7 @@ impl AllowedRoot {
 
 impl GraphicsFilePolicy {
     pub fn from_env() -> Self {
-        let roots = std::env::var_os("SO1TERM_GRAPHICS_ALLOWED_ROOTS")
+        let roots = std::env::var_os("NULIX_GRAPHICS_ALLOWED_ROOTS")
             .into_iter()
             .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
             .filter(|path| !path.as_os_str().is_empty())
@@ -1233,7 +1233,7 @@ mod tests {
     impl TestDir {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "so1term-graphics-test-{}-{}",
+                "nulix-graphics-test-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn file_requests_without_opt_in_reply_permission_error() {
-        let path = std::env::temp_dir().join("so1term-file-opt-in-test");
+        let path = std::env::temp_dir().join("nulix-file-opt-in-test");
         let encoded = STANDARD.encode(path.as_os_str().as_encoded_bytes());
         let Ingest::Decode(job) = GraphicsProtocol::new(GraphicsFilePolicy::default())
             .ingest(format!("Gt=f,f=100,i=12;{encoded}").as_bytes())

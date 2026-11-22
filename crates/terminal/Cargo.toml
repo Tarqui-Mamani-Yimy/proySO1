@@ -1,15 +1,19 @@
 [package]
-name = "so1-terminal"
+name = "nulix"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[lib]
+name = "nulix"
+path = "src/lib.rs"
+
 [[bin]]
-name = "so1term"
+name = "nulix"
 path = "src/main.rs"
 
 [dependencies]
-so1-term-core = { path = "../term-core" }
+nulix-core = { path = "../term-core" }
 winit = "0.30"
 wgpu = "30"
 pollster = "0.4"

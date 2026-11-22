@@ -1,11 +1,11 @@
-pub use so1_term_core::control::{
+pub use nulix_core::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
     ControlRequest, ControlResponse, ListPane, MAX_REQUEST_LINE_BYTES, NO_COMMAND_BLOCK, TextScope,
     block_result, list_pane_entry, parse_request, parse_response, serialize_request,
     serialize_response,
 };
 
-/// Longest accepted `so1term-server --session` name.
+/// Longest accepted `nulix-server --session` name.
 pub const MAX_SESSION_NAME_BYTES: usize = 64;
 
 /// Accepts 1-64 ASCII letters, digits, `-` and `_`, so the name is safe in a socket file name.
@@ -26,7 +26,7 @@ pub fn validate_session_name(session: &str) -> Result<(), String> {
 
 /// Socket file name of a persistent server session inside the runtime directory.
 pub fn session_socket_name(session: &str) -> String {
-    format!("so1term-server-{session}.sock")
+    format!("nulix-server-{session}.sock")
 }
 
 #[cfg(unix)]
@@ -88,12 +88,12 @@ mod transport {
     }
 
     impl ControlServer {
-        /// Starts the per-window listener `so1term-<pid>.sock` in `directory`.
+        /// Starts the per-window listener `nulix-<pid>.sock` in `directory`.
         pub fn start_at<F>(directory: &Path, pid: u32, dispatch: F) -> io::Result<Self>
         where
             F: Fn(ControlRequest) -> ControlResponse + Send + Sync + 'static,
         {
-            Self::start_named(directory, &format!("so1term-{pid}.sock"), dispatch, None)
+            Self::start_named(directory, &format!("nulix-{pid}.sock"), dispatch, None)
         }
 
         /// Starts the persistent-server listener for `session` in `directory`.
@@ -222,7 +222,7 @@ mod transport {
             let active = Arc::new(AtomicUsize::new(0));
             let active_for_listener = active.clone();
             let thread = thread::Builder::new()
-                .name("so1term-control-listener".into())
+                .name("nulix-control-listener".into())
                 .spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         match listener.accept() {
@@ -245,7 +245,7 @@ mod transport {
                                 let attach = attach.clone();
                                 let active_for_client = active.clone();
                                 if thread::Builder::new()
-                                    .name("so1term-control-client".into())
+                                    .name("nulix-control-client".into())
                                     .spawn(move || {
                                         handle_connection(
                                             stream,
@@ -502,9 +502,9 @@ mod transport {
 
     pub fn runtime_directory() -> io::Result<PathBuf> {
         if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
-            Ok(PathBuf::from(path).join("so1term"))
+            Ok(PathBuf::from(path).join("nulix"))
         } else {
-            Ok(std::env::temp_dir().join(format!("so1term-{}", current_uid())))
+            Ok(std::env::temp_dir().join(format!("nulix-{}", current_uid())))
         }
     }
 }
@@ -555,7 +555,7 @@ mod tests {
     fn test_root() -> TestRoot {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let root = std::env::temp_dir().join(format!(
-            "so1term-control-test-{}-{}",
+            "nulix-control-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -618,7 +618,7 @@ mod tests {
         let root = test_root();
         let stale_dir = root.join("stale");
         private_dir(&stale_dir);
-        let stale_path = stale_dir.join("so1term-1236.sock");
+        let stale_path = stale_dir.join("nulix-1236.sock");
         {
             let listener = UnixListener::bind(&stale_path).unwrap();
             drop(listener);
@@ -629,7 +629,7 @@ mod tests {
 
         let live_dir = root.join("live");
         private_dir(&live_dir);
-        let live_path = live_dir.join("so1term-1237.sock");
+        let live_path = live_dir.join("nulix-1237.sock");
         let listener = UnixListener::bind(&live_path).unwrap();
         assert!(ControlServer::start_at(&live_dir, 1237, |_| unreachable!()).is_err());
         assert!(live_path.exists());
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn so1ctl_client_round_trips_through_a_real_listener_and_fake_dispatcher() {
+    fn nulixctl_client_round_trips_through_a_real_listener_and_fake_dispatcher() {
         let root = test_root();
         let server = ControlServer::start_at(&root.join("integration"), 1239, |request| {
             assert_eq!(request.command, ControlCommand::List);

@@ -1,15 +1,15 @@
-//! Startup configuration file for so1term and so1term-server.
+//! Startup configuration file for nulix and nulix-server.
 //!
 //! The file is plain `key = value` lines (no dependency, same spirit as the
-//! so1sh policy file). Blank lines and lines whose first non-blank character
+//! shellux policy file). Blank lines and lines whose first non-blank character
 //! is `#` are ignored; colour values start with `#`, so comments are only
-//! recognised at the start of a line. It is looked up at `$SO1TERM_CONFIG`
-//! when non-empty, else `$XDG_CONFIG_HOME/so1term/so1term.conf`, else
-//! `$HOME/.config/so1term/so1term.conf`. A missing default file is silent.
+//! recognised at the start of a line. It is looked up at `$NULIX_CONFIG`
+//! when non-empty, else `$XDG_CONFIG_HOME/nulix/nulix.conf`, else
+//! `$HOME/.config/nulix/nulix.conf`. A missing default file is silent.
 //!
-//! Every problem is reported as `so1term: config FILE:LINE: MESSAGE` and the
+//! Every problem is reported as `nulix: config FILE:LINE: MESSAGE` and the
 //! affected key keeps its default, so a bad file never stops the window from
-//! opening. `SO1TERM_FONT`, `SO1TERM_FONT_SIZE` and `SO1TERM_SHELL` override
+//! opening. `NULIX_FONT`, `NULIX_FONT_SIZE` and `NULIX_SHELL` override
 //! the matching keys where they are consumed. Hot reload is not implemented.
 
 use std::ffi::OsString;
@@ -61,7 +61,7 @@ pub struct ConfigLocation {
 /// Resolves the configuration path from environment lookups.
 pub fn config_location(var: impl Fn(&str) -> Option<OsString>) -> Option<ConfigLocation> {
     let non_empty = |name: &str| var(name).filter(|value| !value.is_empty());
-    if let Some(path) = non_empty("SO1TERM_CONFIG") {
+    if let Some(path) = non_empty("NULIX_CONFIG") {
         return Some(ConfigLocation {
             path: PathBuf::from(path),
             explicit: true,
@@ -71,12 +71,12 @@ pub fn config_location(var: impl Fn(&str) -> Option<OsString>) -> Option<ConfigL
         .map(PathBuf::from)
         .or_else(|| non_empty("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(ConfigLocation {
-        path: base.join("so1term").join("so1term.conf"),
+        path: base.join("nulix").join("nulix.conf"),
         explicit: false,
     })
 }
 
-/// Parses configuration text. Diagnostics are complete `so1term: config ...`
+/// Parses configuration text. Diagnostics are complete `nulix: config ...`
 /// lines; the returned config holds every valid key.
 pub fn parse_config(text: &str, origin: &Path, home: Option<&Path>) -> (Config, Vec<String>) {
     let mut config = Config::default();
@@ -90,7 +90,7 @@ pub fn parse_config(text: &str, origin: &Path, home: Option<&Path>) -> (Config, 
         }
         let report = |message: String| {
             format!(
-                "so1term: config {}:{}: {message}",
+                "nulix: config {}:{}: {message}",
                 origin.display(),
                 index + 1
             )
@@ -197,7 +197,7 @@ pub fn load_config(var: impl Fn(&str) -> Option<OsString>) -> (Config, Vec<Strin
         Err(error) => (
             Config::default(),
             vec![format!(
-                "so1term: config {}: {error}",
+                "nulix: config {}: {error}",
                 location.path.display()
             )],
         ),
@@ -234,7 +234,7 @@ mod tests {
     fn parse(text: &str) -> (Config, Vec<String>) {
         parse_config(
             text,
-            Path::new("/cfg/so1term.conf"),
+            Path::new("/cfg/nulix.conf"),
             Some(Path::new("/home/u")),
         )
     }
@@ -289,14 +289,14 @@ mod tests {
         assert_eq!(
             diagnostics,
             vec![
-                "so1term: config /cfg/so1term.conf:1: font_size: expected a number from 6 to 72, got \"100\"",
-                "so1term: config /cfg/so1term.conf:2: expected KEY = VALUE",
-                "so1term: config /cfg/so1term.conf:3: unknown key: colour1",
-                "so1term: config /cfg/so1term.conf:4: unknown key: color16",
-                "so1term: config /cfg/so1term.conf:5: background: expected #rrggbb, got \"red\"",
-                "so1term: config /cfg/so1term.conf:6: scrollback: expected 0 to 100000 lines, got \"100001\"",
-                "so1term: config /cfg/so1term.conf:7: shell: empty value",
-                "so1term: config /cfg/so1term.conf:8: foreground: expected #rrggbb, got \"#fff\"",
+                "nulix: config /cfg/nulix.conf:1: font_size: expected a number from 6 to 72, got \"100\"",
+                "nulix: config /cfg/nulix.conf:2: expected KEY = VALUE",
+                "nulix: config /cfg/nulix.conf:3: unknown key: colour1",
+                "nulix: config /cfg/nulix.conf:4: unknown key: color16",
+                "nulix: config /cfg/nulix.conf:5: background: expected #rrggbb, got \"red\"",
+                "nulix: config /cfg/nulix.conf:6: scrollback: expected 0 to 100000 lines, got \"100001\"",
+                "nulix: config /cfg/nulix.conf:7: shell: empty value",
+                "nulix: config /cfg/nulix.conf:8: foreground: expected #rrggbb, got \"#fff\"",
             ]
         );
         assert_eq!(config, Config::default());
@@ -306,7 +306,7 @@ mod tests {
     fn config_location_prefers_explicit_then_xdg_then_home() {
         assert_eq!(
             config_location(env(&[
-                ("SO1TERM_CONFIG", "/x.conf"),
+                ("NULIX_CONFIG", "/x.conf"),
                 ("XDG_CONFIG_HOME", "/xdg"),
                 ("HOME", "/h")
             ])),
@@ -317,19 +317,19 @@ mod tests {
         );
         assert_eq!(
             config_location(env(&[
-                ("SO1TERM_CONFIG", ""),
+                ("NULIX_CONFIG", ""),
                 ("XDG_CONFIG_HOME", "/xdg"),
                 ("HOME", "/h")
             ])),
             Some(ConfigLocation {
-                path: PathBuf::from("/xdg/so1term/so1term.conf"),
+                path: PathBuf::from("/xdg/nulix/nulix.conf"),
                 explicit: false
             })
         );
         assert_eq!(
             config_location(env(&[("XDG_CONFIG_HOME", ""), ("HOME", "/h")])),
             Some(ConfigLocation {
-                path: PathBuf::from("/h/.config/so1term/so1term.conf"),
+                path: PathBuf::from("/h/.config/nulix/nulix.conf"),
                 explicit: false
             })
         );
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn config_missing_default_file_is_silent_but_explicit_file_warns() {
-        let dir = std::env::temp_dir().join(format!("so1term-config-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nulix-config-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let dir_text = dir.to_str().unwrap();
         assert_eq!(
@@ -347,16 +347,16 @@ mod tests {
         );
         let missing = dir.join("missing.conf");
         let (config, diagnostics) =
-            load_config(env(&[("SO1TERM_CONFIG", missing.to_str().unwrap())]));
+            load_config(env(&[("NULIX_CONFIG", missing.to_str().unwrap())]));
         assert_eq!(config, Config::default());
         assert_eq!(diagnostics.len(), 1);
         assert!(
-            diagnostics[0].starts_with(&format!("so1term: config {}: ", missing.display())),
+            diagnostics[0].starts_with(&format!("nulix: config {}: ", missing.display())),
             "{diagnostics:?}"
         );
 
-        std::fs::create_dir_all(dir.join("so1term")).unwrap();
-        std::fs::write(dir.join("so1term/so1term.conf"), "scrollback = 42\n").unwrap();
+        std::fs::create_dir_all(dir.join("nulix")).unwrap();
+        std::fs::write(dir.join("nulix/nulix.conf"), "scrollback = 42\n").unwrap();
         let (config, diagnostics) = load_config(env(&[("XDG_CONFIG_HOME", dir_text)]));
         assert_eq!(diagnostics, Vec::<String>::new());
         assert_eq!(config.scrollback, 42);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn config_example_file_parses_to_the_built_in_defaults() {
-        let (config, diagnostics) = parse(include_str!("../../../docs/so1term.conf.example"));
+        let (config, diagnostics) = parse(include_str!("../../../docs/nulix.conf.example"));
         assert_eq!(diagnostics, Vec::<String>::new());
         assert_eq!(config, Config::default());
     }
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(
             diagnostics,
             vec![
-                "so1term: config /cfg/so1term.conf:4: scrollback: expected 0 to 100000 lines, got \"x\""
+                "nulix: config /cfg/nulix.conf:4: scrollback: expected 0 to 100000 lines, got \"x\""
             ]
         );
         assert_eq!(config.scrollback, 5);

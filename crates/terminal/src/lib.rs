@@ -1,4 +1,4 @@
-pub use so1_term_core::{
+pub use nulix_core::{
     apc, attach, block_navigation, blocks, graphics, keyboard, layout, model, osc, placements,
     renderer,
 };
@@ -71,7 +71,7 @@ impl PaneRenderInput {
 pub fn default_shell_candidates() -> &'static [&'static str] {
     #[cfg(unix)]
     {
-        &["so1sh"]
+        &["shellux"]
     }
     #[cfg(windows)]
     {
@@ -87,7 +87,7 @@ pub fn default_shell_candidates_for(windows: bool) -> &'static [&'static str] {
     if windows {
         &["pwsh", "cmd"]
     } else {
-        &["so1sh"]
+        &["shellux"]
     }
 }
 
@@ -101,9 +101,9 @@ pub fn resolve_shell_choice<'a>(
         return path;
     }
     if sibling_exists {
-        return "sibling-so1sh";
+        return "sibling-shellux";
     }
-    candidates.first().copied().unwrap_or("so1sh")
+    candidates.first().copied().unwrap_or("shellux")
 }
 
 /// Surface dimensions must be non-zero even when a window is minimized.
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn default_shell_candidates_are_platform_ordered() {
         #[cfg(unix)]
-        assert_eq!(default_shell_candidates(), &["so1sh"]);
+        assert_eq!(default_shell_candidates(), &["shellux"]);
         #[cfg(windows)]
         assert_eq!(default_shell_candidates(), &["pwsh", "cmd"]);
     }
@@ -137,14 +137,14 @@ mod tests {
     #[test]
     fn shell_selection_prefers_override_then_sibling_then_path_candidates() {
         assert_eq!(
-            resolve_shell_choice(Some("custom"), true, &["so1sh"]),
+            resolve_shell_choice(Some("custom"), true, &["shellux"]),
             "custom"
         );
         assert_eq!(
-            resolve_shell_choice(None, true, &["so1sh"]),
-            "sibling-so1sh"
+            resolve_shell_choice(None, true, &["shellux"]),
+            "sibling-shellux"
         );
-        assert_eq!(resolve_shell_choice(None, false, &["so1sh"]), "so1sh");
+        assert_eq!(resolve_shell_choice(None, false, &["shellux"]), "shellux");
     }
 
     #[test]

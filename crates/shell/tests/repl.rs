@@ -32,7 +32,7 @@ fn pty_timeout_from_override(value: Option<&str>) -> std::time::Duration {
 }
 
 fn pty_test_timeout() -> std::time::Duration {
-    pty_timeout_from_override(std::env::var("SO1SH_TEST_TIMEOUT_SECS").ok().as_deref())
+    pty_timeout_from_override(std::env::var("SHELLUX_TEST_TIMEOUT_SECS").ok().as_deref())
 }
 
 fn pty_deadline() -> std::time::Instant {
@@ -135,17 +135,17 @@ fn session_with(args: &[&str], prompt: Option<&str>) -> (PtySession, TempDir) {
 
 fn session_with_term(args: &[&str], prompt: Option<&str>, term: &str) -> (PtySession, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         // Keep the historical literal prompt; default-prompt tests unset PS1.
         .env("PS1", "$ ")
-        .env("SO1SH_BANNER", "0")
+        .env("SHELLUX_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", term)
-        .env("SO1SH_SHELL_INTEGRATION", "0")
-        .env("SO1SH_KITTY_KEYBOARD", "0")
-        .env("SO1SH_HIGHLIGHT", "0")
+        .env("SHELLUX_SHELL_INTEGRATION", "0")
+        .env("SHELLUX_KITTY_KEYBOARD", "0")
+        .env("SHELLUX_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     command.args(args);
@@ -159,19 +159,19 @@ fn session_with_term(args: &[&str], prompt: Option<&str>, term: &str) -> (PtySes
 
 fn session_with_shell_integration(value: Option<&str>) -> (PtySession, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         // Keep the historical literal prompt; default-prompt tests unset PS1.
         .env("PS1", "$ ")
-        .env("SO1SH_BANNER", "0")
+        .env("SHELLUX_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
         .env("HOME", dir.path())
-        .env("SO1SH_HIGHLIGHT", "0")
+        .env("SHELLUX_HIGHLIGHT", "0")
         .current_dir(dir.path());
     if let Some(value) = value {
-        command.env("SO1SH_SHELL_INTEGRATION", value);
+        command.env("SHELLUX_SHELL_INTEGRATION", value);
     }
     (spawn_pty(command), dir)
 }
@@ -247,17 +247,17 @@ fn exited(session: &mut PtySession, code: i32) {
 
 fn kitty_test_session(enabled: bool) -> (PtySession, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         // Keep the historical literal prompt; default-prompt tests unset PS1.
         .env("PS1", "$ ")
-        .env("SO1SH_BANNER", "0")
+        .env("SHELLUX_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "xterm-256color")
         .env("HOME", dir.path())
-        .env("SO1SH_HIGHLIGHT", "0")
-        .env("SO1SH_KITTY_KEYBOARD", if enabled { "1" } else { "0" })
+        .env("SHELLUX_HIGHLIGHT", "0")
+        .env("SHELLUX_KITTY_KEYBOARD", if enabled { "1" } else { "0" })
         .current_dir(dir.path());
     let mut session = spawn_command(command, Some(5_000)).unwrap();
     session.process_mut().set_kill_timeout(Some(5_000));
@@ -308,15 +308,20 @@ fn failed_exec_keeps_status_127_and_the_session() {
     let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
-    submit(&mut session, "exec so1sh-no-such-command; echo not-reached");
-    session.exp_string("exec: so1sh-no-such-command: ").unwrap();
+    submit(
+        &mut session,
+        "exec shellux-no-such-command; echo not-reached",
+    );
+    session
+        .exp_string("exec: shellux-no-such-command: ")
+        .unwrap();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "echo status=$?");
     let output = session.exp_string("status=127\r\n").unwrap();
     assert!(!output.contains("not-reached"), "{output:?}");
     session.exp_string("$ ").unwrap();
     // Other special-builtin errors keep reporting 2.
-    submit(&mut session, ". ./so1sh-no-such-file");
+    submit(&mut session, ". ./shellux-no-such-file");
     session.exp_string("$ ").unwrap();
     submit(&mut session, "echo status=$?");
     session.exp_string("status=2\r\n").unwrap();
@@ -566,19 +571,19 @@ fn history_session(dir: &TempDir, explicit: bool) -> PtySession {
 }
 
 fn history_session_with_file(dir: &TempDir, path: Option<&std::path::Path>) -> PtySession {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         // Keep the historical literal prompt; default-prompt tests unset PS1.
         .env("PS1", "$ ")
-        .env("SO1SH_BANNER", "0")
+        .env("SHELLUX_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
-        .env("SO1SH_HIGHLIGHT", "0")
+        .env("SHELLUX_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     if let Some(path) = path {
-        command.env("SO1SH_HISTFILE", path);
+        command.env("SHELLUX_HISTFILE", path);
     }
     let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
@@ -605,7 +610,7 @@ fn history_survives_sessions_and_ctrl_r_searches_it() {
         let path = dir.path().join(if explicit {
             "private-history"
         } else {
-            ".so1sh_history"
+            ".shellux_history"
         });
         assert!(
             std::fs::read_to_string(path)
@@ -687,7 +692,7 @@ fn backslash_newline_uses_continuation_prompt() {
 }
 
 fn history_error_keeps_session_working(mut session: PtySession) {
-    session.exp_string("so1sh: history:").unwrap();
+    session.exp_string("shellux: history:").unwrap();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "echo after");
     assert_no_output(&session.exp_string("after\r\n").unwrap());
@@ -714,13 +719,13 @@ fn history_sync_error_keeps_session_working() {
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
     submit(&mut session, "echo after");
-    session.exp_string("so1sh: history:").unwrap();
+    session.exp_string("shellux: history:").unwrap();
     session.exp_string("\r\n").unwrap();
     assert_no_output(&session.exp_string("after\r\n").unwrap());
     session.exp_string("$ ").unwrap();
     // Later submissions (including exit) must remain non-fatal as well.
     submit(&mut session, "exit");
-    session.exp_string("so1sh: history:").unwrap();
+    session.exp_string("shellux: history:").unwrap();
     exited(&mut session, 0);
 }
 
@@ -1239,11 +1244,11 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
-        .env("SO1SH_HIGHLIGHT", "0")
+        .env("SHELLUX_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .env("PS1", "parent> ")
-        .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
-        .env("SO1SH_HISTFILE", dir.path().join("history"))
+        .env("SHELLUX_BIN", env!("CARGO_BIN_EXE_shellux"))
+        .env("SHELLUX_HISTFILE", dir.path().join("history"))
         .current_dir(dir.path());
     let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
@@ -1252,7 +1257,7 @@ fn background_start_waits_for_foreground_and_restores_parent_terminal() {
     let parent_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     session
         .send_line(
-            "PS1='$ ' \"$SO1SH_BIN\" & child=$!; echo $child > child; wait $child; echo waited:$?",
+            "PS1='$ ' \"$SHELLUX_BIN\" & child=$!; echo $child > child; wait $child; echo waited:$?",
         )
         .unwrap();
     let deadline = pty_deadline();
@@ -1296,15 +1301,15 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
     let _pty_test_guard = serialize_pty_test();
     use std::os::unix::process::CommandExt;
     let dir = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         // Keep the historical literal prompt; default-prompt tests unset PS1.
         .env("PS1", "$ ")
-        .env("SO1SH_BANNER", "0")
+        .env("SHELLUX_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
-        .env("SO1SH_HIGHLIGHT", "0")
+        .env("SHELLUX_HIGHLIGHT", "0")
         .env("HOME", dir.path())
         .current_dir(dir.path());
     // SAFETY: child-only async-signal-safe detachment; keep stdin's tty fd open.
@@ -1327,7 +1332,7 @@ fn missing_controlling_terminal_reports_once_and_keeps_repl_working() {
     }
     let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
-    session.exp_string("so1sh: terminal:").unwrap();
+    session.exp_string("shellux: terminal:").unwrap();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "echo after");
     assert_no_output(&session.exp_string("after\r\n").unwrap());
@@ -1349,12 +1354,12 @@ fn background_startup_saves_modes_after_foreground_permission() {
         .env("TERM", "dumb")
         .env("HOME", dir.path())
         .env("PS1", "parent> ")
-        .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
+        .env("SHELLUX_BIN", env!("CARGO_BIN_EXE_shellux"))
         .current_dir(dir.path());
     let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
     session.exp_string("parent> ").unwrap();
-    session.send_line("stty -icanon; PS1='$ ' \"$SO1SH_BIN\" & child=$!; echo $child > child; wait $child; stty icanon; echo ready-for-fg").unwrap();
+    session.send_line("stty -icanon; PS1='$ ' \"$SHELLUX_BIN\" & child=$!; echo $child > child; wait $child; stty icanon; echo ready-for-fg").unwrap();
     let deadline = pty_deadline();
     let pid = loop {
         if let Ok(raw) = std::fs::read_to_string(dir.path().join("child"))
@@ -1368,7 +1373,7 @@ fn background_startup_saves_modes_after_foreground_permission() {
     let mut child = TestJobs(vec![pid]);
     session.exp_string("ready-for-fg\r\n").unwrap();
     session.exp_string("parent> ").unwrap();
-    // The parent changed modes while so1sh was stopped in its acquisition loop.
+    // The parent changed modes while shellux was stopped in its acquisition loop.
     session.send_line("fg").unwrap();
     session.exp_string("$ ").unwrap();
     submit(&mut session, "stty -a");
@@ -1393,10 +1398,10 @@ fn orphaned_background_startup_falls_back_without_spinning() {
     let _pty_test_guard = serialize_pty_test();
     use std::os::fd::AsRawFd;
     const NAME: &str = "orphaned_background_startup_falls_back_without_spinning";
-    if std::env::var("SO1SH_ORPHAN_TEST").as_deref() != Ok(NAME) {
+    if std::env::var("SHELLUX_ORPHAN_TEST").as_deref() != Ok(NAME) {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", NAME, "--nocapture"])
-            .env("SO1SH_ORPHAN_TEST", NAME)
+            .env("SHELLUX_ORPHAN_TEST", NAME)
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -1425,7 +1430,7 @@ fn orphaned_background_startup_falls_back_without_spinning() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("rc"),
-        "/bin/sh -c 'owner=$(/bin/ps -o tpgid= -p $$); test \"$owner\" -eq \"$SO1SH_PARENT_PGID\"' || exit 9\nexit 3\n",
+        "/bin/sh -c 'owner=$(/bin/ps -o tpgid= -p $$); test \"$owner\" -eq \"$SHELLUX_PARENT_PGID\"' || exit 9\nexit 3\n",
     )
     .unwrap();
     let mut command = Command::new("/bin/sh");
@@ -1436,8 +1441,8 @@ fn orphaned_background_startup_falls_back_without_spinning() {
         .env("TERM", "dumb")
         .env("HOME", dir.path())
         .env("PS1", "parent> ")
-        .env("SO1SH_BIN", env!("CARGO_BIN_EXE_so1sh"))
-        .env("SO1SH_RC", dir.path().join("rc"))
+        .env("SHELLUX_BIN", env!("CARGO_BIN_EXE_shellux"))
+        .env("SHELLUX_RC", dir.path().join("rc"))
         .current_dir(dir.path());
     let mut session = spawn_pty(command);
     session.process_mut().set_kill_timeout(Some(1000));
@@ -1445,13 +1450,13 @@ fn orphaned_background_startup_falls_back_without_spinning() {
     let tty = session.process().get_file_handle().unwrap();
     let owner = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
     session
-        .send_line(&format!("export SO1SH_PARENT_PGID={owner}"))
+        .send_line(&format!("export SHELLUX_PARENT_PGID={owner}"))
         .unwrap();
     session.exp_string("parent> ").unwrap();
     let started = std::time::Instant::now();
-    // The subshell exits before the background job starts so1sh. Its new parent
+    // The subshell exits before the background job starts shellux. Its new parent
     // (this subreaper) belongs to another session, making its group orphaned.
-    session.send_line("( /bin/sh -c 'while [ ! -e ready ]; do /bin/sleep 0.01; done; exec \"$SO1SH_BIN\"' </dev/tty >/dev/tty 2>&1 & echo $! > child ); : > ready").unwrap();
+    session.send_line("( /bin/sh -c 'while [ ! -e ready ]; do /bin/sleep 0.01; done; exec \"$SHELLUX_BIN\"' </dev/tty >/dev/tty 2>&1 & echo $! > child ); : > ready").unwrap();
     let deadline = started + pty_test_timeout();
     let pid = loop {
         if let Ok(raw) = std::fs::read_to_string(dir.path().join("child"))
@@ -1464,7 +1469,7 @@ fn orphaned_background_startup_falls_back_without_spinning() {
     };
     let mut orphan = Orphan(pid);
     assert_ne!(unsafe { libc::getpgid(pid) }, owner);
-    if let Err(error) = session.exp_string("so1sh: terminal:") {
+    if let Err(error) = session.exp_string("shellux: terminal:") {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
         unsafe { libc::kill(pid, libc::SIGKILL) };
         assert_eq!(
@@ -1506,20 +1511,20 @@ mod startup_rc {
     use std::os::unix::ffi::OsStrExt;
 
     fn session(dir: &TempDir, rc: Option<&OsStr>, home: Option<&OsStr>) -> PtySession {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
         command
             .env_clear()
             // Keep the historical literal prompt; default-prompt tests unset PS1.
             .env("PS1", "$ ")
-            .env("SO1SH_BANNER", "0")
+            .env("SHELLUX_BANNER", "0")
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
-            .env("SO1SH_SHELL_INTEGRATION", "0")
-            .env("SO1SH_HIGHLIGHT", "0")
-            .env("SO1SH_HISTFILE", dir.path().join("history"))
+            .env("SHELLUX_SHELL_INTEGRATION", "0")
+            .env("SHELLUX_HIGHLIGHT", "0")
+            .env("SHELLUX_HISTFILE", dir.path().join("history"))
             .current_dir(dir.path());
         if let Some(rc) = rc {
-            command.env("SO1SH_RC", rc);
+            command.env("SHELLUX_RC", rc);
         }
         if let Some(home) = home {
             command.env("HOME", home);
@@ -1535,7 +1540,7 @@ mod startup_rc {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(
-            dir.path().join(".so1shrc"),
+            dir.path().join(".shelluxrc"),
             "PS1='rc> '; PS2='rc-more> '; x=5; cd sub\n",
         )
         .unwrap();
@@ -1568,7 +1573,7 @@ mod startup_rc {
             .join(OsStr::from_bytes(b"rc '; echo injected; # \xff"));
         std::fs::write(&rc, "greet() { echo from-rc; }\n").unwrap();
         // The explicit file overrides the default, even with shell metacharacters.
-        std::fs::write(dir.path().join(".so1shrc"), "echo wrong-file; exit 9\n").unwrap();
+        std::fs::write(dir.path().join(".shelluxrc"), "echo wrong-file; exit 9\n").unwrap();
         let mut session = session(&dir, Some(rc.as_os_str()), Some(dir.path().as_os_str()));
         assert_no_output(&session.exp_string("$ ").unwrap());
         submit(&mut session, "greet");
@@ -1589,20 +1594,20 @@ mod startup_rc {
             "PS1='path> '; echo path-rc\n",
         )
         .unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
         command
             .env_clear()
             // Keep the historical literal prompt; default-prompt tests unset PS1.
             .env("PS1", "$ ")
-            .env("SO1SH_BANNER", "0")
+            .env("SHELLUX_BANNER", "0")
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", path_dir.path().display()),
             )
             .env("TERM", "dumb")
-            .env("SO1SH_HIGHLIGHT", "0")
+            .env("SHELLUX_HIGHLIGHT", "0")
             .env("HOME", dir.path())
-            .env("SO1SH_RC", "rcfile")
+            .env("SHELLUX_RC", "rcfile")
             .current_dir(&dir);
         let mut session = spawn_pty(command);
         session.process_mut().set_kill_timeout(Some(1000));
@@ -1649,7 +1654,7 @@ mod startup_rc {
         let _pty_test_guard = serialize_pty_test();
         let dir = tempfile::tempdir().unwrap();
         let rc = dir.path().join("missing-rc");
-        std::fs::write(dir.path().join(".so1shrc"), "exit 9\n").unwrap();
+        std::fs::write(dir.path().join(".shelluxrc"), "exit 9\n").unwrap();
         error_then_prompt(
             session(&dir, Some(rc.as_os_str()), Some(dir.path().as_os_str())),
             ".:",
@@ -1690,7 +1695,7 @@ mod startup_rc {
         submit(&mut absent, "exit");
         exited(&mut absent, 0);
         // A local dotfile must not be sourced through a relative empty HOME.
-        std::fs::write(dir.path().join(".so1shrc"), "exit 9\n").unwrap();
+        std::fs::write(dir.path().join(".shelluxrc"), "exit 9\n").unwrap();
         for home in [None, Some(OsStr::new(""))] {
             let mut session = session(&dir, Some(OsStr::new("")), home);
             assert_no_output(&session.exp_string("$ ").unwrap());
@@ -1820,11 +1825,14 @@ fn interactive_wait_preserves_background_exit_statuses() {
 }
 
 #[test]
-fn backgrounded_so1sh_can_acquire_tty_after_sigttin_timeout_window() {
+fn backgrounded_shellux_can_acquire_tty_after_sigttin_timeout_window() {
     let _pty_test_guard = serialize_pty_test();
     let (mut session, _dir) = session();
     session.exp_string("$ ").unwrap();
-    submit(&mut session, &format!("{} &", env!("CARGO_BIN_EXE_so1sh")));
+    submit(
+        &mut session,
+        &format!("{} &", env!("CARGO_BIN_EXE_shellux")),
+    );
     let launch = session.exp_string("$ ").unwrap();
     let pgid = background_pgid(launch.as_bytes());
     let mut cleanup = ProcessGroupCleanup::new(pgid);
@@ -1838,7 +1846,7 @@ fn backgrounded_so1sh_can_acquire_tty_after_sigttin_timeout_window() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "nested so1sh did not stop for SIGTTIN: {listing:?}"
+            "nested shellux did not stop for SIGTTIN: {listing:?}"
         );
         std::thread::yield_now();
     }
@@ -2449,17 +2457,17 @@ fn tab_lists_multiple_file_matches() {
 fn history_hint_is_visible_and_right_arrow_accepts_it() {
     let _pty_test_guard = serialize_pty_test();
     let dir = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         // Keep the historical literal prompt; default-prompt tests unset PS1.
         .env("PS1", "$ ")
-        .env("SO1SH_BANNER", "0")
+        .env("SHELLUX_BANNER", "0")
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb")
-        .env("SO1SH_SHELL_INTEGRATION", "0")
-        .env("SO1SH_HIGHLIGHT", "1")
-        .env("SO1SH_HISTFILE", dir.path().join("history"))
+        .env("SHELLUX_SHELL_INTEGRATION", "0")
+        .env("SHELLUX_HIGHLIGHT", "1")
+        .env("SHELLUX_HISTFILE", dir.path().join("history"))
         .env("HOME", dir.path())
         .current_dir(dir.path());
     let mut session = spawn_pty(command);
@@ -2668,16 +2676,16 @@ mod prompt_expansion {
 
     /// A session whose PS1 is unset, so the default prompt is shown uncolored.
     fn default_prompt_session(dir: &TempDir) -> PtySession {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
-            .env("SO1SH_BANNER", "0")
-            .env("SO1SH_SHELL_INTEGRATION", "0")
-            .env("SO1SH_KITTY_KEYBOARD", "0")
-            .env("SO1SH_HIGHLIGHT", "0")
+            .env("SHELLUX_BANNER", "0")
+            .env("SHELLUX_SHELL_INTEGRATION", "0")
+            .env("SHELLUX_KITTY_KEYBOARD", "0")
+            .env("SHELLUX_HIGHLIGHT", "0")
             .env("HOME", dir.path())
             .current_dir(dir.path());
         let mut session = spawn_pty(command);
@@ -2757,27 +2765,27 @@ mod prompt_expansion {
 mod startup_banner {
     use super::*;
 
-    /// A session with `SO1SH_BANNER` left unset unless `banner` is given.
+    /// A session with `SHELLUX_BANNER` left unset unless `banner` is given.
     fn banner_session(dir: &TempDir, banner: Option<&str>, rc: Option<&str>) -> PtySession {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
             .env("PS1", "$ ")
-            .env("SO1SH_SHELL_INTEGRATION", "0")
-            .env("SO1SH_KITTY_KEYBOARD", "0")
-            .env("SO1SH_HIGHLIGHT", "0")
+            .env("SHELLUX_SHELL_INTEGRATION", "0")
+            .env("SHELLUX_KITTY_KEYBOARD", "0")
+            .env("SHELLUX_HIGHLIGHT", "0")
             .env("HOME", dir.path())
             .current_dir(dir.path());
         if let Some(value) = banner {
-            command.env("SO1SH_BANNER", value);
+            command.env("SHELLUX_BANNER", value);
         }
         if let Some(text) = rc {
             let path = dir.path().join("banner.rc");
             std::fs::write(&path, text).unwrap();
-            command.env("SO1SH_RC", path);
+            command.env("SHELLUX_RC", path);
         }
         let mut session = spawn_pty(command);
         session.process_mut().set_kill_timeout(Some(1000));
@@ -2789,7 +2797,7 @@ mod startup_banner {
         let _pty_test_guard = serialize_pty_test();
         let dir = TempDir::new().unwrap();
         let mut session = banner_session(&dir, None, None);
-        let before = session.exp_string("Shell:  so1sh").unwrap();
+        let before = session.exp_string("Shell:  shellux").unwrap();
         assert!(
             !before.contains("$ "),
             "banner precedes the prompt: {before:?}"
@@ -2800,9 +2808,9 @@ mod startup_banner {
     }
 
     #[test]
-    fn so1sh_banner_zero_from_the_environment_or_rc_suppresses_the_banner() {
+    fn shellux_banner_zero_from_the_environment_or_rc_suppresses_the_banner() {
         let _pty_test_guard = serialize_pty_test();
-        for (env, rc) in [(Some("0"), None), (None, Some("SO1SH_BANNER=0\n"))] {
+        for (env, rc) in [(Some("0"), None), (None, Some("SHELLUX_BANNER=0\n"))] {
             let dir = TempDir::new().unwrap();
             let mut session = banner_session(&dir, env, rc);
             submit(&mut session, "echo banner-check");
@@ -2820,7 +2828,7 @@ mod startup_banner {
         let mut session = banner_session(&dir, Some("0"), None);
         session.exp_string("$ ").unwrap();
         submit(&mut session, "sysinfo; echo status=$?");
-        session.exp_string("Shell:  so1sh").unwrap();
+        session.exp_string("Shell:  shellux").unwrap();
         session.exp_string("status=0").unwrap();
         submit(&mut session, "exit");
         exited(&mut session, 0);
@@ -2830,28 +2838,28 @@ mod startup_banner {
 mod command_policy {
     use super::*;
 
-    /// Start so1sh with `SO1SH_POLICY` pointing at `policy_path`.
+    /// Start shellux with `SHELLUX_POLICY` pointing at `policy_path`.
     fn session_with_policy_path(
         dir: &TempDir,
         policy_path: &std::path::Path,
         rc: Option<&str>,
     ) -> PtySession {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
         command
             .env_clear()
             .env("PS1", "$ ")
-            .env("SO1SH_BANNER", "0")
+            .env("SHELLUX_BANNER", "0")
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
-            .env("SO1SH_SHELL_INTEGRATION", "0")
-            .env("SO1SH_KITTY_KEYBOARD", "0")
-            .env("SO1SH_HIGHLIGHT", "0")
+            .env("SHELLUX_SHELL_INTEGRATION", "0")
+            .env("SHELLUX_KITTY_KEYBOARD", "0")
+            .env("SHELLUX_HIGHLIGHT", "0")
             .env("HOME", dir.path())
-            .env("SO1SH_POLICY", policy_path)
+            .env("SHELLUX_POLICY", policy_path)
             .current_dir(dir.path());
         if let Some(rc) = rc {
             std::fs::write(dir.path().join("rc"), rc).unwrap();
-            command.env("SO1SH_RC", dir.path().join("rc"));
+            command.env("SHELLUX_RC", dir.path().join("rc"));
         }
         let mut session = spawn_pty(command);
         session.process_mut().set_kill_timeout(Some(1000));
@@ -2911,7 +2919,7 @@ mod command_policy {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().canonicalize().unwrap().join("work");
         std::fs::create_dir_all(work.join("sub")).unwrap();
-        // so1sh starts in `dir`; after `cd work` only shell-cwd resolution
+        // shellux starts in `dir`; after `cd work` only shell-cwd resolution
         // (with `..` normalization) turns `sub/../blocked` into this target.
         let policy = format!("default allow\ndeny write {}/blocked\n", work.display());
         let mut session = policy_session(&dir, &policy, None);
@@ -2990,7 +2998,7 @@ mod command_policy {
         let path = dir.path().join("policy");
         session
             .exp_string(&format!(
-                "so1sh: policy {}:2: unknown rule kind `everything`; expected `command` or `write`",
+                "shellux: policy {}:2: unknown rule kind `everything`; expected `command` or `write`",
                 path.display()
             ))
             .unwrap();
@@ -3005,7 +3013,7 @@ mod command_policy {
         let missing = dir.path().join("missing");
         let mut session = session_with_policy_path(&dir, &missing, None);
         session
-            .exp_string(&format!("so1sh: policy {}: ", missing.display()))
+            .exp_string(&format!("shellux: policy {}: ", missing.display()))
             .unwrap();
         exited(&mut session, 2);
     }
@@ -3039,7 +3047,7 @@ mod aliases {
         submit(&mut session, "exit");
         exited(&mut session, 0);
         // History keeps the line as typed, not its expansion.
-        let history = std::fs::read_to_string(dir.path().join(".so1sh_history")).unwrap();
+        let history = std::fs::read_to_string(dir.path().join(".shellux_history")).unwrap();
         assert!(history.contains("greet world; echo greet"), "{history:?}");
         assert!(!history.contains("echo hello world"), "{history:?}");
     }
@@ -3072,20 +3080,20 @@ mod aliases {
         let (mut session, dir) = {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(
-                dir.path().join(".so1shrc"),
+                dir.path().join(".shelluxrc"),
                 "alias rcgreet='echo from-rc'\n",
             )
             .unwrap();
-            let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
             command
                 .env_clear()
                 .env("PS1", "$ ")
-                .env("SO1SH_BANNER", "0")
+                .env("SHELLUX_BANNER", "0")
                 .env("PATH", "/usr/bin:/bin")
                 .env("TERM", "dumb")
-                .env("SO1SH_SHELL_INTEGRATION", "0")
-                .env("SO1SH_KITTY_KEYBOARD", "0")
-                .env("SO1SH_HIGHLIGHT", "0")
+                .env("SHELLUX_SHELL_INTEGRATION", "0")
+                .env("SHELLUX_KITTY_KEYBOARD", "0")
+                .env("SHELLUX_HIGHLIGHT", "0")
                 .env("HOME", dir.path())
                 .current_dir(dir.path());
             (spawn_pty(command), dir)

@@ -283,8 +283,8 @@ impl SystemInfo {
             .map(parse_os_release)
             .unwrap_or_default();
         let var = |name: &str| env(name).filter(|value| !value.is_empty());
-        let terminal = if var("SO1TERM_SOCKET").is_some() {
-            Some("so1term".to_string())
+        let terminal = if var("NULIX_SOCKET").is_some() {
+            Some("nulix".to_string())
         } else {
             var("TERM_PROGRAM").or_else(|| var("TERM"))
         };
@@ -295,7 +295,7 @@ impl SystemInfo {
             os_id: os.id,
             os_id_like: os.id_like,
             kernel: sources.kernel.clone().filter(|kernel| !kernel.is_empty()),
-            shell: format!("so1sh {}", env!("CARGO_PKG_VERSION")),
+            shell: format!("shellux {}", env!("CARGO_PKG_VERSION")),
             terminal,
             cpu: sources.cpuinfo.as_deref().and_then(parse_cpuinfo),
             ram: sources.meminfo.as_deref().and_then(parse_meminfo),
@@ -371,7 +371,7 @@ pub(crate) fn render_banner(info: &SystemInfo, color: bool) -> String {
     out
 }
 
-/// The startup banner is shown unless `SO1SH_BANNER` is exactly `0`.
+/// The startup banner is shown unless `SHELLUX_BANNER` is exactly `0`.
 pub(crate) fn banner_enabled(value: Option<&str>) -> bool {
     value != Some("0")
 }
@@ -397,10 +397,10 @@ pub fn register_sysinfo_builtin(shell: &mut Shell) -> Result<(), String> {
     })
 }
 
-/// Print the startup banner unless the shell variable `SO1SH_BANNER` is `0`.
+/// Print the startup banner unless the shell variable `SHELLUX_BANNER` is `0`.
 /// Call after the rc file has been sourced so the rc can disable it.
 pub fn show_startup_banner(shell: &Shell) {
-    if banner_enabled(shell.get_var("SO1SH_BANNER")) {
+    if banner_enabled(shell.get_var("SHELLUX_BANNER")) {
         shell.write_stdout(shell_banner(shell).as_bytes());
     }
 }
@@ -587,7 +587,7 @@ mod tests {
     fn fixture_env(name: &str) -> Option<String> {
         match name {
             "USER" => Some("yimy".to_string()),
-            "SO1TERM_SOCKET" => Some("/run/user/1000/so1term/so1term-1.sock".to_string()),
+            "NULIX_SOCKET" => Some("/run/user/1000/nulix/nulix-1.sock".to_string()),
             "TERM" => Some("xterm-256color".to_string()),
             _ => None,
         }
@@ -689,15 +689,15 @@ mod tests {
         );
         assert_eq!(info.os_id.as_deref(), Some("debian"));
         assert_eq!(info.kernel.as_deref(), Some("6.12.113+deb13-amd64"));
-        assert_eq!(info.shell, format!("so1sh {}", env!("CARGO_PKG_VERSION")));
-        assert_eq!(info.terminal.as_deref(), Some("so1term"));
+        assert_eq!(info.shell, format!("shellux {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(info.terminal.as_deref(), Some("nulix"));
         assert_eq!(info.uptime_seconds, Some(11520));
         assert!(info.cpu.is_some() && info.ram.is_some() && info.disk.is_some());
 
         let term_program = |name: &str| match name {
             "TERM_PROGRAM" => Some("WezTerm".to_string()),
             "TERM" => Some("xterm".to_string()),
-            "SO1TERM_SOCKET" => Some(String::new()),
+            "NULIX_SOCKET" => Some(String::new()),
             _ => None,
         };
         let info = SystemInfo::from_sources(&Sources::default(), &term_program);
@@ -719,8 +719,8 @@ mod tests {
             "--------------",
             "OS:     Debian GNU/Linux 13 (trixie)",
             "Kernel: 6.12.113+deb13-amd64",
-            &format!("Shell:  so1sh {}", env!("CARGO_PKG_VERSION")),
-            "Term:   so1term",
+            &format!("Shell:  shellux {}", env!("CARGO_PKG_VERSION")),
+            "Term:   nulix",
             "CPU:    AMD Ryzen 5 5600 6-Core Processor (3)",
             "RAM:    5.2 GiB / 15.5 GiB (34%)",
             "Disk /: 120.0 GiB / 457.0 GiB (26%)",
@@ -741,7 +741,7 @@ mod tests {
     fn sysinfo_omits_unreadable_fields() {
         let info = SystemInfo::from_sources(&Sources::default(), &no_env);
         let banner = render_banner(&info, false);
-        assert!(banner.contains("Shell:  so1sh"));
+        assert!(banner.contains("Shell:  shellux"));
         for label in [
             "OS:", "Kernel:", "Term:", "CPU:", "RAM:", "Disk /:", "Uptime:", "---",
         ] {
@@ -767,21 +767,21 @@ mod tests {
     }
 
     #[test]
-    fn sysinfo_startup_banner_respects_so1sh_banner_variable() {
+    fn sysinfo_startup_banner_respects_shellux_banner_variable() {
         let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut shell = Shell::builder()
             .env_clear()
             .stdout_sink(sink.clone())
             .build();
-        shell.set_var("SO1SH_BANNER", "0").unwrap();
+        shell.set_var("SHELLUX_BANNER", "0").unwrap();
         show_startup_banner(&shell);
         assert!(sink.lock().unwrap().is_empty());
 
-        shell.set_var("SO1SH_BANNER", "1").unwrap();
+        shell.set_var("SHELLUX_BANNER", "1").unwrap();
         shell.set_var("NO_COLOR", "1").unwrap();
         show_startup_banner(&shell);
         let output = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("Shell:  so1sh"), "{output}");
+        assert!(output.contains("Shell:  shellux"), "{output}");
         assert!(!output.contains('\u{1b}'));
     }
 
@@ -796,7 +796,7 @@ mod tests {
         shell.set_var("NO_COLOR", "1").unwrap();
         assert_eq!(shell.run_script("sysinfo"), ExitStatus::SUCCESS.code());
         let output = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("Shell:  so1sh"), "{output}");
+        assert!(output.contains("Shell:  shellux"), "{output}");
         assert!(!output.contains('\u{1b}'));
         assert_eq!(shell.run_script("command -v sysinfo"), 0);
     }

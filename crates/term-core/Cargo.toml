@@ -1,11 +1,11 @@
 [package]
-name = "so1-term-core"
+name = "nulix-core"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
 [lib]
-name = "so1_term_core"
+name = "nulix_core"
 
 [dependencies]
 alacritty_terminal = "0.26"

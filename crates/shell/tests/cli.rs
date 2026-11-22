@@ -4,7 +4,7 @@ use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 fn command(dir: &TempDir) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -104,14 +104,14 @@ fn non_interactive_modes_ignore_startup_rc_files() {
     let dir = tempfile::tempdir().unwrap();
     let rc = dir.path().join("rc");
     std::fs::write(&rc, "echo forbidden; exit 42\n").unwrap();
-    std::fs::write(dir.path().join(".so1shrc"), "echo forbidden; exit 42\n").unwrap();
+    std::fs::write(dir.path().join(".shelluxrc"), "echo forbidden; exit 42\n").unwrap();
     std::fs::write(dir.path().join("script.sh"), "echo script\n").unwrap();
     for explicit in [false, true] {
         let configured = || {
             let mut command = command(&dir);
             command.env("HOME", dir.path());
             if explicit {
-                command.env("SO1SH_RC", &rc);
+                command.env("SHELLUX_RC", &rc);
             }
             command
         };
@@ -150,7 +150,7 @@ fn non_interactive_modes_ignore_command_policy() {
     for policy in [deny_all.as_os_str(), "missing-policy".as_ref()] {
         let configured = || {
             let mut command = command(&dir);
-            command.env("SO1SH_POLICY", policy);
+            command.env("SHELLUX_POLICY", policy);
             command
         };
         assert_output(

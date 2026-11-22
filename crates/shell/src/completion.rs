@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use crate::aliases::{Aliases, SharedAliases, lock};
 use epsh::builtins::BUILTIN_NAMES;
 use epsh::eval::Shell;
 use epsh::lexer::{Lexer, Token};
@@ -17,6 +18,15 @@ pub(crate) struct CompletionContext {
 }
 
 impl CompletionContext {
+    /// Context with alias names counted as commands (see `crate::aliases`).
+    pub(crate) fn from_shell_and_aliases(shell: &Shell, aliases: &Aliases) -> Self {
+        let mut context = Self::from_shell(shell);
+        context
+            .command_names
+            .extend(aliases.names().map(str::to_owned));
+        context
+    }
+
     pub(crate) fn from_shell(shell: &Shell) -> Self {
         let cwd = shell.cwd().to_path_buf();
         let path = shell
@@ -66,24 +76,31 @@ impl CompletionContext {
 }
 
 #[derive(Clone)]
-pub(crate) struct CompletionState(Arc<RwLock<CompletionContext>>);
+pub(crate) struct CompletionState {
+    context: Arc<RwLock<CompletionContext>>,
+    aliases: SharedAliases,
+}
 
 impl CompletionState {
-    pub(crate) fn new(shell: &Shell) -> Self {
-        Self(Arc::new(RwLock::new(CompletionContext::from_shell(shell))))
+    pub(crate) fn new(shell: &Shell, aliases: SharedAliases) -> Self {
+        let context = CompletionContext::from_shell_and_aliases(shell, &lock(&aliases));
+        Self {
+            context: Arc::new(RwLock::new(context)),
+            aliases,
+        }
     }
 
     pub(crate) fn refresh(&self, shell: &Shell) {
+        let context = CompletionContext::from_shell_and_aliases(shell, &lock(&self.aliases));
         *self
-            .0
+            .context
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            CompletionContext::from_shell(shell);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = context;
     }
 
     pub(crate) fn with_context<T>(&self, use_context: impl FnOnce(&CompletionContext) -> T) -> T {
         let context = self
-            .0
+            .context
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         use_context(&context)
@@ -102,12 +119,8 @@ impl ShellCompleter {
 
 impl Completer for ShellCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let context = self
-            .state
-            .0
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        CompletionResult::fresh(complete(line, pos, &context))
+        self.state
+            .with_context(|context| CompletionResult::fresh(complete(line, pos, context)))
     }
 }
 
@@ -612,5 +625,18 @@ mod tests {
         assert!(context.resolves_command("host_job"));
         assert!(context.variables.contains(&"PROJECT_ROOT".to_owned()));
         assert_eq!(values(complete("uni", 3, &context)), vec!["unique-tool"]);
+    }
+
+    #[test]
+    fn alias_names_complete_as_commands() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.set_var("PATH", "").unwrap();
+        let aliases = crate::aliases::register(&mut shell).unwrap();
+        shell.run_script("alias zzgreet='echo hi'");
+        let context =
+            CompletionContext::from_shell_and_aliases(&shell, &crate::aliases::lock(&aliases));
+        assert!(context.resolves_command("zzgreet"));
+        assert_eq!(values(complete("zzg", 3, &context)), vec!["zzgreet"]);
+        assert!(values(complete("echo zzg", 8, &context)).is_empty());
     }
 }

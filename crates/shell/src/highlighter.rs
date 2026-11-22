@@ -448,4 +448,18 @@ mod tests {
         assert_eq!(plain_text(&styled), incomplete);
         assert_eq!(style_at(&styled, incomplete, "echo").0, None);
     }
+
+    #[test]
+    fn syntax_highlighter_colors_alias_names_as_valid_commands() {
+        let mut shell = Shell::builder().env_clear().build();
+        shell.set_var("PATH", "").unwrap();
+        let aliases = crate::aliases::register(&mut shell).unwrap();
+        shell.run_script("alias zzgreet='echo hi'");
+        let context =
+            CompletionContext::from_shell_and_aliases(&shell, &crate::aliases::lock(&aliases));
+        let source = "zzgreet x; echo zzgreet";
+        let styled = highlight_line(source, &context);
+        assert_eq!(plain_text(&styled), source);
+        assert_eq!(style_at(&styled, source, "zzgreet").0, Some(Color::Green));
+    }
 }

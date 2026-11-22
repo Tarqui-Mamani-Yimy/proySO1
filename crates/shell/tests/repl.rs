@@ -3010,3 +3010,126 @@ mod command_policy {
         exited(&mut session, 2);
     }
 }
+
+mod aliases {
+    use super::*;
+
+    #[test]
+    fn alias_defined_at_the_prompt_expands_only_typed_command_names() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, dir) = session();
+        std::fs::write(dir.path().join("sourced"), "greet from-dot\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "alias greet='echo hello'");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "greet world; echo greet");
+        assert_no_output(&session.exp_string("hello world\r\n").unwrap());
+        session.exp_string("greet\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        // Files sourced with '.' are never alias-expanded.
+        submit(&mut session, ". ./sourced; echo status=$?");
+        let output = session.exp_string("status=127\r\n").unwrap();
+        assert!(!output.contains("hello"), "{output:?}");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "unalias greet");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "greet; echo status=$?");
+        session.exp_string("status=127\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+        // History keeps the line as typed, not its expansion.
+        let history = std::fs::read_to_string(dir.path().join(".so1sh_history")).unwrap();
+        assert!(history.contains("greet world; echo greet"), "{history:?}");
+        assert!(!history.contains("echo hello world"), "{history:?}");
+    }
+
+    #[test]
+    fn alias_listing_is_sorted_and_quoted() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "alias b=\"it's\" a='echo a'");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "alias");
+        assert_no_output(
+            &session
+                .exp_string("alias a='echo a'\r\nalias b='it'\\''s'\r\n")
+                .unwrap(),
+        );
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "alias nope; echo status=$?");
+        session.exp_string("alias: nope: not found\r\n").unwrap();
+        session.exp_string("status=1\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn alias_from_the_rc_file_works_at_the_prompt() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, dir) = {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(".so1shrc"),
+                "alias rcgreet='echo from-rc'\n",
+            )
+            .unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_so1sh"));
+            command
+                .env_clear()
+                .env("PS1", "$ ")
+                .env("SO1SH_BANNER", "0")
+                .env("PATH", "/usr/bin:/bin")
+                .env("TERM", "dumb")
+                .env("SO1SH_SHELL_INTEGRATION", "0")
+                .env("SO1SH_KITTY_KEYBOARD", "0")
+                .env("SO1SH_HIGHLIGHT", "0")
+                .env("HOME", dir.path())
+                .current_dir(dir.path());
+            (spawn_pty(command), dir)
+        };
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "rcgreet ok");
+        assert_no_output(&session.exp_string("from-rc ok\r\n").unwrap());
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+        drop(dir);
+    }
+
+    #[test]
+    fn alias_expands_in_multiline_continuation_input() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "alias greet='echo hello'");
+        session.exp_string("$ ").unwrap();
+        session.send_line("if true; then").unwrap();
+        session.exp_string("> ").unwrap();
+        submit(&mut session, "greet multiline");
+        session.exp_string("> ").unwrap();
+        submit(&mut session, "fi");
+        session.exp_string("\r\nhello multiline\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+
+    #[test]
+    fn syntax_errors_without_aliases_keep_epsh_diagnostics() {
+        let _pty_test_guard = serialize_pty_test();
+        let (mut session, _dir) = session();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "alias greet='echo hello'");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "fi");
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "echo status=$?");
+        session.exp_string("status=2\r\n").unwrap();
+        session.exp_string("$ ").unwrap();
+        submit(&mut session, "exit");
+        exited(&mut session, 0);
+    }
+}

@@ -1,3 +1,4 @@
+mod aliases;
 mod completion;
 mod highlighter;
 mod history_hint;

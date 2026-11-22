@@ -173,6 +173,8 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         .map_err(|error| io::Error::other(format!("so1sh: jobs builtin: {error}")))?;
     crate::sysinfo::register_sysinfo_builtin(shell)
         .map_err(|error| io::Error::other(format!("so1sh: sysinfo builtin: {error}")))?;
+    let aliases = crate::aliases::register(shell)
+        .map_err(|error| io::Error::other(format!("so1sh: alias builtins: {error}")))?;
     shell.suppress_repl_stopped_diagnostic(true);
     let terminal = match crate::terminal::Terminal::acquire() {
         Ok(terminal) => Some(terminal),
@@ -202,7 +204,7 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
     }
     // After the rc file, so it can set SO1SH_BANNER=0; before the first prompt.
     crate::sysinfo::show_startup_banner(shell);
-    let completion_state = CompletionState::new(shell);
+    let completion_state = CompletionState::new(shell, aliases.clone());
     let completion_menu = Box::new(ColumnarMenu::default().with_name("shell_completion_menu"));
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
@@ -277,7 +279,9 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
                 {
                     report_integration_error(error, &mut integration_failure_reported);
                 }
-                let result = shell.eval_repl_line(&source);
+                // History keeps the typed line; only epsh sees the expansion.
+                let expanded = crate::aliases::lock(&aliases).expand(&source);
+                let result = shell.eval_repl_line(&expanded);
                 crate::jobs::sync(shell, &jobs);
                 if let Some(terminal) = &terminal {
                     terminal.reclaim()?;

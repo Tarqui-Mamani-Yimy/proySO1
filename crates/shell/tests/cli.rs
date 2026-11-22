@@ -178,3 +178,17 @@ fn non_interactive_modes_ignore_command_policy() {
         assert_output(child.wait_with_output().unwrap(), 0, b"piped\n");
     }
 }
+
+#[test]
+fn command_string_does_not_expand_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = command(&dir)
+        .args(["-c", "alias ll=\"echo hi\"; ll"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("hi"),
+        "{output:?}"
+    );
+}

@@ -64,6 +64,22 @@ file and before the first prompt, an interactive session prints a system banner
 user@host, OS, kernel, shell, terminal, CPU, RAM, disk usage of `/` and uptime;
 unreadable fields are omitted). `SO1SH_BANNER=0`, set in the environment or the
 rc file, disables it; the `sysinfo` builtin prints it on demand.
+Aliases live only in the interactive shell (epsh stays alias-free): `alias` lists
+`alias name='value'` sorted by name, `alias name` prints one, `alias name=value`
+defines, and `unalias name...`/`unalias -a` remove; unknown names report
+`alias: name: not found` (or `unalias: ...`) with status 1, and names outside the
+POSIX alias characters (letters, digits, `_ ! % , @`) report
+`alias: invalid alias name: NAME`. Each line typed at the prompt (PS2 continuation
+lines included) is expanded before epsh parses it: only an unquoted literal word in
+command-name position (line start, after `; & | && || (`, a newline, or `if then
+else elif do while until { !`), never quoted or escaped words, `$(...)`, comments or
+here-document bodies. An alias is not re-expanded inside its own expansion, and a
+value ending in a blank makes the next word a candidate. A whole line is expanded
+before it runs, so `unalias x; x` still expands `x`. History keeps the typed line;
+rc-file definitions apply at later prompts, but files sourced with `.` (including
+the rc file itself) are never expanded. Alias names complete and highlight as
+commands. The builtins are registered by the REPL only, so `-c`, scripts and piped
+input neither define nor expand aliases.
 `fg %n` resumes a job in the foreground and `bg %n` in the background; before each
 prompt so1sh reports changed background jobs (`[n]+ Done/Stopped/Killed`), and
 `exit` with stopped jobs warns once. `exec CMD` replaces the shell with CMD and
@@ -93,6 +109,7 @@ crates/shell/
   src/repl.rs     Startup rc, reedline editor, validator, prompts and history
   src/terminal.rs Interactive-only process group, signal policy and tty modes
   src/jobs.rs     Job table, job specs and the `jobs`, `fg` and `bg` builtins
+  src/aliases.rs  Alias table, `alias`/`unalias` builtins and REPL-line alias expansion
   src/completion.rs Tab completion of commands, paths and variables
   src/highlighter.rs Syntax highlighting from the epsh lexer (SO1SH_HIGHLIGHT=0 disables it)
   src/history_hint.rs Ghost-text hints from history
@@ -492,7 +509,7 @@ parser capability.
 
 - Job control builtins (fg, bg, jobs) — use `external_handler` + `Stopped`
 - Interactive features (prompt, history, line editing) — use rustyline/reedline
-- Aliases
+- Aliases in epsh — so1sh expands them in its interactive REPL only (`crates/shell/src/aliases.rs`)
 - Here-strings (`<<<`)
 - Extended globs (`@(...)`, `+(...)`, etc.)
 - Arrays, typeset, select (ksh extensions)

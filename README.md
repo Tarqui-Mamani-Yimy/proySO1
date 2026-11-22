@@ -10,8 +10,9 @@ This workspace builds one: **Shellux** (the interactive shell) and **Nulix** (a 
 
 ## Installing Shellux and Nulix
 
-Prebuilt binaries are published on the GitHub Releases page for Linux x86_64 and
-macOS arm64. Install with one command:
+Prebuilt binaries are published on the GitHub Releases page for Linux x86_64
+(also usable from WSL on Windows); macOS arm64 builds are planned. Install with
+one command:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Tarqui-Mamani-Yimy/proySO1/main/install.sh | sh                # shellux + epsh
@@ -20,8 +21,9 @@ curl -fsSL https://raw.githubusercontent.com/Tarqui-Mamani-Yimy/proySO1/main/ins
 
 The script verifies the release checksum and installs into `~/.local/bin`
 (`PREFIX=/usr/local` changes that; `VERSION=X.Y.Z` pins a release). Homebrew
-formulas and AUR `shellux-bin` / `nulix-bin` packages are generated from
-`packaging/`. Other platforms build from source with `cargo build --release`.
+formulas (once macOS builds ship) and AUR `shellux-bin` / `nulix-bin` packages are
+generated from `packaging/`. Other platforms build from source with
+`cargo build --release`.
 
 ## Why not just use bash?
 

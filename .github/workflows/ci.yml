@@ -16,6 +16,8 @@ jobs:
       matrix:
         os: [ubuntu-22.04, macos-latest]
     runs-on: ${{ matrix.os }}
+    # macOS is informational until its port lands (see TODO.md); Linux gates.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux build dependencies

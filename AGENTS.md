@@ -173,21 +173,25 @@ A control `attach` request upgrades its connection to the attach stream (`crates
 
 ## Packaging
 
-Releases ship two packages per target (`x86_64-unknown-linux-gnu`,
-`aarch64-apple-darwin`): `shellux-X.Y.Z-TARGET.tar.gz` (`bin/shellux`, `bin/epsh`,
+Releases ship two packages per target (`x86_64-unknown-linux-gnu` today;
+`aarch64-apple-darwin` is built by `package.sh` but not released until the macOS
+tests pass): `shellux-X.Y.Z-TARGET.tar.gz` (`bin/shellux`, `bin/epsh`,
 `LICENSE`, `LICENSE-epsh`, `README.md`) and `nulix-X.Y.Z-TARGET.tar.gz`
 (`bin/nulix`, `bin/nulix-server`, `bin/nulixctl`, `LICENSE`, `README.md`,
 `nulix.conf.example`), each with a `.sha256` file. `scripts/package.sh` builds and
 packages them (`VERSION`, `OUT`, `SKIP_BUILD=1`); X.Y.Z is the `shellux` crate version.
-`.github/workflows/ci.yml` runs `make ci` and the install test on Linux and macOS;
-`.github/workflows/release.yml` runs on `vX.Y.Z` tags (the tag must equal the shellux
-version), tests, packages both targets and creates the GitHub Release with `gh`.
+`.github/workflows/ci.yml` runs `make ci` and the install test on Linux (gating) and
+macOS (informational, `continue-on-error`); `.github/workflows/release.yml` runs on
+`vX.Y.Z` tags (the tag must equal the shellux version), tests, packages Linux and
+creates the GitHub Release with `gh`.
 `install.sh` (`PACKAGE=shellux|nulix`, `VERSION`, `PREFIX`, `REPO`, `BASE_URL`)
 downloads the matching tarball, refuses a checksum mismatch or an unsupported
-platform, and installs into `$PREFIX/bin` (default `~/.local/bin`).
+platform, explains when a release has no macOS build, and installs into
+`$PREFIX/bin` (default `~/.local/bin`).
 `scripts/render-packaging.sh VERSION DIST OUT` fills the Homebrew formulas
 (`packaging/homebrew/*.rb.in`; `nulix` depends on `shellux`) and the AUR
-`shellux-bin` / `nulix-bin` PKGBUILDs plus `.SRCINFO` with a release's checksums.
+`shellux-bin` / `nulix-bin` PKGBUILDs plus `.SRCINFO` with a release's checksums;
+without macOS checksums it renders only the AUR files and skips Homebrew.
 Publishing a tag, a Homebrew tap or AUR packages is a separate, explicitly
 authorized step.
 

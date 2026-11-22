@@ -403,3 +403,21 @@ These matter less than the items above, but are worth tracking.
 - Dedicated stress tests for fd churn and nested substitutions.
 - Optional property-style tests for pattern matching and field splitting.
 - A short design note documenting which dash/posh/mrsh behaviors are intentionally followed and where `epsh` diverges.
+
+## macOS Port (blocks macOS releases)
+
+CI run 45060865039 (macos-latest, 2026-11-22) failed about 38 tests; Linux passes
+everything. Known causes:
+
+- Unix socket paths are limited to 104 bytes on macOS (108 on Linux) and its
+  `$TMPDIR` is long, so test servers cannot bind ("path must be shorter than
+  SUN_LEN"): nulix attach, server, remote and control tests. Real use with long
+  session names may hit it too.
+- Signal numbers differ (`USR1` is 30, not 10): trap tests hard-code `138`.
+- `/bin/false` does not exist (use `false` from PATH).
+- 11 shellux PTY REPL tests and 1 TUI test: not diagnosed yet.
+- `command cd` leaves the physical path (`/private/var/...`) in `Shell::cwd()`.
+
+When `make ci` passes on macOS, add `macos-latest` back to release.yml and drop
+`continue-on-error` from ci.yml.
+

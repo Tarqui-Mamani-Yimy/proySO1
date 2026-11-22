@@ -3,10 +3,11 @@
 #
 #   sh scripts/render-packaging.sh VERSION DIST OUT
 #
-# DIST holds the release's *.tar.gz.sha256 files (both targets, from
-# scripts/package.sh or downloaded from the GitHub Release). OUT receives
-# homebrew/{shellux,nulix}.rb and aur/{shellux-bin,nulix-bin}/{PKGBUILD,.SRCINFO},
-# ready to copy into a Homebrew tap and the AUR repositories.
+# DIST holds the release's *.tar.gz.sha256 files (from scripts/package.sh or
+# downloaded from the GitHub Release). OUT receives
+# aur/{shellux-bin,nulix-bin}/{PKGBUILD,.SRCINFO} (needs the Linux sums) and, when
+# the macOS sums are present too, homebrew/{shellux,nulix}.rb, ready to copy into
+# the AUR repositories and a Homebrew tap.
 set -eu
 
 [ $# -eq 3 ] || {
@@ -33,9 +34,15 @@ sum() {
 }
 
 SHELLUX_LINUX=$(sum shellux x86_64-unknown-linux-gnu)
-SHELLUX_DARWIN=$(sum shellux aarch64-apple-darwin)
+# macOS builds are optional (not published yet); without them Homebrew is skipped.
+SHELLUX_DARWIN=
+NULIX_DARWIN=
+if [ -f "$DIST/shellux-$VERSION-aarch64-apple-darwin.tar.gz.sha256" ] ||
+    [ -f "$DIST/nulix-$VERSION-aarch64-apple-darwin.tar.gz.sha256" ]; then
+    SHELLUX_DARWIN=$(sum shellux aarch64-apple-darwin)
+    NULIX_DARWIN=$(sum nulix aarch64-apple-darwin)
+fi
 NULIX_LINUX=$(sum nulix x86_64-unknown-linux-gnu)
-NULIX_DARWIN=$(sum nulix aarch64-apple-darwin)
 
 render() {
     mkdir -p "$(dirname "$2")"
@@ -52,8 +59,12 @@ render() {
     fi
 }
 
-render "$ROOT/packaging/homebrew/shellux.rb.in" "$OUT/homebrew/shellux.rb"
-render "$ROOT/packaging/homebrew/nulix.rb.in" "$OUT/homebrew/nulix.rb"
+if [ -n "$SHELLUX_DARWIN" ]; then
+    render "$ROOT/packaging/homebrew/shellux.rb.in" "$OUT/homebrew/shellux.rb"
+    render "$ROOT/packaging/homebrew/nulix.rb.in" "$OUT/homebrew/nulix.rb"
+else
+    echo "render-packaging.sh: no macOS checksums in $DIST; skipping Homebrew formulas" >&2
+fi
 
 # .SRCINFO is what the AUR web interface reads; makepkg --printsrcinfo is
 # not available off Arch, so bash (the PKGBUILD language) writes it from the

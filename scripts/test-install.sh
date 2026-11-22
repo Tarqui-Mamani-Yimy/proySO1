@@ -102,8 +102,17 @@ check "formula carries the Linux checksum" \
 check "nulix formula depends on shellux" "grep -q 'depends_on \"shellux\"' $RENDER/homebrew/nulix.rb"
 check "SRCINFO lists version and checksum" \
     "grep -q \"pkgver = $VERSION\" $RENDER/aur/shellux-bin/.SRCINFO && grep -q \"sha256sums_x86_64 = $LINUX_SUM\" $RENDER/aur/shellux-bin/.SRCINFO"
-check "missing checksum is refused" \
-    "! sh $ROOT/scripts/render-packaging.sh $VERSION $DIST $SCRATCH/render-bad > $SCRATCH/render.log 2>&1 && grep -q 'missing' $SCRATCH/render.log"
+# Linux-only releases (no macOS builds yet): AUR is rendered, Homebrew is skipped.
+mkdir -p "$SCRATCH/dist-linux" "$SCRATCH/dist-darwin"
+cp "$SCRATCH"/dist-both/*x86_64-unknown-linux-gnu.tar.gz.sha256 "$SCRATCH/dist-linux/"
+cp "$SCRATCH"/dist-both/*aarch64-apple-darwin.tar.gz.sha256 "$SCRATCH/dist-darwin/"
+check "Linux-only render writes AUR and skips Homebrew" \
+    "sh $ROOT/scripts/render-packaging.sh $VERSION $SCRATCH/dist-linux $SCRATCH/render-linux > $SCRATCH/render-linux.log 2>&1 && [ -f $SCRATCH/render-linux/aur/nulix-bin/.SRCINFO ] && [ ! -e $SCRATCH/render-linux/homebrew ] && grep -q 'skipping Homebrew' $SCRATCH/render-linux.log"
+check "missing Linux checksum is refused" \
+    "! sh $ROOT/scripts/render-packaging.sh $VERSION $SCRATCH/dist-darwin $SCRATCH/render-bad > $SCRATCH/render.log 2>&1 && grep -q 'missing' $SCRATCH/render.log"
+mkdir -p "$SCRATCH/empty-release"
+check "macOS without published builds explains it" \
+    "! INSTALL_OS=Darwin INSTALL_ARCH=arm64 install_pkg shellux $SCRATCH/mac $SCRATCH/empty-release > $SCRATCH/mac.log 2>&1 && grep -q 'macOS builds are not published' $SCRATCH/mac.log"
 if [ "$TARGET" = x86_64-unknown-linux-gnu ]; then
     for pkg in shellux nulix; do
         src=$SCRATCH/aur-src-$pkg

@@ -1,4 +1,4 @@
-# Build, test and package both targets for a vX.Y.Z tag, then publish a GitHub
+# Build, test and package the released targets for a vX.Y.Z tag, then publish a GitHub
 # Release with the shellux and nulix tarballs and their .sha256 files
 # (scripts/package.sh; see odd/tasks/packaging.md).
 name: Release
@@ -14,7 +14,8 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-22.04, macos-latest]
+        # macOS is not released yet: its tests do not pass (see TODO.md).
+        os: [ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

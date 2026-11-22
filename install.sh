@@ -58,7 +58,12 @@ main() {
     trap 'exit 1' INT TERM
 
     echo "Downloading $stem.tar.gz"
-    curl -fsSL -o "$tmp/$stem.tar.gz" "$BASE_URL/$stem.tar.gz" || die "download failed: $BASE_URL/$stem.tar.gz"
+    if ! curl -fsSL -o "$tmp/$stem.tar.gz" "$BASE_URL/$stem.tar.gz"; then
+        case $target in
+            *-apple-darwin) die "macOS builds are not published for v$VERSION yet; build from source with cargo (see README.md)" ;;
+            *) die "download failed: $BASE_URL/$stem.tar.gz" ;;
+        esac
+    fi
     curl -fsSL -o "$tmp/$stem.tar.gz.sha256" "$BASE_URL/$stem.tar.gz.sha256" ||
         die "download failed: $BASE_URL/$stem.tar.gz.sha256"
 

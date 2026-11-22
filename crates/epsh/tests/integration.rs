@@ -2773,3 +2773,17 @@ f() { echo ${u:-\*}; }; f; eval "echo \${u:-\\*}"; echo ${u:-${w:-\*}}"#,
         "stderr: {stderr}"
     );
 }
+
+/// Line continuations inside `${...}` and escapes in unquoted here-document
+/// parameter words keep dash's behavior after the brace-escape change.
+#[test]
+fn parameter_word_continuations_and_heredoc_escapes_match_dash() {
+    let (stdout, stderr, code) = run(
+        "printf \"<%s>\" ${u:-a\\\nb} \"${u:-c\\\nd}\"; echo\ncat <<E\n${u:-\\*} ${u:-\\$x} ${u:-a\\\\b}\nE\n",
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("<ab><cd>\n\\* $x a\\b\n", 0),
+        "stderr: {stderr}"
+    );
+}

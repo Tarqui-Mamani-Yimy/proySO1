@@ -312,6 +312,10 @@ Goal: ensure pathname expansion and pattern matching are stable and compatible.
   `${u:-a\ b}` is one field) (`backslash_escapes_in_parameter_words_are_quoted`).
 - Open: pathname expansion drops a leading `./` (`echo ./sub/*` gives `sub/x`; dash keeps `./sub/x`).
 - Open: `echo .*"/"` prints `.*/`; dash prints `../ ./`.
+- Open: `case zz in ${u:-*})` does not match; an unescaped `*` from a default word is not a case pattern.
+- Open: `${u:-x[\!1]}` treats the escaped `!` as negation (dash takes it literally).
+- Open: in an unquoted here-document, `${u:-a\}b}` prints `a\}b` (dash prints `a}b`).
+- Open: `${u:-~}` is not tilde-expanded (dash expands it to `$HOME`).
 
 ## 9. NUL-Byte Policy And API Consistency
 

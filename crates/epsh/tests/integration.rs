@@ -2752,3 +2752,24 @@ printf "<%s>" "$u"; echo"#,
         "stderr: {stderr}"
     );
 }
+
+/// Brace-escape probes from the independent verification, validated against dash.
+#[test]
+fn backslash_escapes_in_parameter_words_match_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["x1", "x2", "a b"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        r#"set -- ${u:-\ }; echo $#; set -- ${u:-\*\*}; echo "$#:$1"
+(IFS=:; for i in ${u:-a\:b}; do echo "[$i]"; done)
+v="a\\b"; printf "%s\n" ${v#a\\}; echo ${u:-\[x]1}; echo ${u:-x\?}
+f() { echo ${u:-\*}; }; f; eval "echo \${u:-\\*}"; echo ${u:-${w:-\*}}"#,
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("1\n1:**\n[a:b]\nb\n[x]1\nx?\n*\n*\n*\n", 0),
+        "stderr: {stderr}"
+    );
+}

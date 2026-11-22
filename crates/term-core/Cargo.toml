@@ -2,6 +2,7 @@
 name = "so1-term-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [lib]
 name = "so1_term_core"

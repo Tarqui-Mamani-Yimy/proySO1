@@ -162,7 +162,7 @@ Cada fase termina con algo **usable** y con tests en verde.
 | herdr | Apache-2.0 | Se puede estudiar y reutilizar con atribución |
 | Pi, gentle-shell | MIT | Reutilizable con atribución |
 
-Licencia de so1Shell: **pendiente de decidir** (recomendado MIT o Apache-2.0, como epsh).
+Licencia de so1Shell: **MIT** (decidido el 2026-11-21), igual que epsh. `LICENSE` conserva el aviso de epsh (Joshua Li) y suma el de so1Shell (Yimy Tarqui Mamani); todos los crates declaran `license = "MIT"`.
 
 ## 7. Riesgos
 
@@ -174,7 +174,7 @@ Licencia de so1Shell: **pendiente de decidir** (recomendado MIT o Apache-2.0, co
 ## 8. Decisiones abiertas
 
 1. Nombre definitivo del proyecto y de los binarios.
-2. Licencia de so1Shell.
+2. ~~Licencia de so1Shell~~ → MIT (ver §6).
 3. Librería de ventana y render para la terminal (`winit` + `wgpu`, o estudiar Rio).
    Motor VT: `alacritty_terminal` o la alternativa basada en `ghostty-vt` que usa herdr (sin evaluar).
 4. Plataformas objetivo (¿solo Linux al inicio?).

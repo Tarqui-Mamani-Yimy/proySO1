@@ -2727,3 +2727,28 @@ fn quoted_glob_characters_survive_noglob_without_markers() {
         "stderr: {stderr}"
     );
 }
+
+/// A backslash-escaped character inside `${...}` is quoted: it is neither
+/// pathname-expanded, field-split nor a pattern character. Expected: dash.
+#[test]
+fn backslash_escapes_in_parameter_words_are_quoted() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a", "b", "a*"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        r#"printf "<%s>" ${u:-\*} ${u:-a\ b} "${u:-\*}" ${u:-\}} ${u:-x\$y}; echo
+v=x; w="*x"; printf "<%s>" ${v#\*} ${w#\*} ${w%\x} ${w##\**}; echo
+printf "<%s>" ${u:=\*}; echo
+printf "<%s>" "$u"; echo"#,
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        (
+            "<*><a b><\\*><}><x$y>\n<x><x><a><a*><b>\n<a><a*><b>\n<*>\n",
+            0
+        ),
+        "stderr: {stderr}"
+    );
+}

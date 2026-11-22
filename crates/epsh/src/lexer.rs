@@ -545,9 +545,16 @@ impl Lexer {
                             had_quoting = true;
                             self.advance(); // consume backslash
                             if let Some(escaped) = self.advance() {
-                                if ctx == WordCtx::Brace && escaped == '}' {
-                                    // Inside ${...}, \} always escapes }
-                                    literal.push(escaped);
+                                if ctx == WordCtx::Brace {
+                                    // Inside an unquoted ${...} word (including trim
+                                    // patterns), an escaped char is quoted: never
+                                    // pathname-expanded, field-split or a pattern char.
+                                    if !literal.is_empty() {
+                                        parts.push(WordPart::Literal(
+                                            std::mem::take(&mut literal).into(),
+                                        ));
+                                    }
+                                    parts.push(WordPart::SingleQuoted(escaped.to_string().into()));
                                 } else if ctx == WordCtx::Word {
                                     // Mark escaped chars with CTLESC so fnmatch/glob
                                     // can see escapes inside brackets (e.g. [\!ab]).

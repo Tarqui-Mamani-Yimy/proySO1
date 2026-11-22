@@ -306,10 +306,10 @@ Goal: ensure pathname expansion and pattern matching are stable and compatible.
   gives `<x y>`; dash gives `<x><y>`).
 - Open: `${x%*}` removes one character; the shortest suffix matching `*` is empty
   (`x="a*"; echo ${x%*}` gives `a`; dash gives `a*`).
-- Open: `${v#[a\]}` strips a leading `a` (escape lost in trim patterns; `case` is correct).
+- Done: `${v#[a\]}` keeps the escaped `]` (backslash escapes in `${...}` words are quoted).
 - Open: an unquoted `$p` used as a `case` pattern is matched literally (dash matches it as a pattern).
-- Open (dangerous): a backslash escape inside an unquoted `${...}` default word is lost:
-  `echo ${u:-\*}` lists files (dash prints `*`), so `rm ${f:-\*}` would delete everything.
+- Done: a backslash escape inside an unquoted `${...}` word is quoted (`echo ${u:-\*}` prints `*`,
+  `${u:-a\ b}` is one field) (`backslash_escapes_in_parameter_words_are_quoted`).
 - Open: pathname expansion drops a leading `./` (`echo ./sub/*` gives `sub/x`; dash keeps `./sub/x`).
 - Open: `echo .*"/"` prints `.*/`; dash prints `../ ./`.
 

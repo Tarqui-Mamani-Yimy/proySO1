@@ -308,6 +308,10 @@ Goal: ensure pathname expansion and pattern matching are stable and compatible.
   (`x="a*"; echo ${x%*}` gives `a`; dash gives `a*`).
 - Open: `${v#[a\]}` strips a leading `a` (escape lost in trim patterns; `case` is correct).
 - Open: an unquoted `$p` used as a `case` pattern is matched literally (dash matches it as a pattern).
+- Open (dangerous): a backslash escape inside an unquoted `${...}` default word is lost:
+  `echo ${u:-\*}` lists files (dash prints `*`), so `rm ${f:-\*}` would delete everything.
+- Open: pathname expansion drops a leading `./` (`echo ./sub/*` gives `sub/x`; dash keeps `./sub/x`).
+- Open: `echo .*"/"` prints `.*/`; dash prints `../ ./`.
 
 ## 9. NUL-Byte Policy And API Consistency
 

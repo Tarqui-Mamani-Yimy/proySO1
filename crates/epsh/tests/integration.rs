@@ -2684,3 +2684,34 @@ fn quoted_glob_characters_are_not_pathname_expanded() {
         "stderr: {stderr}"
     );
 }
+
+/// Quoting probes from the independent verification, validated against dash:
+/// here-documents, "x$@y", external argv, redirection targets, quoted path
+/// prefixes, `read -r` and lengths keep `*` literal and leak no markers.
+#[test]
+fn quoted_glob_characters_stay_literal_everywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("a*b.d")).unwrap();
+    std::fs::write(dir.path().join("a*b.d/in"), "").unwrap();
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        r#"v="*"; cat <<E
+$v "$v" $(echo "*")
+E
+set -- "*" "a?"; printf "<%s>" "x$@y"; echo
+V="*" /usr/bin/printf "%s|" "$V" "*" "[ab]" "x\\y"; echo
+w="new*"; echo hi > "$w"; ls -d new*
+d="a*b.d"; echo "$d"/*
+printf "a*\n" | { read -r l; echo "$l"; }
+t="pre${v}post"; echo "$t" ${#t}"#,
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        (
+            "* \"*\" *\n<x*><a?y>\n|*|[ab]|x\\y|\nnew*\na*b.d/in\na*\npre*post 8\n",
+            0
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(!stdout.contains('\u{FFFE}'));
+}

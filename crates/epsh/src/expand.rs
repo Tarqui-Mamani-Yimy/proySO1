@@ -35,6 +35,10 @@ pub struct ExpandedWord {
     pub split_fields: bool,
     /// True if this starts a new word boundary (for "$@" expansion).
     pub word_break: bool,
+    /// True if this text came from quotes (or tilde expansion) and must not
+    /// undergo pathname expansion; unquoted literals and expansions keep
+    /// their glob characters active.
+    pub quoted: bool,
 }
 
 /// Expand a Word AST node into a list of strings (after field splitting and globbing).
@@ -44,8 +48,13 @@ pub fn expand_word_to_fields(
     word: &Word,
     sh: &mut dyn ShellExpand,
 ) -> crate::error::Result<Vec<String>> {
-    // Step 1: Expand to intermediate fragments with split_fields metadata
-    let fragments = expand_word_parts(&word.parts, sh, false)?;
+    // Step 1: Expand to intermediate fragments with split_fields metadata.
+    // Quoted text is escaped with CTLESC so pathname expansion treats its
+    // glob characters literally (quote removal strips the markers later).
+    let mut fragments = expand_word_parts(&word.parts, sh, false)?;
+    for fragment in fragments.iter_mut().filter(|fragment| fragment.quoted) {
+        fragment.value = escape_glob_chars(&fragment.value);
+    }
 
     // Step 2: Field splitting on fragments marked split_fields=true
     let ifs = sh.vars().ifs();
@@ -70,6 +79,22 @@ pub fn expand_word_to_fields(
     }
 
     Ok(result)
+}
+
+/// Prefix each glob metacharacter (`* ? [ ] \\`) with CTLESC.
+fn escape_glob_chars(text: &str) -> String {
+    use crate::lexer::CTLESC;
+    if !text.contains(['*', '?', '[', ']', '\\']) {
+        return text.to_owned();
+    }
+    let mut escaped = String::with_capacity(text.len() + 4);
+    for c in text.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push(CTLESC);
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 /// Expand word parts into a fnmatch-ready pattern string.
@@ -170,6 +195,7 @@ fn expand_word_parts_inner(
                     value: s.to_shell_string(),
                     // Literals from ${...} words are subject to field splitting
                     split_fields: in_param_word && !quoted_context,
+                    quoted: quoted_context,
                     word_break: false,
                 });
             }
@@ -177,6 +203,7 @@ fn expand_word_parts_inner(
                 result.push(ExpandedWord {
                     value: s.to_shell_string(),
                     split_fields: false,
+                    quoted: true,
                     word_break: false,
                 });
             }
@@ -192,6 +219,7 @@ fn expand_word_parts_inner(
                         result.push(ExpandedWord {
                             value: arg.clone(),
                             split_fields: false,
+                            quoted: true,
                             word_break: i > 0,
                         });
                     }
@@ -237,6 +265,7 @@ fn expand_word_parts_inner(
                             result.push(ExpandedWord {
                                 value: val,
                                 split_fields: false,
+                                quoted: true,
                                 word_break: i > 0,
                             });
                         }
@@ -248,6 +277,7 @@ fn expand_word_parts_inner(
                     result.push(ExpandedWord {
                         value,
                         split_fields: false,
+                        quoted: true,
                         word_break: false,
                     });
                 }
@@ -260,6 +290,7 @@ fn expand_word_parts_inner(
                         result.push(ExpandedWord {
                             value: arg.clone(),
                             split_fields: false,
+                            quoted: false,
                             word_break: i > 0,
                         });
                     }
@@ -277,6 +308,7 @@ fn expand_word_parts_inner(
                     result.push(ExpandedWord {
                         value,
                         split_fields: false,
+                        quoted: true,
                         word_break: false,
                     });
                 }
@@ -291,6 +323,7 @@ fn expand_word_parts_inner(
                         result.push(ExpandedWord {
                             value: arg.clone(),
                             split_fields: true, // subject to further IFS splitting
+                            quoted: false,
                             word_break: true,
                         });
                     }
@@ -304,6 +337,7 @@ fn expand_word_parts_inner(
                 result.push(ExpandedWord {
                     value: expanded,
                     split_fields: false,
+                    quoted: true,
                     word_break: false,
                 });
             }
@@ -312,6 +346,7 @@ fn expand_word_parts_inner(
                 result.push(ExpandedWord {
                     value,
                     split_fields: !quoted_context,
+                    quoted: quoted_context,
                     word_break: false,
                 });
             }
@@ -333,6 +368,7 @@ fn expand_word_parts_inner(
                 result.push(ExpandedWord {
                     value,
                     split_fields: !quoted_context,
+                    quoted: quoted_context,
                     word_break: false,
                 });
             }
@@ -402,6 +438,7 @@ fn expand_param_to_fragments(
             Ok(vec![ExpandedWord {
                 value,
                 split_fields: !quoted_context,
+                quoted: quoted_context,
                 word_break: false,
             }])
         }
@@ -413,6 +450,7 @@ fn expand_param_to_fragments(
             Ok(vec![ExpandedWord {
                 value,
                 split_fields: !quoted_context,
+                quoted: quoted_context,
                 word_break: false,
             }])
         }
@@ -436,6 +474,7 @@ fn expand_param_to_fragments(
                     return Ok(vec![ExpandedWord {
                         value: val,
                         split_fields: !quoted_context,
+                        quoted: quoted_context,
                         word_break: false,
                     }]);
                 }
@@ -445,6 +484,7 @@ fn expand_param_to_fragments(
                 Ok(vec![ExpandedWord {
                     value,
                     split_fields: !quoted_context,
+                    quoted: quoted_context,
                     word_break: false,
                 }])
             }
@@ -471,6 +511,7 @@ fn expand_param_to_fragments(
                 Ok(vec![ExpandedWord {
                     value,
                     split_fields: !quoted_context,
+                    quoted: quoted_context,
                     word_break: false,
                 }])
             }
@@ -499,6 +540,7 @@ fn expand_param_to_fragments(
             Ok(vec![ExpandedWord {
                 value,
                 split_fields: !quoted_context,
+                quoted: quoted_context,
                 word_break: false,
             }])
         }
@@ -1120,6 +1162,7 @@ mod tests {
         let fragments = vec![ExpandedWord {
             value: "a b c".into(),
             split_fields: true,
+            quoted: false,
             word_break: false,
         }];
         let result = field_split(&fragments, " \t\n");
@@ -1131,6 +1174,7 @@ mod tests {
         let fragments = vec![ExpandedWord {
             value: "a:b:c".into(),
             split_fields: true,
+            quoted: false,
             word_break: false,
         }];
         let result = field_split(&fragments, ":");
@@ -1143,11 +1187,13 @@ mod tests {
             ExpandedWord {
                 value: "prefix-".into(),
                 split_fields: false,
+                quoted: false,
                 word_break: false,
             },
             ExpandedWord {
                 value: "a b".into(),
                 split_fields: true,
+                quoted: false,
                 word_break: false,
             },
         ];

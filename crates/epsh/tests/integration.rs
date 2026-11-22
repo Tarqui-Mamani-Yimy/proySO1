@@ -2660,3 +2660,27 @@ v=a[b]c; printf "%s " ${v#*[} ${v%[*} ${v#a[}; echo"#,
         "stderr: {stderr}"
     );
 }
+
+/// Quoted text is never pathname-expanded; unquoted expansions still are, and
+/// escaped characters in a literal path component are looked up literally.
+/// Expected output is dash's.
+#[test]
+fn quoted_glob_characters_are_not_pathname_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("a*b")).unwrap();
+    for name in ["a*b/x", "ab", "a1b", "xa", "xb"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        r#"echo 1 "*" '*' "a*"; v="*"; echo 2 "$v"; set -- "*" "a?b"; printf "3 %s\n" "$@"; echo 4 "x"*; echo 5 a\*b/* "a*b"/*; echo 6 ${u:-"*"} ${u:-*}; echo 7 $v; set -f; echo 8 *; set +f; case "$v" in "*") echo 9 quoted-case;; esac; w="[ab]"; echo 10 "$w" "a[1]b" "${w}""#,
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        (
+            "1 * * a*\n2 *\n3 *\n3 a?b\n4 xa xb\n5 a*b/x a*b/x\n6 * a*b a1b ab xa xb\n7 a*b a1b ab xa xb\n8 *\n9 quoted-case\n10 [ab] a[1]b [ab]\n",
+            0
+        ),
+        "stderr: {stderr}"
+    );
+}

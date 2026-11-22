@@ -296,6 +296,19 @@ Goal: ensure pathname expansion and pattern matching are stable and compatible.
   - glob
 - Add shared regression cases so these contexts do not drift semantically.
 
+### Known differences from dash (2026-11-22)
+
+- Done: quoted text (`"*"`, `'*'`, `"$v"`, `"$@"`) is no longer
+  pathname-expanded, and escaped characters in a literal path component
+  (`a\*b/*`) are looked up literally (`quoted_glob_characters_are_not_pathname_expanded`).
+- Done: `[` is a pattern only when a `]` closes it (`lone_bracket_does_not_trigger_pathname_expansion`).
+- Open: unquoted `$@` does not field-split each parameter (`set -- "x y"; printf '<%s>' $@`
+  gives `<x y>`; dash gives `<x><y>`).
+- Open: `${x%*}` removes one character; the shortest suffix matching `*` is empty
+  (`x="a*"; echo ${x%*}` gives `a`; dash gives `a*`).
+- Open: `${v#[a\]}` strips a leading `a` (escape lost in trim patterns; `case` is correct).
+- Open: an unquoted `$p` used as a `case` pattern is matched literally (dash matches it as a pattern).
+
 ## 9. NUL-Byte Policy And API Consistency
 
 Goal: be explicit about the one byte Unix process/file APIs do not permit in strings.

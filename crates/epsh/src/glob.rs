@@ -119,7 +119,7 @@ pub fn has_glob_chars(s: &str) -> bool {
     while i < chars.len() {
         match chars[i] {
             '*' | '?' => return true,
-            '[' if bracket_closes(&chars, i + 1, true) => return true,
+            '[' if bracket_end(&chars, i + 1, true).is_some() => return true,
             c if is_escape(c) => i += 1, // skip escaped char
             _ => {}
         }
@@ -136,7 +136,11 @@ pub fn has_unclosed_bracket(pattern: &str) -> bool {
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
-            '[' if !bracket_closes(&chars, i + 1, false) => return true,
+            // A closed expression is skipped whole: a `[` inside it is a member.
+            '[' => match bracket_end(&chars, i + 1, false) {
+                Some(end) => i = end,
+                None => return true,
+            },
             c if is_escape(c) => i += 1,
             _ => {}
         }
@@ -145,9 +149,10 @@ pub fn has_unclosed_bracket(pattern: &str) -> bool {
     false
 }
 
-/// Whether the bracket expression whose members start at `start` is closed
-/// by a `]` before the end of the word (or before a `/`, for pathnames).
-fn bracket_closes(chars: &[char], start: usize, stop_at_slash: bool) -> bool {
+/// The index of the `]` that closes the bracket expression whose members
+/// start at `start`, if one comes before the end of the word (or before a
+/// `/`, for pathnames).
+fn bracket_end(chars: &[char], start: usize, stop_at_slash: bool) -> Option<usize> {
     let mut q = start;
     if chars.get(q) == Some(&'!') {
         q += 1;
@@ -157,12 +162,12 @@ fn bracket_closes(chars: &[char], start: usize, stop_at_slash: bool) -> bool {
             q += 1;
         }
         match chars.get(q) {
-            None => return false,
-            Some('/') if stop_at_slash => return false,
+            None => return None,
+            Some('/') if stop_at_slash => return None,
             Some(_) => q += 1,
         }
         if chars.get(q) == Some(&']') {
-            return true;
+            return Some(q);
         }
     }
 }
@@ -220,7 +225,7 @@ fn fnmatch_inner(pat: &[char], mut pi: usize, s: &[char], mut si: usize) -> bool
                 return false;
             }
             // An unclosed `[` is an ordinary character (dash's `pmatch`).
-            '[' if !bracket_closes(pat, pi + 1, false) => {
+            '[' if bracket_end(pat, pi + 1, false).is_none() => {
                 if si >= s.len() || s[si] != '[' {
                     return false;
                 }
@@ -366,6 +371,23 @@ mod tests {
         assert!(has_glob_chars("[abc]"));
         assert!(!has_glob_chars("plain"));
         assert!(!has_glob_chars("escaped\\*"));
+    }
+
+    /// A `[` inside a closed bracket expression is a member, not a new bracket.
+    #[test]
+    fn has_unclosed_bracket_skips_closed_expressions() {
+        for (pattern, expected) in [
+            ("[[]", false),
+            ("[a[]", false),
+            ("/x/[[]*", false),
+            ("[ab]", false),
+            ("\\[", false),
+            ("[ab", true),
+            ("[ab][", true),
+            ("[[]x[", true),
+        ] {
+            assert_eq!(has_unclosed_bracket(pattern), expected, "{pattern:?}");
+        }
     }
 
     /// An unclosed `[` matches itself literally (dash's `pmatch`).

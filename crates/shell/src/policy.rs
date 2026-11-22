@@ -267,7 +267,7 @@ mod tests {
                 message: "write pattern `/secret/[ab` has an unclosed `[`; write `\\[` for a literal bracket".into(),
             }
         );
-        assert!(parse("default allow\ndeny write /secret/[ab] /x/\\[ /y/[]]\n").is_ok());
+        assert!(parse("default allow\ndeny write /secret/[ab] /x/\\[ /y/[]] /z/[[]\n").is_ok());
         assert_eq!(
             err("default maybe\n"),
             ParseError {

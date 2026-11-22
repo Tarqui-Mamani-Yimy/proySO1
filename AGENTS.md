@@ -240,6 +240,7 @@ assert!(!is_builtin("rm"));
 ```sh
 cargo test --workspace
 cargo test -p so1sh --test repl                        # PTY REPL tests
+cargo test -p so1-terminal --test tui                  # TUI smoke matrix (less, top, fzf, man; skips missing)
 cargo run -p so1sh                                     # interactive on a TTY
 make ci                                               # both crates + conformance
 cargo test -p epsh --test api_stability                      # API surface regression
@@ -250,6 +251,10 @@ cargo build && perl check.pl -p ./target/debug/epsh \
 sh crates/epsh/tests/stress/run.sh ./target/debug/epsh dash  # performance vs dash
 perl filter-tests.pl check.t > check-epsh.t                  # regenerate filtered tests
 ```
+
+Manual so1term checks for nvim, tmux, htop, fzf, lazygit, less, top and man
+(resize, mouse, kitty keys, colours, shortcut pass-through) live in
+`docs/tui-smoke-checklist.md`.
 
 ## Performance vs dash
 

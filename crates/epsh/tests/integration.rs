@@ -2637,3 +2637,26 @@ fn unclosed_bracket_in_patterns_matches_literally() {
         "stderr: {stderr}"
     );
 }
+
+/// Bracket edge cases from the independent verification, validated against dash.
+#[test]
+fn bracket_edge_cases_match_dash() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a]", "ab", "]", "b", "a", "c", "a[", "["] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        r#"printf "<%s>" a[\]b [\]b [a\/] [a-z ?[; echo
+case a in [a) echo Y;; *) echo n;; esac
+case "[a" in [a) echo Y;; *) echo n;; esac
+case "[x" in [*) echo Y;; *) echo n;; esac
+case x in [!]) echo Y;; *) echo n;; esac
+v=a[b]c; printf "%s " ${v#*[} ${v%[*} ${v#a[}; echo"#,
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("<a[]b><[]b><[a/]><[a-z><a[>\nn\nY\nY\nn\nb]c a b]c \n", 0),
+        "stderr: {stderr}"
+    );
+}

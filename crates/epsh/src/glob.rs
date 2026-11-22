@@ -128,6 +128,23 @@ pub fn has_glob_chars(s: &str) -> bool {
     false
 }
 
+/// Whether `pattern` has a `[` that no `]` closes, so [`fnmatch`] would treat
+/// it as an ordinary character. Callers that accept user patterns (for
+/// example policy files) can refuse such patterns instead of matching less.
+pub fn has_unclosed_bracket(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '[' if !bracket_closes(&chars, i + 1, false) => return true,
+            c if is_escape(c) => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Whether the bracket expression whose members start at `start` is closed
 /// by a `]` before the end of the word (or before a `/`, for pathnames).
 fn bracket_closes(chars: &[char], start: usize, stop_at_slash: bool) -> bool {

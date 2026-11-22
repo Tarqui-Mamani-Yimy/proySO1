@@ -38,7 +38,7 @@ before the rc file; a missing, unreadable or invalid file prints one diagnostic
 `#` comments (a `#` starting a word, so `/tmp/a#b` keeps it) and blank lines ignored: exactly one `default allow|deny`;
 `allow|deny command NAME...` matches argv[0] or its basename; `allow|deny write
 GLOB...` matches the lexically normalized absolute target of `>`, `>|`, `>>` and
-`<>` with `epsh::glob::fnmatch`. Command and write rules each use first match in
+`<>` with `epsh::glob::fnmatch`; a write pattern with an unclosed `[` is refused as invalid (write `\[` for a literal bracket). Command and write rules each use first match in
 file order, then the default. Denied commands print `NAME: denied by policy` and
 yield 126 without opening their redirections; the targets of `exec CMD` and
 `command CMD` (also nested, as in `command exec CMD`) are checked the same way

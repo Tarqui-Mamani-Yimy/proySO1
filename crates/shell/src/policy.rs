@@ -90,6 +90,15 @@ pub fn parse(source: &str) -> Result<Policy, ParseError> {
                 "`{directive} {kind}` needs at least one {operand}"
             )));
         }
+        if kind == "write"
+            && let Some(pattern) = operands
+                .iter()
+                .find(|pattern| epsh::glob::has_unclosed_bracket(pattern))
+        {
+            return Err(fail(format!(
+                "write pattern `{pattern}` has an unclosed `[`; write `\\[` for a literal bracket"
+            )));
+        }
         rules.push((action, operands));
     }
     let default = default.ok_or_else(|| ParseError {
@@ -249,6 +258,16 @@ mod tests {
                 message: "unknown rule kind `read`; expected `command` or `write`".into(),
             }
         );
+        // An unclosed `[` would silently match only itself, so a deny written
+        // as `/secret/[ab` would protect nothing; it is refused instead.
+        assert_eq!(
+            err("default allow\ndeny write /tmp/ok /secret/[ab\n"),
+            ParseError {
+                line: Some(2),
+                message: "write pattern `/secret/[ab` has an unclosed `[`; write `\\[` for a literal bracket".into(),
+            }
+        );
+        assert!(parse("default allow\ndeny write /secret/[ab] /x/\\[ /y/[]]\n").is_ok());
         assert_eq!(
             err("default maybe\n"),
             ParseError {

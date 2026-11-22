@@ -793,8 +793,11 @@ mod embedder_builtins {
             }))
             .is_err()
         );
-        let fd_target = fs::read_link("/proc/self/fd/1").unwrap();
-        assert_ne!(fd_target, output);
+        assert!(
+            !stdout_is(&output),
+            "stdout still points at {}",
+            output.display()
+        );
     }
 
     #[test]
@@ -926,10 +929,7 @@ mod embedder_builtins {
             }))
             .is_err()
         );
-        assert_ne!(
-            fs::read_link("/proc/self/fd/1").unwrap(),
-            temp.path().join("panic.txt")
-        );
+        assert!(!stdout_is(&temp.path().join("panic.txt")));
         assert_eq!(
             shell.run_program(&parse("echo restored")),
             ExitStatus::SUCCESS
@@ -997,7 +997,25 @@ mod embedder_builtins {
             ExitStatus::SUCCESS
         );
         assert_eq!(*stdout.lock().unwrap(), b"wrapper\n");
-        assert_eq!(shell.cwd(), target);
+        // Compare canonical paths: on macOS the temp dir lives behind the
+        // /var -> /private/var symlink.
+        assert_eq!(
+            fs::canonicalize(shell.cwd()).unwrap(),
+            fs::canonicalize(&target).unwrap()
+        );
+    }
+
+    /// Whether fd 1 is the file at `path` (same device and inode); portable
+    /// replacement for reading Linux's /proc/self/fd/1.
+    fn stdout_is(path: &std::path::Path) -> bool {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+        let Ok(target) = fs::metadata(path) else {
+            return false;
+        };
+        let stdout = std::io::stdout().as_fd().try_clone_to_owned().unwrap();
+        let current = fs::File::from(stdout).metadata().unwrap();
+        current.dev() == target.dev() && current.ino() == target.ino()
     }
 
     #[test]

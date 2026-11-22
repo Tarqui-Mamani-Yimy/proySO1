@@ -31,7 +31,7 @@ cat > "$TMP/expected" <<'EXPECTED'
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build
-cargo test --workspace
+cargo test --workspace --no-fail-fast
 perl check.pl -p ./target/debug/epsh -s check-epsh.t
 EXPECTED
 

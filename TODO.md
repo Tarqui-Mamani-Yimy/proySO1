@@ -187,6 +187,9 @@ Goal: make process control and traps behave like a real shell, especially during
 
 ## 5. `PWD` And Path Semantics
 
+- Open (found on macOS CI, 2026-11-22): `command cd DIR` leaves the physical path in `Shell::cwd()`
+  (`/private/var/...` for `/var/...`); POSIX `cd` defaults to `-L`, keeping the logical path as dash does.
+
 Goal: eliminate ambiguity around logical vs physical cwd behavior.
 
 ### Define shell policy

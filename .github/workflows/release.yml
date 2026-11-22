@@ -29,7 +29,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libwayland-dev
       - name: Install the pinned toolchain
-        run: rustup show
+        run: rustup toolchain install
       - name: Test
         run: cargo test --workspace --locked
       - name: Package

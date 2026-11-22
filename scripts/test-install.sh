@@ -59,6 +59,30 @@ check "unsupported platform is refused" \
 check "unknown package is refused" \
     "! install_pkg epsh $SCRATCH/y $DIST > $SCRATCH/pkg.log 2>&1 && grep -q 'PACKAGE must be shellux or nulix' $SCRATCH/pkg.log"
 
+# Refusals and variants found in verification.
+cp -R "$DIST" "$SCRATCH/nosum"
+rm "$SCRATCH/nosum/shellux-$VERSION-$TARGET.tar.gz.sha256"
+check "missing checksum file is refused" \
+    "! install_pkg shellux $SCRATCH/nosum-prefix $SCRATCH/nosum > $SCRATCH/nosum.log 2>&1 && [ ! -e $SCRATCH/nosum-prefix/bin/shellux ]"
+check "a leading v in VERSION is accepted" \
+    "PACKAGE=shellux VERSION=v$VERSION PREFIX=$SCRATCH/vprefix BASE_URL=file://$DIST sh $ROOT/install.sh > /dev/null 2>&1 && [ -x $SCRATCH/vprefix/bin/shellux ]"
+if [ "$TARGET" = x86_64-unknown-linux-gnu ]; then
+    check "the amd64 alias maps to x86_64 Linux" \
+        "INSTALL_ARCH=amd64 install_pkg shellux $SCRATCH/amd64 $DIST > /dev/null 2>&1 && [ -x $SCRATCH/amd64/bin/shellux ]"
+fi
+check "a PREFIX with a space installs" \
+    "PACKAGE=shellux VERSION=$VERSION PREFIX='$SCRATCH/pre fix' BASE_URL=file://$DIST sh $ROOT/install.sh > /dev/null 2>&1 && [ -x '$SCRATCH/pre fix/bin/shellux' ]"
+mkdir -p "$SCRATCH/nosha/bin"
+for tool in sh curl tar gzip cut cp chmod mv mkdir mktemp rm basename uname shasum perl dirname sed grep cat; do
+    p=$(command -v "$tool" 2>/dev/null) && ln -sf "$p" "$SCRATCH/nosha/bin/$tool"
+done
+if [ -e "$SCRATCH/nosha/bin/shasum" ]; then
+    check "shasum is used without sha256sum" \
+        "PATH=$SCRATCH/nosha/bin PACKAGE=shellux VERSION=$VERSION PREFIX=$SCRATCH/shasum HOME=$SCRATCH BASE_URL=file://$DIST sh $ROOT/install.sh > /dev/null 2>&1 && [ -x $SCRATCH/shasum/bin/shellux ]"
+fi
+check "package.sh accepts a relative OUT" \
+    "(cd $SCRATCH && OUT=reldist VERSION=$VERSION SKIP_BUILD=1 sh $ROOT/scripts/package.sh > /dev/null && [ -f reldist/shellux-$VERSION-$TARGET.tar.gz.sha256 ])"
+
 # Rendered packaging: no placeholders, real checksums, and each PKGBUILD's
 # package() installs the expected files from the real tarball.
 RENDER=$SCRATCH/render

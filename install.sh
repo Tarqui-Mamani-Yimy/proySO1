@@ -6,7 +6,7 @@
 #
 # Environment:
 #   PACKAGE   shellux (default) or nulix; nulix uses shellux as its default shell
-#   VERSION   release version without the leading v (default: the latest release)
+#   VERSION   release version, with or without a leading v (default: the latest release)
 #   PREFIX    install root; binaries go to $PREFIX/bin (default: $HOME/.local)
 #   REPO      GitHub owner/name (default: Tarqui-Mamani-Yimy/proySO1)
 #   BASE_URL  directory holding the release files (default: the GitHub release)
@@ -40,16 +40,19 @@ esac
 if [ -z "${VERSION:-}" ]; then
     latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest") ||
         die "cannot find the latest release of $REPO"
-    VERSION=${latest##*/v}
-    case $VERSION in
-        '' | */*) die "cannot read the latest release version from $latest" ;;
+    # Without any release, GitHub redirects /releases/latest to /releases.
+    case $latest in
+        */releases/tag/v*) VERSION=${latest##*/tag/v} ;;
+        *) die "$REPO has no published release yet; set VERSION or build from source" ;;
     esac
 fi
+VERSION=${VERSION#v}
 BASE_URL=${BASE_URL:-https://github.com/$REPO/releases/download/v$VERSION}
 
 stem=$PACKAGE-$VERSION-$target
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' INT TERM
 
 echo "Downloading $stem.tar.gz"
 curl -fsSL -o "$tmp/$stem.tar.gz" "$BASE_URL/$stem.tar.gz" || die "download failed: $BASE_URL/$stem.tar.gz"
@@ -64,13 +67,22 @@ else
 fi
 [ -n "$expected" ] && [ "$expected" = "$actual" ] || die "checksum mismatch for $stem.tar.gz"
 
-tar -C "$tmp" -xzf "$tmp/$stem.tar.gz"
+tar -C "$tmp" -xzf "$tmp/$stem.tar.gz" || die "cannot extract $stem.tar.gz"
 mkdir -p "$PREFIX/bin"
+# Copy every binary next to its destination first, then rename them all, so a
+# failed copy never leaves a mix of old and new versions behind.
+staged=
 for bin in "$tmp/$stem"/bin/*; do
     name=$(basename "$bin")
-    cp "$bin" "$PREFIX/bin/$name.tmp.$$"
-    chmod 0755 "$PREFIX/bin/$name.tmp.$$"
-    mv -f "$PREFIX/bin/$name.tmp.$$" "$PREFIX/bin/$name"
+    if ! cp "$bin" "$PREFIX/bin/.$name.new.$$" || ! chmod 0755 "$PREFIX/bin/.$name.new.$$"; then
+        rm -f "$PREFIX/bin/.$name.new.$$"
+        for done_name in $staged; do rm -f "$PREFIX/bin/.$done_name.new.$$"; done
+        die "cannot write to $PREFIX/bin"
+    fi
+    staged="$staged $name"
+done
+for name in $staged; do
+    mv -f "$PREFIX/bin/.$name.new.$$" "$PREFIX/bin/$name"
     echo "Installed $PREFIX/bin/$name"
 done
 

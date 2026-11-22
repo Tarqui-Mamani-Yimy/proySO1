@@ -992,6 +992,34 @@ mod tests {
     }
 
     #[test]
+    fn default_palette_keeps_every_named_and_indexed_colour() {
+        // The colours resolved before palettes existed.
+        fn previous(color: CellColor) -> [u8; 3] {
+            match color {
+                CellColor::Rgb(r, g, b) => [r, g, b],
+                CellColor::Named(index) => match index {
+                    0..=15 => ANSI[index as usize],
+                    256 => [220, 220, 220],
+                    257 => [20, 22, 28],
+                    258 => [255, 255, 255],
+                    259..=266 => ANSI[(index - 259) as usize],
+                    _ => [220, 220, 220],
+                },
+                CellColor::Indexed(index) => indexed_rgb(index),
+            }
+        }
+        let palette = Palette::default();
+        for index in 0..=u16::MAX {
+            let color = CellColor::Named(index);
+            assert_eq!(palette.rgb(color), previous(color), "{color:?}");
+        }
+        for index in 0..=u8::MAX {
+            let color = CellColor::Indexed(index);
+            assert_eq!(palette.rgb(color), previous(color), "{color:?}");
+        }
+    }
+
+    #[test]
     fn custom_palette_resolves_named_indexed_and_dim_colours() {
         let mut palette = Palette::default();
         palette.ansi[1] = [1, 1, 1];

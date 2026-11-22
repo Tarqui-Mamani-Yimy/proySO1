@@ -81,6 +81,8 @@ pub fn config_location(var: impl Fn(&str) -> Option<OsString>) -> Option<ConfigL
 pub fn parse_config(text: &str, origin: &Path, home: Option<&Path>) -> (Config, Vec<String>) {
     let mut config = Config::default();
     let mut diagnostics = Vec::new();
+    // Some editors save a UTF-8 byte order mark; it is not part of the first key.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -138,7 +140,12 @@ fn apply_setting(
         _ => {
             let slot = key
                 .strip_prefix("color")
-                .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                // Exactly `color0`..`color15`: no sign, no leading zero.
+                .filter(|digits| {
+                    !digits.is_empty()
+                        && digits.bytes().all(|b| b.is_ascii_digit())
+                        && (digits.len() == 1 || !digits.starts_with('0'))
+                })
                 .and_then(|digits| digits.parse::<usize>().ok())
                 .filter(|slot| *slot < 16)
                 .ok_or_else(|| format!("unknown key: {key}"))?;
@@ -361,5 +368,43 @@ mod tests {
         let (config, diagnostics) = parse(include_str!("../../../docs/so1term.conf.example"));
         assert_eq!(diagnostics, Vec::<String>::new());
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn config_accepts_crlf_bom_equals_in_values_and_last_valid_duplicate() {
+        let (config, diagnostics) = parse(
+            "\u{feff}scrollback = 5\r\nforeground = #010203\r\nshell = /bin/a=b\r\nscrollback = x\r\n",
+        );
+        assert_eq!(
+            diagnostics,
+            vec![
+                "so1term: config /cfg/so1term.conf:4: scrollback: expected 0 to 100000 lines, got \"x\""
+            ]
+        );
+        assert_eq!(config.scrollback, 5);
+        assert_eq!(config.palette.foreground, [1, 2, 3]);
+        assert_eq!(config.shell, Some(OsString::from("/bin/a=b")));
+    }
+
+    #[test]
+    fn config_value_limits_match_the_documented_ranges() {
+        for (text, accepted) in [
+            ("font_size = 6", true),
+            ("font_size = 72", true),
+            ("font_size = 1e1", true),
+            ("font_size = 5.99", false),
+            ("font_size = nan", false),
+            ("font_size = inf", false),
+            ("scrollback = 0", true),
+            ("scrollback = 100000", true),
+            ("scrollback = -1", false),
+            ("color1 = #FF0000", true),
+            ("color1 = #ff0000 # red", false),
+            ("color01 = #ff0000", false),
+            ("color+1 = #ff0000", false),
+        ] {
+            let (_, diagnostics) = parse(text);
+            assert_eq!(diagnostics.is_empty(), accepted, "{text}: {diagnostics:?}");
+        }
     }
 }

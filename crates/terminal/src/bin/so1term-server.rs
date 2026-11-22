@@ -50,7 +50,8 @@ use std::process::ExitCode;
 const USAGE: &str = "Usage: so1term-server [--session NAME]\n\
 Runs a persistent so1term session (default name: default) that outlives its clients.\n\
 Control it with so1ctl; stop it with `so1ctl shutdown` or by exiting its last shell.\n\
-Reads `shell` and `scrollback` from $SO1TERM_CONFIG or ~/.config/so1term/so1term.conf.";
+Reads `shell` and `scrollback` from $SO1TERM_CONFIG, else\n\
+$XDG_CONFIG_HOME/so1term/so1term.conf (default ~/.config/so1term/so1term.conf).";
 
 fn main() -> ExitCode {
     #[cfg(unix)]

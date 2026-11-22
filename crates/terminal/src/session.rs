@@ -1257,7 +1257,11 @@ fn spawn_pane(
     .map_err(|error| format!("could not start shell PTY for pane {}: {error}", pane_id.0))?;
     Ok(SessionPane {
         pty,
-        model: Model::new(layout.cols as usize, layout.rows as usize),
+        model: Model::with_scrollback_limit(
+            layout.cols as usize,
+            layout.rows as usize,
+            crate::config::current().scrollback,
+        ),
         title: cwd_basename_title(&cwd),
         explicit_title: None,
         cwd,

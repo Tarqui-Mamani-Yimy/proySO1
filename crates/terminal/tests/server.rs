@@ -50,6 +50,8 @@ impl Scratch {
             .args(args)
             .env("XDG_RUNTIME_DIR", &self.root)
             .env("SO1TERM_SHELL", "/bin/sh")
+            // Never read the developer's own so1term.conf.
+            .env("SO1TERM_CONFIG", "/dev/null")
             .env_remove("SO1TERM_SOCKET")
             .current_dir(&self.root)
             .stdin(Stdio::null())
@@ -421,4 +423,66 @@ fn invalid_session_names_are_rejected() {
             "name {name:?}"
         );
     }
+}
+
+/// Starts a server that reads `config` through `SO1TERM_CONFIG`, with or without
+/// the harness `SO1TERM_SHELL` override.
+fn spawn_with_config(scratch: &Scratch, session: &str, config: &str, env_shell: bool) -> Child {
+    let path = scratch.root.join(format!("{session}.conf"));
+    fs::write(&path, config).unwrap();
+    let mut command = scratch.server(&["--session", session]);
+    command.env("SO1TERM_CONFIG", &path);
+    if !env_shell {
+        command.env_remove("SO1TERM_SHELL");
+    }
+    let child = command.spawn().unwrap();
+    wait_until("server socket", || scratch.socket(session).exists());
+    child
+}
+
+fn marker_shell(scratch: &Scratch) -> PathBuf {
+    let shell = scratch.root.join("marker-shell");
+    fs::write(&shell, "#!/bin/sh\nMARK=from-config exec /bin/sh\n").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    shell
+}
+
+#[test]
+fn server_config_file_sets_the_shell_and_reports_bad_lines() {
+    let scratch = Scratch::new();
+    let shell = marker_shell(&scratch);
+    let config = format!("shell = {}\nbogus = 1\nscrollback = 50\n", shell.display());
+    let child = spawn_with_config(&scratch, "cfg", &config, false);
+    let mut server = Server { child };
+    stdout(&scratch.ctl("cfg", &["send-text", "echo mark=$MARK\n"]));
+    wait_until("config shell", || {
+        screen_contains(&scratch, "cfg", "mark=from-config")
+    });
+    assert!(server.is_running());
+    stdout(&scratch.ctl("cfg", &["shutdown"]));
+    assert!(server.wait_exit().success());
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut server.child.stderr.take().unwrap(), &mut stderr).unwrap();
+    let expected = format!(
+        "so1term: config {}:2: unknown key: bogus",
+        scratch.root.join("cfg.conf").display()
+    );
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn server_shell_environment_variable_overrides_the_config_file() {
+    let scratch = Scratch::new();
+    let shell = marker_shell(&scratch);
+    let config = format!("shell = {}\n", shell.display());
+    let _server = Server {
+        child: spawn_with_config(&scratch, "envwins", &config, true),
+    };
+    stdout(&scratch.ctl("envwins", &["send-text", "echo mark=[$MARK]\n"]));
+    wait_until("env shell", || {
+        screen_contains(&scratch, "envwins", "mark=[]")
+    });
 }

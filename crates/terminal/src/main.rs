@@ -1171,13 +1171,21 @@ impl TerminalWindow {
             .ok_or_else(|| "GPU adapter does not support the window surface".to_owned())?;
         surface.configure(&device, &config);
         let mut font_system = FontSystem::new();
-        if let Ok(font) = std::env::var("SO1TERM_FONT") {
+        // SO1TERM_FONT / SO1TERM_FONT_SIZE override the config file's keys.
+        let term_config = so1_terminal::config::current();
+        if let Some(font) = std::env::var_os("SO1TERM_FONT")
+            .map(PathBuf::from)
+            .or_else(|| term_config.font.clone())
+        {
             font_system.db_mut().load_font_file(font).ok();
         }
         let font_size = std::env::var("SO1TERM_FONT_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .filter(|value: &f32| value.is_finite() && (6.0..=72.0).contains(value))
+            .filter(|value: &f32| {
+                value.is_finite() && so1_terminal::config::FONT_SIZE_RANGE.contains(value)
+            })
+            .or(term_config.font_size)
             .unwrap_or(14.0);
         let metrics = Metrics::new(font_size, font_size * 1.35);
         let mut measure = Buffer::new(&mut font_system, metrics);
@@ -1422,7 +1430,11 @@ impl TerminalWindow {
         .map_err(|error| format!("could not start shell PTY for pane {}: {error}", pane_id.0))?;
         Ok(Pane {
             pty,
-            model: Model::new(cols, rows),
+            model: Model::with_scrollback_limit(
+                cols,
+                rows,
+                so1_terminal::config::current().scrollback,
+            ),
             graphics: PaneGraphics::default(),
             title: cwd_basename_title(&cwd),
             explicit_title: None,
@@ -2417,7 +2429,7 @@ impl TerminalWindow {
                     let images = frame_placements(&pane.graphics.placements, &pane.model);
                     (input, &mut pane.glyphs, images)
                 };
-            let cells = input.render_cells();
+            let cells = input.render_cells(&so1_terminal::config::current().palette);
             gpu.vertices.clear();
             let width = gpu.config.width as f32;
             let height = gpu.config.height as f32;
@@ -2713,10 +2725,10 @@ impl TerminalWindow {
                                 wgpu::LoadOp::Load
                             } else {
                                 wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: so1_terminal::renderer::surface_clear_color()[0],
-                                    g: so1_terminal::renderer::surface_clear_color()[1],
-                                    b: so1_terminal::renderer::surface_clear_color()[2],
-                                    a: so1_terminal::renderer::surface_clear_color()[3],
+                                    r: so1_terminal::config::current().palette.clear_color()[0],
+                                    g: so1_terminal::config::current().palette.clear_color()[1],
+                                    b: so1_terminal::config::current().palette.clear_color()[2],
+                                    a: so1_terminal::config::current().palette.clear_color()[3],
                                 })
                             },
                             store: wgpu::StoreOp::Store,
@@ -2789,10 +2801,10 @@ impl TerminalWindow {
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: so1_terminal::renderer::surface_clear_color()[0],
-                                g: so1_terminal::renderer::surface_clear_color()[1],
-                                b: so1_terminal::renderer::surface_clear_color()[2],
-                                a: so1_terminal::renderer::surface_clear_color()[3],
+                                r: so1_terminal::config::current().palette.clear_color()[0],
+                                g: so1_terminal::config::current().palette.clear_color()[1],
+                                b: so1_terminal::config::current().palette.clear_color()[2],
+                                a: so1_terminal::config::current().palette.clear_color()[3],
                             }),
                             store: wgpu::StoreOp::Store,
                         },
@@ -3574,6 +3586,12 @@ Options:
                   1-64 ASCII letters, digits, '-' or '_'. Closing the window
                   detaches and leaves the session running.
   -h, --help      Print this help.
+
+Configuration is read at startup from $SO1TERM_CONFIG, else
+$XDG_CONFIG_HOME/so1term/so1term.conf (default ~/.config/so1term/so1term.conf):
+`key = value` lines for font, font_size, shell, scrollback, foreground,
+background, cursor and color0..color15 (#rrggbb). SO1TERM_FONT,
+SO1TERM_FONT_SIZE and SO1TERM_SHELL override the file.
 ";
 
 /// What the command line asks the window to do.
@@ -3619,8 +3637,16 @@ fn main() {
             print!("{USAGE}");
             0
         }
-        Ok(WindowArgs::Standalone) => run_terminal(None),
-        Ok(WindowArgs::Session(session)) => run_session_client(&session),
+        Ok(WindowArgs::Standalone) => {
+            so1_terminal::config::init();
+            run_terminal(None)
+        }
+        Ok(WindowArgs::Session(session)) => {
+            // The client applies fonts and colours; the server reads the same
+            // file for `shell` and `scrollback`.
+            so1_terminal::config::init();
+            run_session_client(&session)
+        }
         Err(error) => {
             eprintln!("so1term: {error}");
             eprint!("{USAGE}");

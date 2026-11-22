@@ -2,6 +2,7 @@ pub use so1_term_core::{
     apc, attach, block_navigation, blocks, graphics, keyboard, layout, model, osc, placements,
     renderer,
 };
+pub mod config;
 pub mod control;
 pub mod graphics_pipeline;
 pub mod pty;
@@ -52,10 +53,11 @@ impl PaneRenderInput {
         }
     }
 
-    /// Resolves colors, the cursor and the selection highlight into render cells.
-    pub fn render_cells(&self) -> Vec<Vec<renderer::RenderCell>> {
+    /// Resolves colors (with `palette`), the cursor and the selection
+    /// highlight into render cells.
+    pub fn render_cells(&self, palette: &renderer::Palette) -> Vec<Vec<renderer::RenderCell>> {
         let cursor = self.cursor.unwrap_or((usize::MAX, usize::MAX));
-        let mut cells = renderer::render_cells(&self.rows, cursor);
+        let mut cells = renderer::render_cells_with_palette(&self.rows, cursor, palette);
         for &(column, row) in &self.selected {
             if let Some(cell) = cells.get_mut(row).and_then(|row| row.get_mut(column)) {
                 renderer::apply_selection_highlight(cell);
@@ -160,7 +162,7 @@ mod tests {
         let input = super::PaneRenderInput::from_model(&model);
         assert_eq!(input.cursor, Some((2, 0)));
         assert_eq!(input.selected, model.selected_cells());
-        let cells = input.render_cells();
+        let cells = input.render_cells(&crate::renderer::Palette::default());
         assert!(cells[0][2].cursor);
         let plain = crate::renderer::render_cells(&input.rows, (2, 0));
         for &(column, row) in &input.selected {
@@ -172,7 +174,7 @@ mod tests {
         };
         assert!(
             hidden
-                .render_cells()
+                .render_cells(&crate::renderer::Palette::default())
                 .iter()
                 .flatten()
                 .all(|cell| !cell.cursor)

@@ -1,0 +1,30 @@
+# so1term configuration example.
+# Copy to ~/.config/so1term/so1term.conf (or point $SO1TERM_CONFIG at it).
+# One `key = value` per line; lines starting with `#` are comments.
+# Changes apply the next time so1term (or so1term-server) starts.
+
+# font = ~/.local/share/fonts/JetBrainsMono-Regular.ttf
+# font_size = 14
+# shell = /usr/bin/zsh
+# scrollback = 10000
+
+# Colours (#rrggbb). These are the built-in defaults.
+foreground = #dcdcdc
+background = #14161c
+# cursor = #f0c674
+color0 = #000000
+color1 = #cd3131
+color2 = #0dbc79
+color3 = #e5e510
+color4 = #2472c8
+color5 = #bc3fbc
+color6 = #11a8cd
+color7 = #e5e5e5
+color8 = #666666
+color9 = #f14c4c
+color10 = #23d18b
+color11 = #f5f543
+color12 = #3b8eea
+color13 = #d670d6
+color14 = #29b8db
+color15 = #ffffff

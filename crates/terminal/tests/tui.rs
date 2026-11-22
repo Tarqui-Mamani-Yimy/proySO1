@@ -64,6 +64,8 @@ impl Pane {
             .args(["--session", SESSION])
             .env("XDG_RUNTIME_DIR", &root)
             .env("SO1TERM_SHELL", "/bin/sh")
+            // Never read the developer's own so1term.conf.
+            .env("SO1TERM_CONFIG", "/dev/null")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("LANG", "C.UTF-8")

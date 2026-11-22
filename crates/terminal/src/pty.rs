@@ -477,7 +477,7 @@ impl Pty {
         F: Fn() + Send + Sync + 'static,
     {
         let notify = std::sync::Arc::new(notify);
-        if let Some(override_path) = std::env::var_os("SO1TERM_SHELL") {
+        if let Some(override_path) = shell_override() {
             let callback = std::sync::Arc::clone(&notify);
             return Self::spawn_notified(override_path, cwd, cols, rows, move || callback());
         }
@@ -922,8 +922,13 @@ fn other_io(error: impl std::fmt::Display) -> io::Error {
 
 /// Resolve the default so1sh executable, preferring a sibling to PATH.
 #[cfg(unix)]
+/// The shell chosen by the user: `SO1TERM_SHELL`, else the config file's `shell`.
+fn shell_override() -> Option<std::ffi::OsString> {
+    std::env::var_os("SO1TERM_SHELL").or_else(|| crate::config::current().shell.clone())
+}
+
 pub fn resolve_shell() -> PathBuf {
-    if let Some(value) = std::env::var_os("SO1TERM_SHELL") {
+    if let Some(value) = shell_override() {
         return PathBuf::from(value);
     }
     let sibling = std::env::current_exe()

@@ -49,7 +49,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "Usage: so1term-server [--session NAME]\n\
 Runs a persistent so1term session (default name: default) that outlives its clients.\n\
-Control it with so1ctl; stop it with `so1ctl shutdown` or by exiting its last shell.";
+Control it with so1ctl; stop it with `so1ctl shutdown` or by exiting its last shell.\n\
+Reads `shell` and `scrollback` from $SO1TERM_CONFIG or ~/.config/so1term/so1term.conf.";
 
 fn main() -> ExitCode {
     #[cfg(unix)]
@@ -769,6 +770,8 @@ mod unix {
                 return ExitCode::from(2);
             }
         };
+        // Panes take `shell` and `scrollback` from the configuration file.
+        so1_terminal::config::init();
         // The session must survive the terminal that launched it.
         unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
 

@@ -441,20 +441,64 @@ pub fn grid_size(width: u32, height: u32, cell_width: f32, cell_height: f32) -> 
     (cols.max(1), rows.max(1))
 }
 
-pub fn color_rgb(color: CellColor) -> [u8; 3] {
-    match color {
-        CellColor::Rgb(r, g, b) => [r, g, b],
-        CellColor::Named(index) => match index {
-            0..=15 => ANSI[index as usize],
-            256 => [220, 220, 220],
-            257 => [20, 22, 28],
-            258 => [255, 255, 255],
-            259..=266 => ANSI[(index - 259) as usize],
-            267 => [220, 220, 220],
-            _ => [220, 220, 220],
-        },
-        CellColor::Indexed(index) => indexed_rgb(index),
+/// Colours used to resolve symbolic cell colours. `Default` is so1term's
+/// built-in theme; a configuration file may override any entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    /// ANSI colours 0-15 (also used by the 256-colour table's first 16 entries).
+    pub ansi: [[u8; 3]; 16],
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    /// Block cursor fill; `None` draws the cursor by inverting the cell.
+    pub cursor: Option<[u8; 3]>,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            ansi: ANSI,
+            foreground: [220, 220, 220],
+            background: [20, 22, 28],
+            cursor: None,
+        }
     }
+}
+
+impl Palette {
+    /// Resolves a cell colour. Named indices follow vte: 256 foreground,
+    /// 257 background, 258 cursor, 259-266 dim ANSI, 267 bright foreground.
+    pub fn rgb(&self, color: CellColor) -> [u8; 3] {
+        match color {
+            CellColor::Rgb(r, g, b) => [r, g, b],
+            CellColor::Named(index) => match index {
+                0..=15 => self.ansi[index as usize],
+                257 => self.background,
+                258 => self.cursor.unwrap_or([255, 255, 255]),
+                259..=266 => self.ansi[(index - 259) as usize],
+                _ => self.foreground,
+            },
+            CellColor::Indexed(index) => match index {
+                0..=15 => self.ansi[index as usize],
+                _ => indexed_rgb(index),
+            },
+        }
+    }
+
+    /// The window clear colour (the default background), in linear space.
+    pub fn clear_color(&self) -> [f64; 4] {
+        let [r, g, b] = self.background;
+        [
+            f64::from(srgb_to_linear(r)),
+            f64::from(srgb_to_linear(g)),
+            f64::from(srgb_to_linear(b)),
+            1.0,
+        ]
+    }
+}
+
+/// Resolves a cell colour with the built-in palette.
+pub fn color_rgb(color: CellColor) -> [u8; 3] {
+    Palette::default().rgb(color)
 }
 
 pub fn srgb_to_linear(channel: u8) -> f32 {
@@ -466,14 +510,9 @@ pub fn srgb_to_linear(channel: u8) -> f32 {
     }
 }
 
+/// The built-in palette's clear colour.
 pub fn surface_clear_color() -> [f64; 4] {
-    let [r, g, b] = color_rgb(CellColor::Named(257));
-    [
-        f64::from(srgb_to_linear(r)),
-        f64::from(srgb_to_linear(g)),
-        f64::from(srgb_to_linear(b)),
-        1.0,
-    ]
+    Palette::default().clear_color()
 }
 
 fn indexed_rgb(index: u8) -> [u8; 3] {
@@ -514,7 +553,18 @@ const ANSI: [[u8; 3]; 16] = [
     [255, 255, 255],
 ];
 
+/// Resolves cells with the built-in palette.
 pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<Vec<RenderCell>> {
+    render_cells_with_palette(rows, cursor, &Palette::default())
+}
+
+/// Resolves cells with `palette`. The cursor cell is inverted, or filled with
+/// `palette.cursor` (text drawn in the background colour) when one is set.
+pub fn render_cells_with_palette(
+    rows: &[Vec<VisibleCell>],
+    cursor: (usize, usize),
+    palette: &Palette,
+) -> Vec<Vec<RenderCell>> {
     rows.iter()
         .enumerate()
         .map(|(row, cells)| {
@@ -523,19 +573,22 @@ pub fn render_cells(rows: &[Vec<VisibleCell>], cursor: (usize, usize)) -> Vec<Ve
                 .enumerate()
                 .map(move |(col, cell)| {
                     let active = (col, row) == cursor;
-                    let inverse = cell.inverse ^ active;
+                    let (foreground, background) = match palette.cursor {
+                        Some(fill) if active => (palette.background, fill),
+                        _ => {
+                            let inverse = cell.inverse ^ active;
+                            let (fg, bg) = if inverse {
+                                (cell.background, cell.foreground)
+                            } else {
+                                (cell.foreground, cell.background)
+                            };
+                            (palette.rgb(fg), palette.rgb(bg))
+                        }
+                    };
                     RenderCell {
                         character: cell.character,
-                        foreground: color_rgb(if inverse {
-                            cell.background
-                        } else {
-                            cell.foreground
-                        }),
-                        background: color_rgb(if inverse {
-                            cell.foreground
-                        } else {
-                            cell.background
-                        }),
+                        foreground,
+                        background,
                         bold: cell.bold,
                         cursor: active,
                     }
@@ -917,6 +970,62 @@ mod tests {
                 1.0,
             ]
         );
+    }
+
+    #[test]
+    fn default_palette_matches_the_built_in_colours() {
+        let palette = Palette::default();
+        for color in [
+            CellColor::Named(1),
+            CellColor::Named(256),
+            CellColor::Named(257),
+            CellColor::Named(258),
+            CellColor::Named(260),
+            CellColor::Named(267),
+            CellColor::Indexed(3),
+            CellColor::Indexed(196),
+            CellColor::Rgb(1, 2, 3),
+        ] {
+            assert_eq!(palette.rgb(color), color_rgb(color), "{color:?}");
+        }
+        assert_eq!(palette.clear_color(), surface_clear_color());
+    }
+
+    #[test]
+    fn custom_palette_resolves_named_indexed_and_dim_colours() {
+        let mut palette = Palette::default();
+        palette.ansi[1] = [1, 1, 1];
+        palette.foreground = [2, 2, 2];
+        palette.background = [3, 3, 3];
+        assert_eq!(palette.rgb(CellColor::Named(1)), [1, 1, 1]);
+        assert_eq!(palette.rgb(CellColor::Indexed(1)), [1, 1, 1]);
+        assert_eq!(palette.rgb(CellColor::Named(260)), [1, 1, 1]);
+        assert_eq!(palette.rgb(CellColor::Named(256)), [2, 2, 2]);
+        assert_eq!(palette.rgb(CellColor::Named(267)), [2, 2, 2]);
+        assert_eq!(palette.rgb(CellColor::Named(257)), [3, 3, 3]);
+        assert_eq!(palette.rgb(CellColor::Indexed(196)), [255, 0, 0]);
+    }
+
+    #[test]
+    fn configured_cursor_colour_fills_the_cursor_cell() {
+        let cell = |character| VisibleCell {
+            character,
+            foreground: CellColor::Named(256),
+            background: CellColor::Named(257),
+            bold: false,
+            inverse: false,
+        };
+        let rows = vec![vec![cell('a'), cell('b')]];
+        let palette = Palette {
+            cursor: Some([9, 8, 7]),
+            ..Palette::default()
+        };
+        let cells = render_cells_with_palette(&rows, (0, 0), &palette);
+        assert_eq!(cells[0][0].background, [9, 8, 7]);
+        assert_eq!(cells[0][0].foreground, palette.background);
+        assert!(cells[0][0].cursor);
+        assert_eq!(cells[0][1].background, palette.background);
+        assert_eq!(cells[0][1].foreground, palette.foreground);
     }
 
     #[test]

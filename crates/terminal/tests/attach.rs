@@ -70,6 +70,8 @@ impl Scratch {
             .args(["--session", session])
             .env("XDG_RUNTIME_DIR", &self.root)
             .env("SO1TERM_SHELL", "/bin/sh")
+            // Never read the developer's own so1term.conf.
+            .env("SO1TERM_CONFIG", "/dev/null")
             .env("PS1", "$ ")
             .env_remove("SO1TERM_SOCKET")
             .current_dir(&self.root)

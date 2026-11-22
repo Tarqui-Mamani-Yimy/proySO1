@@ -104,6 +104,9 @@ pub struct Cursor {
     pub shape: vte::ansi::CursorShape,
 }
 
+/// Lines of history a model keeps unless configured otherwise.
+pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
 pub struct Model {
     term: Term<Listener>,
     processor: Processor,
@@ -388,10 +391,11 @@ impl Dimensions for Size {
 
 impl Model {
     pub fn new(cols: usize, rows: usize) -> Self {
-        Self::with_scrollback_limit(cols, rows, 10_000)
+        Self::with_scrollback_limit(cols, rows, DEFAULT_SCROLLBACK)
     }
 
-    pub(crate) fn with_scrollback_limit(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
+    /// A model keeping at most `scrollback_limit` lines of history.
+    pub fn with_scrollback_limit(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         let listener = Listener::default();
         let config = Config {
             scrolling_history: scrollback_limit,

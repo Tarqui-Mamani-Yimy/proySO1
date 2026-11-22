@@ -2592,3 +2592,48 @@ mod traps {
         }
     }
 }
+
+/// A lone `[` (the test command) is not a pattern, so it never reads the
+/// directory: a 20k-iteration `[` loop stays fast in a 3000-entry directory.
+#[test]
+fn lone_bracket_does_not_trigger_pathname_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..3000 {
+        std::fs::write(dir.path().join(format!("f{n}")), "").unwrap();
+    }
+    std::fs::write(dir.path().join("["), "").unwrap();
+    let started = std::time::Instant::now();
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo $i; echo [ [abc a[/]b; echo f[12]",
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("20000\n[ [abc a[/]b\nf1 f2\n", 0),
+        "stderr: {stderr}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "took {elapsed:?}"
+    );
+}
+
+/// An unclosed `[` in a pattern matches a literal `[`, as in dash: in
+/// pathname expansion, `case` patterns and `${var#pattern}`.
+#[test]
+fn unclosed_bracket_in_patterns_matches_literally() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["[", "[abc", "a[", "a", "b"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let (stdout, stderr, code) = run_in(
+        dir.path(),
+        "echo [*; echo *[; echo [abc; case \"[\" in [) echo c1;; esac; v=\"[ab]\"; echo ${v#[}",
+    );
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[ [abc\n[ a[\n[abc\nc1\nab]\n", 0),
+        "stderr: {stderr}"
+    );
+}

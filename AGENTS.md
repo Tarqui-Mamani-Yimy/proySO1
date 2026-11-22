@@ -271,9 +271,12 @@ Fork-dominated operations (typical coding agent workload) are at parity:
 | Heredocs | **0.8x** | Faster than dash |
 | Pipelines | **1.1x** | posix_spawn, exec-direct |
 | External commands | **1.1x** | At parity |
-| Tight arith loops | ~28x | String allocation dominated |
+| Tight `[ ... ]` + arith loops | ~2x | Measured in release, 300k iterations |
 
-The arith loop gap requires integer variable representation (dash's approach).
+The old ~28x loop gap was not arithmetic: an unquoted lone `[` triggered
+pathname expansion (a directory read) on every `[ ... ]` test. `[` is now a
+pattern only when a `]` closes it in the same path component, as in dash;
+arithmetic and assignment were already within ~1.3x of dash.
 
 ## Design Lineage — What We Actually Took
 
@@ -520,7 +523,6 @@ parser capability.
 - A background simple command (`cmd &`) forks a subshell that runs `cmd` as its
   child, so `$!` names the subshell; `kill $!` does not reach `cmd` (dash execs it)
 - `~user` expansion requires getpwnam (not available stdlib-only)
-- Arith loops ~28x slower than dash (string allocation; fixable with integer var repr)
 
 ## What's Not Implemented (by design)
 

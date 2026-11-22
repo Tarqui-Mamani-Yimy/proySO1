@@ -108,18 +108,46 @@ fn glob_recursive(
 
 /// Check if a string contains glob metacharacters.
 /// CTLESC- and backslash-preceded chars are escaped (not glob-active).
+///
+/// As in dash's `expmeta`, `[` is active only when a `]` closes it before the
+/// end of the path component: the first member (after an optional `!`) is
+/// taken literally, so `[]]` is a pattern while `[`, `[]` and `a[/]b` are not.
+/// This keeps the test command `[` from reading the directory on every call.
 pub fn has_glob_chars(s: &str) -> bool {
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' | '?' | '[' => return true,
-            c if c == crate::lexer::CTLESC || c == '\\' => {
-                chars.next(); // skip escaped char
-            }
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' | '?' => return true,
+            '[' if bracket_closes(&chars, i + 1, true) => return true,
+            c if is_escape(c) => i += 1, // skip escaped char
             _ => {}
         }
+        i += 1;
     }
     false
+}
+
+/// Whether the bracket expression whose members start at `start` is closed
+/// by a `]` before the end of the word (or before a `/`, for pathnames).
+fn bracket_closes(chars: &[char], start: usize, stop_at_slash: bool) -> bool {
+    let mut q = start;
+    if chars.get(q) == Some(&'!') {
+        q += 1;
+    }
+    loop {
+        if chars.get(q).copied().is_some_and(is_escape) {
+            q += 1;
+        }
+        match chars.get(q) {
+            None => return false,
+            Some('/') if stop_at_slash => return false,
+            Some(_) => q += 1,
+        }
+        if chars.get(q) == Some(&']') {
+            return true;
+        }
+    }
 }
 
 /// POSIX fnmatch-style pattern matching.
@@ -173,6 +201,14 @@ fn fnmatch_inner(pat: &[char], mut pi: usize, s: &[char], mut si: usize) -> bool
                     }
                 }
                 return false;
+            }
+            // An unclosed `[` is an ordinary character (dash's `pmatch`).
+            '[' if !bracket_closes(pat, pi + 1, false) => {
+                if si >= s.len() || s[si] != '[' {
+                    return false;
+                }
+                pi += 1;
+                si += 1;
             }
             '[' => {
                 if si >= s.len() {
@@ -313,5 +349,40 @@ mod tests {
         assert!(has_glob_chars("[abc]"));
         assert!(!has_glob_chars("plain"));
         assert!(!has_glob_chars("escaped\\*"));
+    }
+
+    /// An unclosed `[` matches itself literally (dash's `pmatch`).
+    #[test]
+    fn fnmatch_unclosed_bracket_is_literal() {
+        assert!(fnmatch("[", "["));
+        assert!(fnmatch("[*", "[abc"));
+        assert!(fnmatch("*[", "a["));
+        assert!(fnmatch("a[b", "a[b"));
+        assert!(!fnmatch("[abc", "a"));
+        assert!(!fnmatch("[", "a"));
+        assert!(fnmatch("[]]", "]"));
+        assert!(fnmatch("[!]]", "a"));
+    }
+
+    /// As in dash, `[` starts a pattern only when a `]` closes it within the
+    /// same path component; the first member may itself be `]`.
+    #[test]
+    fn has_glob_chars_needs_a_closed_bracket() {
+        for (word, expected) in [
+            ("[", false),
+            ("[abc", false),
+            ("[]", false),
+            ("[!]", false),
+            ("a[/]b", false),
+            ("[a\\]", false),
+            ("[]]", true),
+            ("[!]]", true),
+            ("[!a]", true),
+            ("x[ab]y", true),
+            ("[ab]/c", true),
+            ("[*", true),
+        ] {
+            assert_eq!(has_glob_chars(word), expected, "{word:?}");
+        }
     }
 }

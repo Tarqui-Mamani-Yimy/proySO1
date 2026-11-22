@@ -55,10 +55,13 @@ afuera.
    - Primero carga al arrancar; la recarga en caliente después, aplicada por cliente
      y no al servidor de sesión.
 
-7. **`VarValue::Int` en epsh.** Esfuerzo: medio.
-   - `var.rs` ya cachea enteros; el costo restante es crear un `String` en cada
-     escritura.
-   - Medir antes y comparar contra el comportamiento anterior.
+7. ~~**`VarValue::Int` en epsh.**~~ Descartado tras medir (2026-11-22).
+   - La aritmética y la asignación ya estaban a ~1,3x de dash (`i=$((i+1))`:
+     271 ms contra 201 ms en 300k iteraciones, build release).
+   - La brecha de ~28x venía de que cada `[` sin comillas disparaba una
+     expansión de rutas (lectura del directorio). Se reemplazó por ese
+     arreglo: `[` solo es patrón si un `]` lo cierra, como en dash. El loop
+     de 300k iteraciones pasó de 4,7 s a 0,76 s (dash: 0,39 s).
 
 8. **Empaquetado** (binarios, AUR, Homebrew). Depende de decidir la licencia
    (`planing.md` §6).

@@ -164,7 +164,7 @@ with dash:
 | Heredocs | **0.8x** | Faster than dash |
 | Pipelines | **1.1x** | posix_spawn, exec-direct |
 | External commands | **1.1x** | At parity |
-| Tight arithmetic loops | **~28x** | String allocation dominated |
+| Tight `[ ... ]` + arithmetic loops | **~2x** | Release build, 300k iterations |
 
 ## Design
 

@@ -88,17 +88,20 @@ check "package.sh accepts a relative OUT" \
 RENDER=$SCRATCH/render
 mkdir -p "$SCRATCH/dist-both"
 cp "$DIST"/*.sha256 "$SCRATCH/dist-both/"
-for pkg in shellux nulix; do # the macOS sums are stand-ins off macOS
-    [ -f "$SCRATCH/dist-both/$pkg-$VERSION-aarch64-apple-darwin.tar.gz.sha256" ] ||
-        cp "$DIST/$pkg-$VERSION-$TARGET.tar.gz.sha256" "$SCRATCH/dist-both/$pkg-$VERSION-aarch64-apple-darwin.tar.gz.sha256"
+for pkg in shellux nulix; do # the other target's sums are stand-ins for the host's
+    for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+        [ -f "$SCRATCH/dist-both/$pkg-$VERSION-$target.tar.gz.sha256" ] ||
+            cp "$DIST/$pkg-$VERSION-$TARGET.tar.gz.sha256" "$SCRATCH/dist-both/$pkg-$VERSION-$target.tar.gz.sha256"
+    done
 done
+LINUX_SUM=$(cut -d ' ' -f 1 "$SCRATCH/dist-both/shellux-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256")
 check "render packaging" "sh $ROOT/scripts/render-packaging.sh $VERSION $SCRATCH/dist-both $RENDER > /dev/null"
 check "no placeholders left" "! grep -rq '@[A-Z_0-9]*@' $RENDER"
-check "formula carries the linux checksum" \
-    "grep -q \"\$(cut -d ' ' -f 1 $DIST/shellux-$VERSION-$TARGET.tar.gz.sha256)\" $RENDER/homebrew/shellux.rb"
+check "formula carries the Linux checksum" \
+    "grep -q $LINUX_SUM $RENDER/homebrew/shellux.rb"
 check "nulix formula depends on shellux" "grep -q 'depends_on \"shellux\"' $RENDER/homebrew/nulix.rb"
 check "SRCINFO lists version and checksum" \
-    "grep -q \"pkgver = $VERSION\" $RENDER/aur/shellux-bin/.SRCINFO && grep -q \"sha256sums_x86_64 = \$(cut -d ' ' -f 1 $DIST/shellux-$VERSION-$TARGET.tar.gz.sha256)\" $RENDER/aur/shellux-bin/.SRCINFO"
+    "grep -q \"pkgver = $VERSION\" $RENDER/aur/shellux-bin/.SRCINFO && grep -q \"sha256sums_x86_64 = $LINUX_SUM\" $RENDER/aur/shellux-bin/.SRCINFO"
 check "missing checksum is refused" \
     "! sh $ROOT/scripts/render-packaging.sh $VERSION $DIST $SCRATCH/render-bad > $SCRATCH/render.log 2>&1 && grep -q 'missing' $SCRATCH/render.log"
 if [ "$TARGET" = x86_64-unknown-linux-gnu ]; then

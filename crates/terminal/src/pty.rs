@@ -920,13 +920,13 @@ fn other_io(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-/// Resolve the default so1sh executable, preferring a sibling to PATH.
-#[cfg(unix)]
 /// The shell chosen by the user: `SO1TERM_SHELL`, else the config file's `shell`.
 fn shell_override() -> Option<std::ffi::OsString> {
     std::env::var_os("SO1TERM_SHELL").or_else(|| crate::config::current().shell.clone())
 }
 
+/// Resolve the default so1sh executable, preferring a sibling to PATH.
+#[cfg(unix)]
 pub fn resolve_shell() -> PathBuf {
     if let Some(value) = shell_override() {
         return PathBuf::from(value);

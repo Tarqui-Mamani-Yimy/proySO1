@@ -17,12 +17,13 @@ Branch: `feat/packaging`. Delivery: merge to main on the user's request; publish
 
 | ID | Specs | Route | Status | Commit |
 |---|---|---|---|---|
-| T1 — package.sh + install.sh with local tests | S3, S5 | inline | in progress | |
-| T2 — CI and release workflows | S4 | inline | pending | |
-| T3 — Homebrew/AUR templates + render script, docs | S5, S6 | inline | pending | |
+| T1 — package.sh + install.sh with local tests | S3, S5 | inline | done | 82a535c |
+| T2 — CI and release workflows | S4 | inline | done (not run on GitHub yet) | 82a535c |
+| T3 — Homebrew/AUR templates + render script, docs | S5, S6 | inline | done | 82a535c |
 
 ## Log
 
 - **L1** (2026-11-22, user): "ok, hagamos eso" (start item 8 with the scope decision).
 - **L2** (2026-11-22, user answer): "Dos paquetes: shellux y nulix (Recommended)".
 - **L3**: epsh attribution already satisfied (LICENSE lists Joshua Li and Yimy Tarqui Mamani; crates/epsh/LICENSE is MIT). Nulix links Wayland/X11 at run time (wayland-sys, x11-dl); CI needs pkg-config and X11/xkbcommon/Wayland headers.
+- **L4**: `sh scripts/test-install.sh` passes all 23 checks locally (tarball contents, checksums, install of both packages from file://, installed binaries run, tampered checksum / unsupported platform / unknown package refused, rendered formulas and AUR files with no placeholders, PKGBUILD package() installs the expected files). Workflows parse as YAML; the tag/version check was run locally for a matching and a mismatching tag. Not verified locally: the workflows on GitHub runners, the macOS build and tests, and the Homebrew formulas (no ruby/brew here). The GitHub repo is public and Actions are enabled. Risk: item 5 (CI, release, installers) → independent verifier.

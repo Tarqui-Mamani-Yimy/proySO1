@@ -2554,4 +2554,41 @@ mod traps {
             );
         }
     }
+
+    /// Follow-ups from the native review, each validated against dash.
+    #[test]
+    fn traps_review_follow_ups_match_dash() {
+        let cases: &[(&str, &str, i32)] = &[
+            // A subshell started by a trap action still runs its own traps.
+            (
+                "trap '( trap \"echo C\" USR2; sh -c \"kill -USR2 \\$PPID\"; echo sub )' USR1; kill -USR1 $$; echo end",
+                "C\nsub\nend\n",
+                0,
+            ),
+            // `wait %N` is interrupted like `wait PID`.
+            (
+                "trap 'echo T' USR1; exec sleep 3 & j=$!; (sleep 0.2; kill -USR1 $$) & wait %1; echo st=$?; kill $j",
+                "T\nst=138\n",
+                0,
+            ),
+            // Background jobs and pipeline stages reset caught traps too.
+            (
+                "trap 'echo T' TERM; ( sh -c 'kill -TERM $PPID'; sleep 0.3; echo alive ) & wait $!; echo st=$?",
+                "st=143\n",
+                0,
+            ),
+            (
+                "trap 'echo T' TERM; ( sh -c 'kill -TERM $PPID'; sleep 0.3; echo alive ) | cat; echo st=$?",
+                "st=0\n",
+                0,
+            ),
+        ];
+        for (script, stdout, code) in cases {
+            assert_eq!(
+                limited(script),
+                (stdout.to_string(), *code),
+                "script: {script}"
+            );
+        }
+    }
 }

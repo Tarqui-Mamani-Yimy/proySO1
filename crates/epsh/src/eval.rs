@@ -2053,9 +2053,12 @@ impl Shell {
 
     /// POSIX: a subshell resets caught traps to their default action; ignored
     /// signals stay ignored. Signals that reached the parent before the fork
-    /// are dropped. The EXIT trap is handled by each fork site.
+    /// are dropped, and a child of a trap action is no longer inside it. The
+    /// EXIT trap is handled by each fork site.
     fn reset_caught_traps_after_fork(&mut self) {
         crate::signal::clear_pending();
+        // A child forked from inside a trap action runs its own traps.
+        self.in_trap = false;
         self.traps.retain(|name, action| {
             if action.is_empty() || name.eq_ignore_ascii_case("EXIT") {
                 return true;

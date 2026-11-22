@@ -506,7 +506,14 @@ parser capability.
 
 ## Known Limitations
 
-- Signal traps fire between commands but not during blocking waits
+- Traps follow dash/POSIX timing: a trapped signal runs its action as soon as
+  the current command completes (also inside builtin-only loops), with `$?`
+  restored afterwards. A foreground command, pipeline or command substitution is
+  never cut short; only the `wait` builtin is, returning 128+signal before the
+  trap runs. Forked subshells reset caught traps; ignored signals stay ignored.
+  The `read` builtin is not interrupted by traps.
+- A background simple command (`cmd &`) forks a subshell that runs `cmd` as its
+  child, so `$!` names the subshell; `kill $!` does not reach `cmd` (dash execs it)
 - `~user` expansion requires getpwnam (not available stdlib-only)
 - Arith loops ~28x slower than dash (string allocation; fixable with integer var repr)
 

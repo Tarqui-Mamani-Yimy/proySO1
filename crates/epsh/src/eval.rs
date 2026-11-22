@@ -447,6 +447,8 @@ pub struct Shell {
     /// True when executing inside a forked child (pipeline stage, command subst).
     /// Subshells skip the extra fork to avoid pipe fd leaks.
     pub(crate) in_forked_child: bool,
+    /// True while a trap action runs; signals arriving meanwhile wait for it.
+    in_trap: bool,
     /// True when the current eval context will exit after the command completes.
     /// Allows eval_external to exec directly instead of fork+exec (dash's EV_EXIT).
     pub(crate) ev_exit: bool,
@@ -825,6 +827,7 @@ impl ShellBuilder {
             traps: FxHashMap::default(),
             tested: false,
             in_forked_child: false,
+            in_trap: false,
             ev_exit: false,
             cancel: self.cancel,
             stdout_sink: self.stdout_sink,
@@ -886,6 +889,7 @@ impl Shell {
             traps: FxHashMap::default(),
             tested: false,
             in_forked_child: false,
+            in_trap: false,
             ev_exit: false,
             cancel: None,
             stdout_sink: None,
@@ -1971,7 +1975,11 @@ impl Shell {
                     return ControlFlow::Break(self.exit_status);
                 }
             }
-            self.run_pending_traps();
+            // Signals that arrived after the command's own trap check.
+            if let Err(EvalError::Shell(ShellError::Exit(n))) = self.run_pending_traps() {
+                self.run_exit_trap();
+                return ControlFlow::Break(n);
+            }
         }
 
         ControlFlow::Continue(self.exit_status)
@@ -1999,23 +2007,64 @@ impl Shell {
         }
     }
 
-    /// Check for pending signals and run their trap handlers.
-    fn run_pending_traps(&mut self) {
-        for sig_name in crate::signal::take_pending() {
-            if let Some(action) = self.traps.get(sig_name) {
-                // Empty action means ignore (trap '' SIG)
-                if action.is_empty() {
+    /// Run the trap actions of signals that arrived since the last check.
+    ///
+    /// Called after every command completes (dash's `dotrap` in `evaltree`), so
+    /// traps fire before the next command, including inside builtin-only loops.
+    /// `$?` is restored after the actions; an `exit` in an action propagates.
+    fn run_pending_traps(&mut self) -> EvalResult<()> {
+        if self.in_trap || !crate::signal::any_pending() {
+            return Ok(());
+        }
+        self.in_trap = true;
+        let saved_status = self.exit_status;
+        let result = self.run_trap_actions();
+        self.in_trap = false;
+        if result.is_ok() {
+            self.exit_status = saved_status;
+        }
+        result
+    }
+
+    fn run_trap_actions(&mut self) -> EvalResult<()> {
+        loop {
+            let pending = crate::signal::take_pending();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for sig_name in pending {
+                let Some(action) = self
+                    .traps
+                    .get(sig_name)
+                    .or_else(|| self.traps.get(&format!("SIG{sig_name}")))
+                    .filter(|action| !action.is_empty())
+                    .cloned()
+                else {
                     continue;
-                }
-                let action = action.clone();
-                let mut parser = Parser::new(&action);
-                if let Ok(program) = parser.parse() {
+                };
+                if let Ok(program) = Parser::new(&action).parse() {
                     for cmd in &program.commands {
-                        let _ = self.eval_command_internal(cmd);
+                        self.eval_command_internal(cmd)?;
                     }
                 }
             }
         }
+    }
+
+    /// POSIX: a subshell resets caught traps to their default action; ignored
+    /// signals stay ignored. Signals that reached the parent before the fork
+    /// are dropped. The EXIT trap is handled by each fork site.
+    fn reset_caught_traps_after_fork(&mut self) {
+        crate::signal::clear_pending();
+        self.traps.retain(|name, action| {
+            if action.is_empty() || name.eq_ignore_ascii_case("EXIT") {
+                return true;
+            }
+            if let Some(signal) = crate::signal::name_to_signal(&name.to_ascii_uppercase()) {
+                crate::signal::reset_handler(signal);
+            }
+            false
+        });
     }
 
     /// Run the EXIT trap if one is set.
@@ -2152,6 +2201,7 @@ impl Shell {
         self.check_interactive_interrupt()?;
         let status = result?;
         self.exit_status = status;
+        self.run_pending_traps()?;
 
         // Errexit check — mirrors dash's eval.c line 330.
         // Only fires from "leaf" nodes (simple commands, pipelines, subshells)
@@ -2934,6 +2984,7 @@ impl Shell {
 
                 if pid == 0 {
                     self.reset_child_tracking_after_fork();
+                    self.reset_caught_traps_after_fork();
                     if self.opts.interactive {
                         let _ = crate::signal::reset_job_signals();
                     }
@@ -3075,6 +3126,7 @@ impl Shell {
 
             if pid == 0 {
                 self.reset_child_tracking_after_fork();
+                self.reset_caught_traps_after_fork();
                 if self.opts.interactive {
                     let _ = crate::signal::reset_job_signals();
                 }
@@ -3126,6 +3178,7 @@ impl Shell {
 
             if pid == 0 {
                 self.reset_child_tracking_after_fork();
+                self.reset_caught_traps_after_fork();
                 if self.opts.interactive {
                     let _ = crate::signal::reset_job_signals();
                 }
@@ -3265,6 +3318,7 @@ impl Shell {
 
             if pid == 0 {
                 self.reset_child_tracking_after_fork();
+                self.reset_caught_traps_after_fork();
                 if self.opts.interactive {
                     let _ = crate::signal::reset_job_signals();
                 }

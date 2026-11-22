@@ -2337,3 +2337,221 @@ mod asynchronous_lists {
         );
     }
 }
+
+/// Trap timing (odd/tasks/trap-timing.md): traps run after the current command
+/// completes, before the next one; `wait` is interrupted by trapped signals;
+/// forked subshells reset caught traps. Expected outputs match dash.
+mod traps {
+    use super::epsh;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    /// Like `run`, but kills epsh and fails if it outlives `limit`, so a trap
+    /// that never fires cannot hang the suite. Returns the elapsed time too.
+    fn run_limited(script: &str, limit: Duration) -> (String, i32, Duration) {
+        let started = Instant::now();
+        let mut child = epsh()
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to execute epsh");
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if started.elapsed() > limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("script did not finish within {limit:?}: {script:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.code().unwrap_or(128),
+            started.elapsed(),
+        )
+    }
+
+    fn limited(script: &str) -> (String, i32) {
+        let (stdout, code, _) = run_limited(script, Duration::from_secs(10));
+        (stdout, code)
+    }
+
+    #[test]
+    fn traps_run_before_the_next_command() {
+        assert_eq!(
+            limited("trap 'echo T' TERM; kill -TERM $$; echo after"),
+            ("T\nafter\n".into(), 0)
+        );
+    }
+
+    #[test]
+    fn traps_wait_for_the_foreground_external_command_to_finish() {
+        let (stdout, code, elapsed) = run_limited(
+            "trap 'echo T' TERM; (sleep 0.2; kill -TERM $$) & sleep 0.6; echo after",
+            Duration::from_secs(10),
+        );
+        assert_eq!((stdout.as_str(), code), ("T\nafter\n", 0));
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "sleep was cut short: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn traps_run_after_a_foreground_pipeline_and_command_substitution() {
+        assert_eq!(
+            limited(
+                "trap 'echo T' TERM; (sleep 0.2; kill -TERM $$) & sleep 0.5 | cat; echo after-pipe; \
+                 (sleep 0.2; kill -TERM $$) & x=$(sleep 0.5; echo v); echo got=$x"
+            ),
+            ("T\nafter-pipe\nT\ngot=v\n".into(), 0)
+        );
+    }
+
+    #[test]
+    fn traps_fire_inside_builtin_only_loops_and_exit_ends_the_shell() {
+        assert_eq!(
+            limited(
+                "i=0; trap 'echo T; exit 3' TERM; \
+                 while :; do i=$((i+1)); [ $i = 5 ] && kill -TERM $$; done; echo unreachable"
+            ),
+            ("T\n".into(), 3)
+        );
+    }
+
+    #[test]
+    fn traps_preserve_the_status_of_the_interrupted_command() {
+        assert_eq!(
+            limited(
+                "trap 'true' TERM; (sleep 0.1; kill -TERM $$) & sh -c 'sleep 0.4; exit 7'; echo st=$?"
+            ),
+            ("st=7\n".into(), 0)
+        );
+    }
+
+    #[test]
+    fn traps_run_for_every_trappable_signal() {
+        assert_eq!(
+            limited(
+                "trap 'echo U1' USR1; trap 'echo U2' USR2; trap 'echo A' ALRM; trap 'echo Q' QUIT; \
+                 kill -USR1 $$; kill -USR2 $$; kill -ALRM $$; kill -QUIT $$; echo end"
+            ),
+            ("U1\nU2\nA\nQ\nend\n".into(), 0)
+        );
+    }
+
+    #[test]
+    fn traps_interrupt_wait_with_a_pid_and_keep_the_job() {
+        let (stdout, code, elapsed) = run_limited(
+            "trap 'echo T' TERM; exec sleep 3 & j=$!; (sleep 0.2; kill -TERM $$) & \
+             wait $j; echo st=$?; kill $j; wait $j; echo st2=$?",
+            Duration::from_secs(10),
+        );
+        assert_eq!((stdout.as_str(), code), ("T\nst=143\nst2=143\n", 0));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait was not interrupted: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn traps_interrupt_wait_without_operands() {
+        let (stdout, code, elapsed) = run_limited(
+            "trap 'echo U' USR1; exec sleep 3 & j=$!; (sleep 0.2; kill -USR1 $$) & \
+             wait; echo st=$?; kill $j",
+            Duration::from_secs(10),
+        );
+        assert_eq!((stdout.as_str(), code), ("U\nst=138\n", 0));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait was not interrupted: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn traps_ignored_wait_signals_do_not_interrupt_wait() {
+        assert_eq!(
+            limited("trap '' USR1; sleep 0.4 & (sleep 0.1; kill -USR1 $$) & wait $!; echo st=$?"),
+            ("st=0\n".into(), 0)
+        );
+    }
+
+    #[test]
+    fn traps_caught_in_the_parent_are_reset_in_subshells() {
+        assert_eq!(
+            limited(
+                "trap 'echo T' TERM; (sh -c 'kill -TERM $PPID'; sleep 0.3; echo alive); echo st=$?"
+            ),
+            ("st=143\n".into(), 0)
+        );
+    }
+
+    #[test]
+    fn traps_ignored_in_the_parent_stay_ignored_in_subshells() {
+        assert_eq!(
+            limited("trap '' TERM; (sh -c 'kill -TERM $PPID'; echo alive); echo st=$?"),
+            ("alive\nst=0\n".into(), 0)
+        );
+    }
+
+    /// Probes from the independent verification, each validated against dash.
+    #[test]
+    fn traps_verification_probes_match_dash() {
+        let cases: &[(&str, &str, i32)] = &[
+            (
+                "trap 'echo E' EXIT; trap 'exit 3' USR1; kill -USR1 $$; echo no",
+                "E\n",
+                3,
+            ),
+            (
+                "trap 'return 4' USR1; f() { kill -USR1 $$; echo in; }; f; echo st=$?",
+                "st=4\n",
+                0,
+            ),
+            (
+                "trap 'break' USR1; for i in 1 2 3; do [ $i = 2 ] && kill -USR1 $$; echo $i; done; echo end",
+                "1\nend\n",
+                0,
+            ),
+            ("set -e; trap false USR1; kill -USR1 $$; echo ok", "", 1),
+            (
+                "trap 'echo T $?' USR1; (exit 5); kill -USR1 $$; echo st=$?",
+                "T 0\nst=0\n",
+                0,
+            ),
+            (
+                "trap 'echo U1' USR1; trap 'echo U2' USR2; ( kill -USR2 $$; kill -USR1 $$ ); echo after",
+                "U1\nU2\nafter\n",
+                0,
+            ),
+            (
+                "trap 'kill $j; exit 9' TERM; exec sleep 2 & j=$!; (sleep .2; kill $$) & wait; echo no",
+                "",
+                9,
+            ),
+            (
+                "trap 'echo T' CHLD; sleep 0.1 & sleep 0.5 & p=$!; wait $p; echo st=$?",
+                "T\nst=145\n",
+                0,
+            ),
+            ("trap 'echo T' TERM; ( trap; ); echo after", "after\n", 0),
+            (
+                "trap 'echo T' USR1; x=$(echo a; kill -USR1 $$; echo b); echo \"[$x]\"",
+                "T\n[a\nb]\n",
+                0,
+            ),
+        ];
+        for (script, stdout, code) in cases {
+            assert_eq!(
+                limited(script),
+                (stdout.to_string(), *code),
+                "script: {script}"
+            );
+        }
+    }
+}

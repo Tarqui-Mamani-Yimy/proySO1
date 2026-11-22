@@ -1,8 +1,11 @@
 //! Signal handling for trap execution.
 //!
 //! When a trap is set for a signal (e.g. `trap 'cleanup' INT`), we install a
-//! signal handler that sets a global atomic flag. The shell checks these flags
-//! between commands and runs the corresponding trap action.
+//! signal handler that sets a per-signal atomic flag. The shell checks these
+//! flags after every command completes and runs the corresponding trap action
+//! before the next command, as dash does. A foreground command is never
+//! interrupted (POSIX defers the trap until it completes); the `wait` builtin is,
+//! through a self-pipe the handler writes to while `wait` is blocked.
 //!
 //! Signal numbers are rustix `Signal` values (no libc constants). Handler
 //! installation registers a raw C-style handler pointer via `sigaction`
@@ -14,9 +17,13 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use rustix::process::Signal;
 
-static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGTERM_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGHUP_PENDING: AtomicBool = AtomicBool::new(false);
+/// One more than the highest signal number tracked for traps.
+const SIGNAL_SLOTS: usize = 65;
+
+/// Per-signal "trap pending" flags, indexed by signal number.
+static PENDING: [AtomicBool; SIGNAL_SLOTS] = [const { AtomicBool::new(false) }; SIGNAL_SLOTS];
+/// Set whenever any `PENDING` flag is set, so the per-command check is one load.
+static ANY_PENDING: AtomicBool = AtomicBool::new(false);
 static INTERACTIVE_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn interactive_handler(signal: i32) {
@@ -212,28 +219,84 @@ pub fn ignore_signal(sig: Signal) {
     }
 }
 
-/// Check and clear all pending signal flags. Returns signal names that were pending.
-pub fn take_pending() -> Vec<&'static str> {
-    let mut pending = Vec::new();
-    if SIGINT_PENDING.swap(false, Ordering::Relaxed) {
-        pending.push("INT");
-    }
-    if SIGTERM_PENDING.swap(false, Ordering::Relaxed) {
-        pending.push("TERM");
-    }
-    if SIGHUP_PENDING.swap(false, Ordering::Relaxed) {
-        pending.push("HUP");
-    }
-    pending
+/// Whether any trapped signal arrived since the last [`take_pending`].
+pub fn any_pending() -> bool {
+    ANY_PENDING.load(Ordering::Acquire)
 }
 
-extern "C" fn signal_handler(signum: i32) {
-    match signum {
-        x if x == Signal::INT.as_raw() => SIGINT_PENDING.store(true, Ordering::Relaxed),
-        x if x == Signal::TERM.as_raw() => SIGTERM_PENDING.store(true, Ordering::Relaxed),
-        x if x == Signal::HUP.as_raw() => SIGHUP_PENDING.store(true, Ordering::Relaxed),
-        _ => {}
+/// Check and clear all pending signal flags. Returns the names of the signals
+/// that were pending, in signal-number order.
+pub fn take_pending() -> Vec<&'static str> {
+    if !ANY_PENDING.swap(false, Ordering::AcqRel) {
+        return Vec::new();
     }
+    PENDING
+        .iter()
+        .enumerate()
+        .filter(|(_, flag)| flag.swap(false, Ordering::AcqRel))
+        .filter_map(|(signum, _)| signal_to_name(signum as i32))
+        .collect()
+}
+
+/// The lowest pending signal number, without clearing it.
+pub(crate) fn first_pending() -> Option<i32> {
+    if !any_pending() {
+        return None;
+    }
+    PENDING
+        .iter()
+        .position(|flag| flag.load(Ordering::Acquire))
+        .map(|signum| signum as i32)
+}
+
+/// Forget signals that arrived before a fork; they belong to the parent.
+pub(crate) fn clear_pending() {
+    for flag in &PENDING {
+        flag.store(false, Ordering::Relaxed);
+    }
+    ANY_PENDING.store(false, Ordering::Release);
+}
+
+/// Async-signal-safe: atomic stores plus, while `wait` is blocked, one write(2).
+extern "C" fn signal_handler(signum: i32) {
+    if let Some(flag) = usize::try_from(signum).ok().and_then(|n| PENDING.get(n)) {
+        flag.store(true, Ordering::Release);
+        ANY_PENDING.store(true, Ordering::Release);
+    }
+    wake_waiter();
+}
+
+/// Write end of the self-pipe that wakes a blocked `wait` builtin, or -1.
+static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+
+fn wake_waiter() {
+    let fd = WAKE_FD.load(Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: write(2) is async-signal-safe; errno is saved and restored so the
+    // interrupted code never observes the handler's errno.
+    unsafe {
+        let errno = errno_location();
+        let saved = *errno;
+        let _ = libc::write(fd, [1u8].as_ptr().cast(), 1);
+        *errno = saved;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errno_location() -> *mut i32 {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+unsafe fn errno_location() -> *mut i32 {
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+unsafe fn errno_location() -> *mut i32 {
+    unsafe { libc::__errno() }
 }
 
 #[cfg(target_os = "macos")]
@@ -288,4 +351,92 @@ pub(crate) fn reset_job_signals() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+extern "C" fn child_wake_handler(_signal: i32) {
+    wake_waiter();
+}
+
+/// Wake-up source for the `wait` builtin while it blocks on a background job.
+///
+/// Self-pipe trick: the trap handler and a temporary `SIGCHLD` handler write a
+/// byte to the pipe, and [`WaitWakeup::block`] polls its read end. A signal or a
+/// child exit that lands after the caller's last check stays in the pipe, so no
+/// wake-up is lost. The previous `SIGCHLD` action is restored on drop.
+pub(crate) struct WaitWakeup {
+    read: i32,
+    write: i32,
+    old_child_action: libc::sigaction,
+}
+
+impl WaitWakeup {
+    pub(crate) fn install() -> std::io::Result<Self> {
+        let mut fds = [0; 2];
+        // SAFETY: plain syscalls on descriptors this function owns; the sigaction
+        // structs are zero-initialized before use and the handler only does
+        // async-signal-safe work.
+        unsafe {
+            if libc::pipe(fds.as_mut_ptr()) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            WAKE_FD.store(fds[1], Ordering::Release);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) == -1 {
+                let error = std::io::Error::last_os_error();
+                WAKE_FD.store(-1, Ordering::Release);
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return Err(error);
+            }
+            // A `trap ... CHLD` keeps flagging its trap while we wait.
+            let handler = if old.sa_sigaction == signal_handler as *const () as usize {
+                signal_handler as *const () as usize
+            } else {
+                child_wake_handler as *const () as usize
+            };
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler;
+            action.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+            Ok(Self {
+                read: fds[0],
+                write: fds[1],
+                old_child_action: old,
+            })
+        }
+    }
+
+    /// Block until a signal or child exit wrote to the pipe, then drain it.
+    /// A 100 ms ceiling keeps `wait` live even if `SIGCHLD` is blocked.
+    pub(crate) fn block(&self) {
+        let mut pollfd = libc::pollfd {
+            fd: self.read,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` and the buffer are valid for the duration of the calls.
+        unsafe {
+            libc::poll(&mut pollfd, 1, 100);
+            let mut buffer = [0u8; 64];
+            while libc::read(self.read, buffer.as_mut_ptr().cast(), buffer.len()) > 0 {}
+        }
+    }
+}
+
+impl Drop for WaitWakeup {
+    fn drop(&mut self) {
+        // SAFETY: restores the action saved in `install` and closes owned fds.
+        unsafe {
+            libc::sigaction(libc::SIGCHLD, &self.old_child_action, std::ptr::null_mut());
+            WAKE_FD.store(-1, Ordering::Release);
+            libc::close(self.read);
+            libc::close(self.write);
+        }
+    }
 }

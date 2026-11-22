@@ -162,14 +162,13 @@ Goal: make process control and traps behave like a real shell, especially during
 
 ### Trap timing
 
-- Revisit the current known limitation:
-  traps fire between commands but not during blocking waits.
-- Define the intended model explicitly.
-- Add tests for traps arriving during:
-  - foreground external command wait
-  - pipeline wait
-  - command substitution wait
-  - builtin-heavy loops
+- Done (odd/tasks/trap-timing.md): dash/POSIX model. Traps run after the current
+  command completes; foreground commands, pipelines and command substitutions
+  are not interrupted; `wait` returns 128+signal via a self-pipe; subshells reset
+  caught traps. Tests: `cargo test -p epsh --test integration traps`.
+- Open: `read` is not interrupted by trapped signals (POSIX leaves it
+  unspecified; dash and bash return early).
+- Open: `cmd &` double-forks, so `$!` is the subshell and `kill $!` orphans `cmd`.
 
 ### Signal disposition and propagation
 

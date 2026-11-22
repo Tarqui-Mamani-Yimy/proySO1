@@ -767,9 +767,13 @@ impl Shell {
     }
 
     fn builtin_wait(&mut self, args: &[String]) -> ExitStatus {
+        // An `Err` from `wait_background_pid` is a trapped signal: POSIX makes
+        // `wait` return 128+signal at once; the trap runs after it returns.
         if args.len() == 1 {
             for pid in self.background_pids.clone() {
-                self.wait_background_pid(pid);
+                if let Err(status) = self.wait_background_pid(pid) {
+                    return status;
+                }
             }
             self.reaped_job_statuses.clear();
             self.reaped_job_status_order.clear();
@@ -790,15 +794,22 @@ impl Shell {
                         .map(|(_, members)| members.clone()),
                 };
                 match pids {
-                    Some(pids) if !pids.is_empty() => pids
+                    Some(pids) if !pids.is_empty() => match pids
                         .into_iter()
-                        .fold(ExitStatus::SUCCESS, |_, pid| self.wait_background_pid(pid)),
+                        .try_fold(ExitStatus::SUCCESS, |_, pid| self.wait_background_pid(pid))
+                    {
+                        Ok(status) => status,
+                        Err(status) => return status,
+                    },
                     _ => ExitStatus::NOT_FOUND,
                 }
             } else {
                 match arg.parse::<i32>() {
                     Ok(pid) if pid > 0 && arg.bytes().all(|b| b.is_ascii_digit()) => {
-                        self.wait_background_pid(pid)
+                        match self.wait_background_pid(pid) {
+                            Ok(status) => status,
+                            Err(status) => return status,
+                        }
                     }
                     _ => ExitStatus::NOT_FOUND,
                 }
@@ -807,7 +818,9 @@ impl Shell {
         status
     }
 
-    fn wait_background_pid(&mut self, pid: i32) -> ExitStatus {
+    /// Wait for one registered background job. `Err(128+signal)` means a trapped
+    /// signal interrupted the wait; the job stays registered.
+    fn wait_background_pid(&mut self, pid: i32) -> Result<ExitStatus, ExitStatus> {
         let known = self.background_pids.contains(&pid)
             || self
                 .owned_job_history
@@ -815,43 +828,55 @@ impl Shell {
                 .any(|(_, members)| members.contains(&pid));
         if let Some(status) = self.take_reaped_job_status(pid) {
             self.background_pids.retain(|&job| job != pid);
-            return if known { status } else { ExitStatus::NOT_FOUND };
+            return Ok(if known { status } else { ExitStatus::NOT_FOUND });
         }
-        let Some(index) = self.background_pids.iter().position(|&job| job == pid) else {
-            return ExitStatus::NOT_FOUND;
-        };
+        if !self.background_pids.contains(&pid) {
+            return Ok(ExitStatus::NOT_FOUND);
+        }
         let pgid = self
             .owned_job_history
             .iter()
             .find(|(_, members)| members.contains(&pid))
             .map(|(pgid, _)| *pgid);
         // Wait only for a registered job; never consume an embedder's children.
+        // Poll with WNOHANG and sleep on the self-pipe, so a trapped signal ends
+        // the wait; without a pipe, fall back to an uninterruptible wait.
+        let wakeup = crate::signal::WaitWakeup::install().ok();
+        let options = if wakeup.is_some() {
+            rustix::process::WaitOptions::NOHANG
+        } else {
+            rustix::process::WaitOptions::empty()
+        };
         let (status, raw_status) = loop {
-            match rustix::process::waitpid(
-                rustix::process::Pid::from_raw(pid),
-                rustix::process::WaitOptions::empty(),
-            ) {
+            match rustix::process::waitpid(rustix::process::Pid::from_raw(pid), options) {
                 Ok(Some((_, status))) => {
                     let raw = status.as_raw();
                     break (ExitStatus::from_wait(raw), raw);
                 }
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(rustix::io::Errno::CHILD) => {
-                    self.background_pids.remove(index);
+                    self.background_pids.retain(|&job| job != pid);
                     self.child_pids.retain(|&child| child != pid);
-                    return ExitStatus::NOT_FOUND;
+                    return Ok(ExitStatus::NOT_FOUND);
                 }
-                Err(_) => return ExitStatus::FAILURE,
-                Ok(None) => continue,
+                Err(_) => return Ok(ExitStatus::FAILURE),
+                Ok(None) => {}
+            }
+            if let Some(signal) = crate::signal::first_pending() {
+                return Err(ExitStatus::from_signal(signal));
+            }
+            if let Some(wakeup) = &wakeup {
+                wakeup.block();
             }
         };
-        self.background_pids.remove(index);
+        drop(wakeup);
+        self.background_pids.retain(|&job| job != pid);
         self.child_pids.retain(|&child| child != pid);
         if let Some(pgid) = pgid {
             self.record_owned_wait_status(pgid, pid, raw_status);
             self.take_reaped_job_status(pid);
         }
-        status
+        Ok(status)
     }
 
     fn builtin_trap(&mut self, args: &[String]) -> ExitStatus {
@@ -1405,7 +1430,7 @@ mod wait_job_status_tests {
             members: vec![pid],
         });
 
-        let status = shell.wait_background_pid(pid);
+        let status = shell.wait_background_pid(pid).unwrap();
 
         assert_eq!(status, ExitStatus::NOT_FOUND);
         assert!(shell.poll_child_jobs().is_empty());

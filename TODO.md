@@ -418,6 +418,6 @@ everything. Known causes:
 - 11 shellux PTY REPL tests and 1 TUI test: not diagnosed yet.
 - `command cd` leaves the physical path (`/private/var/...`) in `Shell::cwd()`.
 
-When `make ci` passes on macOS, add `macos-latest` back to release.yml and drop
-`continue-on-error` from ci.yml.
+To port: add `macos-latest` back to the ci.yml matrix, fix until `make ci` passes
+there, then add it to release.yml (and render the Homebrew formulas).
 

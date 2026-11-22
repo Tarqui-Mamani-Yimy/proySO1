@@ -180,8 +180,8 @@ tests pass): `shellux-X.Y.Z-TARGET.tar.gz` (`bin/shellux`, `bin/epsh`,
 (`bin/nulix`, `bin/nulix-server`, `bin/nulixctl`, `LICENSE`, `README.md`,
 `nulix.conf.example`), each with a `.sha256` file. `scripts/package.sh` builds and
 packages them (`VERSION`, `OUT`, `SKIP_BUILD=1`); X.Y.Z is the `shellux` crate version.
-`.github/workflows/ci.yml` runs `make ci` and the install test on Linux (gating) and
-macOS (informational, `continue-on-error`); `.github/workflows/release.yml` runs on
+`.github/workflows/ci.yml` runs `make ci` and the install test on Linux (macOS is
+left out until its port lands); `.github/workflows/release.yml` runs on
 `vX.Y.Z` tags (the tag must equal the shellux version), tests, packages Linux and
 creates the GitHub Release with `gh`.
 `install.sh` (`PACKAGE=shellux|nulix`, `VERSION`, `PREFIX`, `REPO`, `BASE_URL`)

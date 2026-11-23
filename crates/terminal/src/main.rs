@@ -3560,8 +3560,13 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
 
 const USAGE: &str = "\
 Usage: nulix [--session NAME]
+       nulix up
 
 Opens a nulix window running a local shell.
+
+Commands:
+  up              Open the window in the friendly UI mode for newcomers
+                  and demos. Pane shells see NULIX_UI=up.
 
 Options:
   --session NAME  Attach the window to the persistent nulix-server session
@@ -3582,7 +3587,15 @@ NULIX_FONT_SIZE and NULIX_SHELL override the file.
 enum WindowArgs {
     Standalone,
     Session(String),
+    /// `nulix up`: the standalone window in the friendly UI mode.
+    Up,
     Help,
+}
+
+/// The `NULIX_UI` value pane shells inherit; `None` removes an inherited one,
+/// so a plain window opened from an up-mode pane does not stay in up mode.
+fn nulix_ui_env(args: &WindowArgs) -> Option<&'static str> {
+    matches!(args, WindowArgs::Up).then_some("up")
 }
 
 fn parse_window_args(args: impl IntoIterator<Item = OsString>) -> Result<WindowArgs, String> {
@@ -3590,13 +3603,19 @@ fn parse_window_args(args: impl IntoIterator<Item = OsString>) -> Result<WindowA
     let Some(first) = args.next() else {
         return Ok(WindowArgs::Standalone);
     };
-    // Only --session and --help are options; anything else is ignored, as the
-    // standalone window always did.
+    // Only `up`, --session and --help are recognised; anything else is
+    // ignored, as the standalone window always did.
     let Ok(first) = first.into_string() else {
         return Ok(WindowArgs::Standalone);
     };
     let session = match first.as_str() {
         "-h" | "--help" => return Ok(WindowArgs::Help),
+        "up" => {
+            if let Some(extra) = args.next() {
+                return Err(format!("unexpected argument {extra:?}"));
+            }
+            return Ok(WindowArgs::Up);
+        }
         "--session" => args
             .next()
             .ok_or_else(|| "--session requires a session NAME".to_owned())?
@@ -3615,12 +3634,21 @@ fn parse_window_args(args: impl IntoIterator<Item = OsString>) -> Result<WindowA
 }
 
 fn main() {
-    let code = match parse_window_args(std::env::args_os().skip(1)) {
+    let args = parse_window_args(std::env::args_os().skip(1));
+    if let Ok(args) = &args {
+        // Set before any thread, PTY or server process exists, so every pane
+        // shell (and an autostarted nulix-server) inherits the final value.
+        match nulix_ui_env(args) {
+            Some(value) => unsafe { std::env::set_var("NULIX_UI", value) },
+            None => unsafe { std::env::remove_var("NULIX_UI") },
+        }
+    }
+    let code = match args {
         Ok(WindowArgs::Help) => {
             print!("{USAGE}");
             0
         }
-        Ok(WindowArgs::Standalone) => {
+        Ok(WindowArgs::Standalone | WindowArgs::Up) => {
             nulix::config::init();
             run_terminal(None)
         }
@@ -3768,6 +3796,31 @@ mod tests {
             Ok(WindowArgs::Session("dev_2".into()))
         );
         assert!(super::USAGE.contains("--session NAME"));
+    }
+
+    #[test]
+    fn window_args_select_up_mode_and_reject_extra_arguments() {
+        use super::WindowArgs;
+        assert_eq!(window_args(&["up"]), Ok(WindowArgs::Up));
+        assert!(
+            window_args(&["up", "--session", "demo"])
+                .unwrap_err()
+                .contains("unexpected argument")
+        );
+        // Only the exact word selects up mode; other words stay ignored.
+        assert_eq!(window_args(&["upx"]), Ok(WindowArgs::Standalone));
+        assert!(super::USAGE.contains("nulix up"));
+    }
+
+    #[test]
+    fn only_up_mode_exports_nulix_ui_to_pane_shells() {
+        use super::WindowArgs;
+        assert_eq!(super::nulix_ui_env(&WindowArgs::Up), Some("up"));
+        assert_eq!(super::nulix_ui_env(&WindowArgs::Standalone), None);
+        assert_eq!(
+            super::nulix_ui_env(&WindowArgs::Session("demo".into())),
+            None
+        );
     }
 
     #[test]

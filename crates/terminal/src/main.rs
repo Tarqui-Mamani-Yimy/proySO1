@@ -85,6 +85,8 @@ struct TerminalWindow {
     exit_poll: ExitPollBackoff,
     next_exit_poll: Instant,
     retry_redraw_at: Option<Instant>,
+    /// Up mode: next redraw that advances running cards' elapsed time.
+    running_tick_at: Option<Instant>,
     occluded: bool,
     redraw_pending: bool,
     cursor_position: PhysicalPosition<f64>,
@@ -1183,6 +1185,7 @@ impl TerminalWindow {
             exit_poll: ExitPollBackoff::new(now),
             next_exit_poll: now,
             retry_redraw_at: None,
+            running_tick_at: None,
             occluded: false,
             redraw_pending: false,
             cursor_position: PhysicalPosition::new(0.0, 0.0),
@@ -3859,6 +3862,19 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 return;
             }
         }
+        let any_running = self.pane_layouts().iter().any(|layout| {
+            !layout.hidden
+                && self
+                    .panes
+                    .get(&layout.pane)
+                    .is_some_and(|pane| pane.model.blocks().activity() == PaneActivity::Running)
+        });
+        let (redraw, tick) =
+            chrome::running_tick(self.ui_mode, any_running, now, self.running_tick_at);
+        self.running_tick_at = tick;
+        if redraw {
+            self.request_redraw();
+        }
         let attach_deadline = self
             .remote
             .as_ref()
@@ -3866,6 +3882,7 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
         let next_deadline = [
             (!self.panes.is_empty()).then_some(self.next_exit_poll),
             self.retry_redraw_at,
+            self.running_tick_at,
             attach_deadline,
         ]
         .into_iter()

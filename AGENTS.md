@@ -203,8 +203,9 @@ cancelled and prompt blocks, `#7A3A3E` after a non-zero exit and 2 px `#69A5DC`
 while running. The prompt row shows, right-aligned, `12ms ✓` (`✓` `#50C878`),
 `1.4s ✗ 101` (`✗` and code `#F06A6A`) or `● 3.1s` while running; durations are
 `NNms` under a second, `N.Ns` under a minute and `MmSSs` after, from the times
-the OSC 133 marks were observed. A running block's elapsed time is computed when
-the pane redraws (there is no timer), and the meta is omitted when it would touch
+the OSC 133 marks were observed. While a visible pane has a running block, the
+window redraws once a second so its `● elapsed` advances; with nothing running
+there is no timer (classic mode never has one), and the meta is omitted when it would touch
 the prompt row's text. The card replaces the classic block markers; there are no
 cards on the alternate screen, and `nulix --session` keeps the classic look.
 

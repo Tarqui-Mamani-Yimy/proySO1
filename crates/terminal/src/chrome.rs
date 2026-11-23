@@ -472,8 +472,59 @@ pub fn up_overlay(chrome: &UpChrome<'_>) -> (Vec<OverlayRect>, Vec<OverlayText>)
     (rects, texts)
 }
 
+/// The once-a-second redraw that advances a running card's `● elapsed` in up
+/// mode. Returns whether to redraw now and the next deadline; no deadline
+/// (no timer) when nothing visible runs or in classic mode.
+pub fn running_tick(
+    mode: UiMode,
+    any_running: bool,
+    now: std::time::Instant,
+    deadline: Option<std::time::Instant>,
+) -> (bool, Option<std::time::Instant>) {
+    if mode != UiMode::Up || !any_running {
+        return (false, None);
+    }
+    let second = std::time::Duration::from_secs(1);
+    match deadline {
+        Some(due) if now >= due => (true, Some(now + second)),
+        Some(due) => (false, Some(due)),
+        None => (false, Some(now + second)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn running_blocks_tick_once_per_second_only_in_up_mode() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let second = Duration::from_secs(1);
+        // First running frame: no redraw yet, schedule one a second later.
+        assert_eq!(
+            super::running_tick(UiMode::Up, true, now, None),
+            (false, Some(now + second))
+        );
+        // Not due yet: keep the deadline.
+        assert_eq!(
+            super::running_tick(UiMode::Up, true, now, Some(now + second)),
+            (false, Some(now + second))
+        );
+        // Due: redraw and schedule the next tick.
+        assert_eq!(
+            super::running_tick(UiMode::Up, true, now + second, Some(now + second)),
+            (true, Some(now + second * 2))
+        );
+        // Nothing running, or classic mode: no timer at all.
+        assert_eq!(
+            super::running_tick(UiMode::Up, false, now, Some(now)),
+            (false, None)
+        );
+        assert_eq!(
+            super::running_tick(UiMode::Classic, true, now, None),
+            (false, None)
+        );
+    }
+
     use super::*;
 
     #[test]

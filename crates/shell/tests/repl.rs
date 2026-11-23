@@ -3141,3 +3141,42 @@ mod aliases {
         exited(&mut session, 0);
     }
 }
+
+fn text_between_command_end_and_next_prompt(nulix_ui: Option<&str>) -> String {
+    let _guard = serialize_pty_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
+    command
+        .env_clear()
+        .env("PS1", "$ ")
+        .env("SHELLUX_BANNER", "0")
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("HOME", dir.path())
+        .env("SHELLUX_HIGHLIGHT", "0")
+        .env("SHELLUX_KITTY_KEYBOARD", "0")
+        .current_dir(dir.path());
+    if let Some(value) = nulix_ui {
+        command.env("NULIX_UI", value);
+    }
+    let mut session = spawn_pty(command);
+    capture_primary_prompt(&mut session);
+    session.send_line("true").unwrap();
+    expect_sequence(&mut session, OSC133_D0);
+    let (between, _) = session
+        .exp_any(vec![ReadUntil::String(OSC133_A.to_owned())])
+        .unwrap();
+    session.send_line("exit").unwrap();
+    session.exp_eof().unwrap();
+    between
+}
+
+#[test]
+fn nulix_up_mode_prints_a_blank_line_before_each_prompt() {
+    let up = text_between_command_end_and_next_prompt(Some("up"));
+    assert!(up.contains('\n'), "{up:?}");
+    let plain = text_between_command_end_and_next_prompt(None);
+    assert!(!plain.contains('\n'), "{plain:?}");
+    let other = text_between_command_end_and_next_prompt(Some("classic"));
+    assert!(!other.contains('\n'), "{other:?}");
+}

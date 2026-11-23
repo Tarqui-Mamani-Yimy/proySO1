@@ -249,8 +249,17 @@ fn read_lines(shell: &mut Shell) -> io::Result<i32> {
         }
     }
     let mut integration_failure_reported = false;
+    // `nulix up` draws each command block as a card; one blank row before the
+    // prompt keeps consecutive cards apart. The row is outside every block.
+    let blank_line_before_prompt = std::env::var_os("NULIX_UI").is_some_and(|value| value == "up");
     loop {
         completion_state.refresh(shell);
+        if blank_line_before_prompt {
+            let mut stdout = io::stdout();
+            if let Err(error) = stdout.write_all(b"\n").and_then(|()| stdout.flush()) {
+                eprintln!("shellux: {error}");
+            }
+        }
         if shell_integration_enabled {
             let terminal = terminal
                 .as_ref()

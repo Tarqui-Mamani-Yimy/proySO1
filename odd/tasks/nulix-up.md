@@ -22,8 +22,8 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 | T3 — up chrome colours + always-visible tab bar + hint bar | S2–S3 | delegated (context backstop) | done (RED: 8 failed + 6 compile errors; GREEN: 41 bin + 81 lib) | e80b4c6 |
 | T4 — shellux blank line before prompt | S4 | inline | done (RED: PTY test failed; GREEN: shellux 87+8+116) | 3bdaea7 |
 | T5 — rounded block cards + status meta | S5 | delegated (context backstop) | done (RED: 8 + 61 compile errors; GREEN: core 202, nulix bin 50 + lib 81) | e3e2788 |
-| T6 — F1 help overlay | S6 | inline | pending | |
-| T7 — demo guide | S7 | inline | pending | |
+| T6 — F1 help overlay | S6 | delegated (context backstop) | in progress | |
+| T7 — demo guide | S7 | inline | done (structural readback; commands checked against `nulixctl --help` and AGENTS.md) | next commit |
 
 ## Log
 

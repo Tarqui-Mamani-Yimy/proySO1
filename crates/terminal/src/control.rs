@@ -1,8 +1,8 @@
 pub use nulix_core::control::{
     ControlCommand, ControlDirection, ControlError, ControlErrorCode, ControlOutcome,
-    ControlRequest, ControlResponse, ListPane, MAX_REQUEST_LINE_BYTES, NO_COMMAND_BLOCK, TextScope,
-    block_result, list_pane_entry, parse_request, parse_response, serialize_request,
-    serialize_response,
+    ControlRequest, ControlResponse, ControlUiMode, ListPane, MAX_REQUEST_LINE_BYTES,
+    NO_COMMAND_BLOCK, TextScope, block_result, list_pane_entry, parse_request, parse_response,
+    serialize_request, serialize_response, ui_result,
 };
 
 /// Longest accepted `nulix-server --session` name.

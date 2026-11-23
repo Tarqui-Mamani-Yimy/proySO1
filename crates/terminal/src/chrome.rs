@@ -472,6 +472,60 @@ pub fn up_overlay(chrome: &UpChrome<'_>) -> (Vec<OverlayRect>, Vec<OverlayText>)
     (rects, texts)
 }
 
+/// Result of a `ui` control request against the window's current mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UiSwitch {
+    /// Mode after the request (the current one for a query).
+    pub mode: UiMode,
+    /// The chrome changed, so every tab must be laid out again.
+    pub changed: bool,
+    /// Whether the F1 help stays open; it exists only in up mode.
+    pub help_open: bool,
+}
+
+/// Applies a `ui` request: `None` queries, the current mode again is a no-op.
+pub fn switch_ui_mode(current: UiMode, requested: Option<UiMode>, help_open: bool) -> UiSwitch {
+    let mode = requested.unwrap_or(current);
+    UiSwitch {
+        mode,
+        changed: mode != current,
+        help_open: help_open && mode == UiMode::Up,
+    }
+}
+
+pub fn ui_mode_from_control(mode: nulix::control::ControlUiMode) -> UiMode {
+    match mode {
+        nulix::control::ControlUiMode::Up => UiMode::Up,
+        nulix::control::ControlUiMode::Classic => UiMode::Classic,
+    }
+}
+
+pub fn control_ui_mode(mode: UiMode) -> nulix::control::ControlUiMode {
+    match mode {
+        UiMode::Up => nulix::control::ControlUiMode::Up,
+        UiMode::Classic => nulix::control::ControlUiMode::Classic,
+    }
+}
+
+/// Lays every tab out for `mode`'s chrome in a `window` of whole pixels and
+/// returns each pane's grid layout (tab order, pane order). Used on window
+/// resize and on a mode switch, whose bars and card inset differ.
+pub fn relayout_tabs(
+    mode: UiMode,
+    tabs: &mut nulix::layout::TabSet,
+    window: Rect,
+    cell: nulix::layout::CellSize,
+    cell_height: f32,
+) -> Vec<PaneLayout> {
+    let pane_rect = content_rect(mode, window, tabs.tabs().len(), cell_height);
+    tabs.resize_all(pane_rect, cell);
+    tabs.tabs()
+        .iter()
+        .flat_map(nulix::layout::Tab::layout)
+        .map(|layout| pane_grid_layout(mode, layout, cell.width))
+        .collect()
+}
+
 /// The once-a-second redraw that advances a running card's `● elapsed` in up
 /// mode. Returns whether to redraw now and the next deadline; no deadline
 /// (no timer) when nothing visible runs or in classic mode.
@@ -760,5 +814,72 @@ mod tests {
         // Hidden panes keep their empty layout.
         let hidden = pane_layout(Rect::new(0, 0, 0, 0), 0, 0, true);
         assert_eq!(pane_grid_layout(UiMode::Up, hidden, 10), hidden);
+    }
+
+    #[test]
+    fn ui_switch_reports_changes_and_closes_help_outside_up_mode() {
+        let query = switch_ui_mode(UiMode::Up, None, true);
+        assert_eq!(
+            query,
+            UiSwitch {
+                mode: UiMode::Up,
+                changed: false,
+                help_open: true
+            }
+        );
+        let same = switch_ui_mode(UiMode::Classic, Some(UiMode::Classic), false);
+        assert!(!same.changed);
+        assert_eq!(same.mode, UiMode::Classic);
+        let up = switch_ui_mode(UiMode::Classic, Some(UiMode::Up), false);
+        assert_eq!(
+            (up.mode, up.changed, up.help_open),
+            (UiMode::Up, true, false)
+        );
+        let down = switch_ui_mode(UiMode::Up, Some(UiMode::Classic), true);
+        assert_eq!(
+            (down.mode, down.changed, down.help_open),
+            (UiMode::Classic, true, false)
+        );
+        assert_eq!(
+            ui_mode_from_control(nulix::control::ControlUiMode::Up),
+            UiMode::Up
+        );
+        assert_eq!(
+            control_ui_mode(UiMode::Classic),
+            nulix::control::ControlUiMode::Classic
+        );
+    }
+
+    #[test]
+    fn relayout_for_a_mode_switch_keeps_panes_and_tabs_and_round_trips() {
+        use nulix::layout::{CellSize, Direction, TabSet};
+        let window = Rect::new(0, 0, 800, 600);
+        let cell = CellSize::new(10, 20);
+        let mut tabs = TabSet::new(window, cell, 4, 5, 3);
+        tabs.active_mut()
+            .unwrap()
+            .split_focused(Direction::Horizontal)
+            .unwrap();
+        tabs.add_tab();
+        tabs.select(0);
+        let tab_ids = tabs.tab_ids();
+        let classic = relayout_tabs(UiMode::Classic, &mut tabs, window, cell, 20.0);
+        let up = relayout_tabs(UiMode::Up, &mut tabs, window, cell, 20.0);
+        let panes = |layouts: &[PaneLayout]| layouts.iter().map(|l| l.pane).collect::<Vec<_>>();
+        assert_eq!(panes(&classic), panes(&up));
+        assert_eq!(classic.len(), 3);
+        assert_eq!(tabs.tab_ids(), tab_ids);
+        assert_eq!(tabs.active_index(), Some(0));
+        let content = content_rect(UiMode::Up, window, 2, 20.0);
+        for (before, after) in classic.iter().zip(&up) {
+            // Classic with two tabs already has the tab bar; up adds the hint
+            // bar and gives up one column per pane for the card inset.
+            assert_eq!(after.rows + 1, before.rows, "{before:?} -> {after:?}");
+            assert_eq!(after.cols + 1, before.cols, "{before:?} -> {after:?}");
+            assert!(after.rect.y >= content.y);
+            assert!(after.rect.y + after.rect.height <= content.y + content.height);
+        }
+        let back = relayout_tabs(UiMode::Classic, &mut tabs, window, cell, 20.0);
+        assert_eq!(back, classic);
     }
 }

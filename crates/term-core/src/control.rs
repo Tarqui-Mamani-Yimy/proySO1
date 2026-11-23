@@ -16,6 +16,28 @@ pub enum TextScope {
     LastBlock,
 }
 
+/// Window chrome named by the `ui` command: `up` is the friendly mode of
+/// `nulix up`, `classic` the plain look.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlUiMode {
+    Up,
+    Classic,
+}
+
+impl ControlUiMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Classic => "classic",
+        }
+    }
+}
+
+/// Builds the `ui` command result: the window mode after the request.
+pub fn ui_result(mode: ControlUiMode) -> Value {
+    json!({ "mode": mode.as_str() })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlCommand {
     List,
@@ -49,6 +71,11 @@ pub enum ControlCommand {
     /// Upgrades this connection to the attach stream (`crate::attach`) of a
     /// `nulix-server` session; windows refuse it.
     Attach,
+    /// Queries the window's UI mode (`mode: None`) or switches it; the result
+    /// is [`ui_result`] of the mode after the request.
+    Ui {
+        mode: Option<ControlUiMode>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,6 +293,18 @@ fn command_from_object(object: &Map<String, Value>) -> Result<ControlCommand, Co
                 block: optional_u64(object, "block")?,
             })
         }
+        "ui" => {
+            if !allowed_fields(object, &["v", "id", "cmd", "mode"]) {
+                return Err(ControlErrorCode::InvalidArguments);
+            }
+            let mode = match object.get("mode") {
+                None => None,
+                Some(Value::String(mode)) if mode == "up" => Some(ControlUiMode::Up),
+                Some(Value::String(mode)) if mode == "classic" => Some(ControlUiMode::Classic),
+                Some(_) => return Err(ControlErrorCode::InvalidArguments),
+            };
+            Ok(ControlCommand::Ui { mode })
+        }
         "list" | "new-tab" | "shutdown" | "attach" => Err(ControlErrorCode::InvalidArguments),
         _ => Err(ControlErrorCode::UnknownCommand),
     }
@@ -469,6 +508,11 @@ pub fn serialize_request(request: &ControlRequest) -> Result<Vec<u8>, serde_json
             ));
             ("split", args)
         }
+        ControlCommand::Ui { mode } => (
+            "ui",
+            mode.map(|mode| vec![("mode", json!(mode.as_str()))])
+                .unwrap_or_default(),
+        ),
         ControlCommand::Focus { pane } => ("focus", vec![("pane", json!(pane))]),
         ControlCommand::Close { pane } => ("close", vec![("pane", json!(pane))]),
         ControlCommand::SendText { pane, text } => {
@@ -908,6 +952,68 @@ mod tests {
                 "state": "unknown",
                 "last_exit_status": null,
             })
+        );
+    }
+
+    #[test]
+    fn ui_command_queries_or_sets_the_window_mode() {
+        use super::{ControlUiMode, ui_result};
+        assert_eq!(
+            parse(r#"{"v":1,"id":1,"cmd":"ui"}"#).unwrap().command,
+            ControlCommand::Ui { mode: None }
+        );
+        assert_eq!(
+            parse(r#"{"v":1,"id":2,"cmd":"ui","mode":"up"}"#)
+                .unwrap()
+                .command,
+            ControlCommand::Ui {
+                mode: Some(ControlUiMode::Up)
+            }
+        );
+        assert_eq!(
+            parse(r#"{"v":1,"id":3,"cmd":"ui","mode":"classic"}"#)
+                .unwrap()
+                .command,
+            ControlCommand::Ui {
+                mode: Some(ControlUiMode::Classic)
+            }
+        );
+        for mode in [None, Some(ControlUiMode::Up), Some(ControlUiMode::Classic)] {
+            let request = super::ControlRequest {
+                id: 8,
+                command: ControlCommand::Ui { mode },
+            };
+            let bytes = super::serialize_request(&request).unwrap();
+            assert_eq!(parse_request(&bytes).unwrap(), request);
+        }
+        assert_eq!(
+            super::serialize_request(&super::ControlRequest {
+                id: 8,
+                command: ControlCommand::Ui { mode: None },
+            })
+            .unwrap(),
+            b"{\"cmd\":\"ui\",\"id\":8,\"v\":1}\n".to_vec()
+        );
+        for source in [
+            r#"{"v":1,"id":1,"cmd":"ui","mode":"down"}"#,
+            r#"{"v":1,"id":1,"cmd":"ui","mode":"Up"}"#,
+            r#"{"v":1,"id":1,"cmd":"ui","mode":1}"#,
+            r#"{"v":1,"id":1,"cmd":"ui","mode":null}"#,
+            r#"{"v":1,"id":1,"cmd":"ui","pane":1}"#,
+        ] {
+            assert_eq!(
+                parse(source).unwrap_err().code,
+                ControlErrorCode::InvalidArguments,
+                "{source}"
+            );
+        }
+        assert_eq!(
+            ui_result(ControlUiMode::Up),
+            serde_json::json!({"mode": "up"})
+        );
+        assert_eq!(
+            ui_result(ControlUiMode::Classic),
+            serde_json::json!({"mode": "classic"})
         );
     }
 

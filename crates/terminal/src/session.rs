@@ -458,6 +458,17 @@ impl Session {
                 effect = ControlEffect::Shutdown;
                 serde_json::json!({"stopping": true})
             }
+            // Sessions draw the classic chrome; the window's up mode does not
+            // reach attached clients.
+            ControlCommand::Ui { mode: None } => {
+                crate::control::ui_result(crate::control::ControlUiMode::Classic)
+            }
+            ControlCommand::Ui { mode: Some(_) } => {
+                return fail(
+                    ControlErrorCode::OperationRefused,
+                    "nulix up is not supported inside a nulix-server session".into(),
+                );
+            }
             // nulix-server intercepts attach in its listener hook; reaching the
             // dispatcher means the listener has no attach support.
             ControlCommand::Attach => {

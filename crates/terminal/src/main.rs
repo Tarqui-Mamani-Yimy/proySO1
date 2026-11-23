@@ -1744,20 +1744,13 @@ impl TerminalWindow {
             return;
         };
         let cell = CellSize::new(gpu.cell_width.ceil() as u32, gpu.cell_height.ceil() as u32);
-        let pane_rect = chrome::content_rect(
+        let layouts = chrome::relayout_tabs(
             self.ui_mode,
+            tabs,
             Rect::new(0, 0, w, h),
-            tabs.tabs().len(),
+            cell,
             gpu.cell_height,
         );
-        tabs.resize_all(pane_rect, cell);
-        let ui_mode = self.ui_mode;
-        let layouts: Vec<_> = tabs
-            .tabs()
-            .iter()
-            .flat_map(Tab::layout)
-            .map(|layout| chrome::pane_grid_layout(ui_mode, layout, cell.width))
-            .collect();
         for layout in layouts {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
                 if !layout.hidden {
@@ -2305,11 +2298,34 @@ impl TerminalWindow {
                     "attach is only supported by nulix-server".into(),
                 );
             }
+            ControlCommand::Ui { mode } => {
+                self.switch_ui_mode(mode.map(chrome::ui_mode_from_control));
+                control::ui_result(chrome::control_ui_mode(self.ui_mode))
+            }
         };
         ControlResponse {
             id,
             outcome: ControlOutcome::Success(result),
         }
+    }
+
+    /// `nulix up` / `nulix down` inside this window (control `ui`): switches
+    /// the chrome at runtime. Every tab is laid out again through the window
+    /// resize path, because bar rows and the card inset differ between modes,
+    /// so PTY grids follow; pane ids and tab order are untouched.
+    fn switch_ui_mode(&mut self, requested: Option<UiMode>) {
+        let switch = chrome::switch_ui_mode(self.ui_mode, requested, self.help_open);
+        self.help_open = switch.help_open;
+        if !switch.changed {
+            return;
+        }
+        self.ui_mode = switch.mode;
+        // The running-card tick is re-armed by the next redraw in up mode.
+        self.running_tick_at = None;
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.resize(gpu.config.width, gpu.config.height);
+        }
+        self.request_redraw();
     }
 
     fn focus_pane_id(&mut self, pane: PaneId) -> bool {
@@ -4022,14 +4038,18 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
 const USAGE: &str = "\
 Usage: nulix [--session NAME]
        nulix up
+       nulix down
 
 Opens a nulix window running a local shell.
 
 Commands:
-  up              Open the window in the friendly UI mode for newcomers
-                  and demos. Pane shells see NULIX_UI=up. F1 shows the
-                  shortcut help (Esc or F1 closes it); inside full-screen
-                  apps F1 goes to the app.
+  up              Inside a nulix window: switch this window to the friendly
+                  UI mode for newcomers and demos. Elsewhere: open a new
+                  window in that mode (its pane shells see NULIX_UI=up).
+                  F1 shows the shortcut help (Esc or F1 closes it); inside
+                  full-screen apps F1 goes to the app.
+  down            Inside a nulix window: switch this window back to the
+                  classic look. Fails outside a nulix window.
 
 Options:
   --session NAME  Attach the window to the persistent nulix-server session
@@ -4050,9 +4070,82 @@ NULIX_FONT_SIZE and NULIX_SHELL override the file.
 enum WindowArgs {
     Standalone,
     Session(String),
-    /// `nulix up`: the standalone window in the friendly UI mode.
+    /// `nulix up`: switch the enclosing window to the friendly UI mode, or
+    /// open a new standalone window in it.
     Up,
+    /// `nulix down`: switch the enclosing window back to classic.
+    Down,
     Help,
+}
+
+/// How the enclosing window (`NULIX_SOCKET`) answered a `ui` switch request.
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchReply {
+    Switched,
+    /// The window or server answered with an error (its message).
+    Refused(String),
+    /// No socket, or nothing answers on it (missing or stale socket).
+    Unreachable,
+}
+
+/// What `nulix up` / `nulix down` do after asking the enclosing window.
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchAction {
+    /// The enclosing window switched; exit 0 silently.
+    Done,
+    /// Not inside a reachable window: open a new up-mode window.
+    OpenUpWindow,
+    /// Print `nulix: MESSAGE` and exit 1.
+    Fail(String),
+}
+
+fn switch_action(target: UiMode, reply: SwitchReply) -> SwitchAction {
+    match (target, reply) {
+        (_, SwitchReply::Switched) => SwitchAction::Done,
+        (_, SwitchReply::Refused(message)) => SwitchAction::Fail(message),
+        (UiMode::Up, SwitchReply::Unreachable) => SwitchAction::OpenUpWindow,
+        (UiMode::Classic, SwitchReply::Unreachable) => {
+            SwitchAction::Fail("down only works inside a nulix window".into())
+        }
+    }
+}
+
+/// The enclosing window's control socket: `NULIX_SOCKET` when non-empty.
+fn enclosing_socket(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// Upper bound of the `ui` request of `nulix up` / `nulix down`.
+#[cfg(unix)]
+const UI_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Asks the window behind `socket` to switch to `mode` through the shared
+/// control client. Transport failures count as not being inside a window.
+fn request_ui_switch(socket: Option<&std::path::Path>, mode: UiMode) -> SwitchReply {
+    let Some(socket) = socket else {
+        return SwitchReply::Unreachable;
+    };
+    #[cfg(unix)]
+    {
+        let request = ControlRequest {
+            id: 1,
+            command: ControlCommand::Ui {
+                mode: Some(chrome::control_ui_mode(mode)),
+            },
+        };
+        match control::send_request_with_timeout(socket, &request, UI_SWITCH_TIMEOUT) {
+            Ok(response) => match response.outcome {
+                ControlOutcome::Success(_) => SwitchReply::Switched,
+                ControlOutcome::Failure(error) => SwitchReply::Refused(error.message),
+            },
+            Err(_) => SwitchReply::Unreachable,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, mode);
+        SwitchReply::Unreachable
+    }
 }
 
 /// The `NULIX_UI` value pane shells inherit; `None` removes an inherited one,
@@ -4066,18 +4159,22 @@ fn parse_window_args(args: impl IntoIterator<Item = OsString>) -> Result<WindowA
     let Some(first) = args.next() else {
         return Ok(WindowArgs::Standalone);
     };
-    // Only `up`, --session and --help are recognised; anything else is
+    // Only `up`, `down`, --session and --help are recognised; anything else is
     // ignored, as the standalone window always did.
     let Ok(first) = first.into_string() else {
         return Ok(WindowArgs::Standalone);
     };
     let session = match first.as_str() {
         "-h" | "--help" => return Ok(WindowArgs::Help),
-        "up" => {
+        "up" | "down" => {
             if let Some(extra) = args.next() {
                 return Err(format!("unexpected argument {extra:?}"));
             }
-            return Ok(WindowArgs::Up);
+            return Ok(if first == "up" {
+                WindowArgs::Up
+            } else {
+                WindowArgs::Down
+            });
         }
         "--session" => args
             .next()
@@ -4115,10 +4212,8 @@ fn main() {
             nulix::config::init();
             run_terminal(None, UiMode::Classic)
         }
-        Ok(WindowArgs::Up) => {
-            nulix::config::init();
-            run_terminal(None, UiMode::Up)
-        }
+        Ok(WindowArgs::Up) => run_ui_switch(UiMode::Up),
+        Ok(WindowArgs::Down) => run_ui_switch(UiMode::Classic),
         Ok(WindowArgs::Session(session)) => {
             // The client applies fonts and colours; the server reads the same
             // file for `shell` and `scrollback`.
@@ -4133,6 +4228,23 @@ fn main() {
     };
     if code != 0 {
         std::process::exit(code);
+    }
+}
+
+/// `nulix up` / `nulix down`: switch the enclosing window in place, or (up
+/// only) open a new up-mode window when not inside a reachable one.
+fn run_ui_switch(mode: UiMode) -> i32 {
+    let socket = enclosing_socket(std::env::var_os("NULIX_SOCKET"));
+    match switch_action(mode, request_ui_switch(socket.as_deref(), mode)) {
+        SwitchAction::Done => 0,
+        SwitchAction::OpenUpWindow => {
+            nulix::config::init();
+            run_terminal(None, UiMode::Up)
+        }
+        SwitchAction::Fail(message) => {
+            eprintln!("nulix: {message}");
+            1
+        }
     }
 }
 
@@ -4228,6 +4340,7 @@ fn start_control_server(proxy: EventLoopProxy<UserEvent>) -> Option<ControlServe
 
 #[cfg(test)]
 mod tests {
+    use super::UiMode;
     use super::{
         BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction,
         TabAction, TerminalKey, apply_title_event, block_marker_bounds, block_shortcut,
@@ -4277,6 +4390,59 @@ mod tests {
         // Only the exact word selects up mode; other words stay ignored.
         assert_eq!(window_args(&["upx"]), Ok(WindowArgs::Standalone));
         assert!(super::USAGE.contains("nulix up"));
+    }
+
+    #[test]
+    fn window_args_select_down_and_reject_extra_arguments() {
+        use super::WindowArgs;
+        assert_eq!(window_args(&["down"]), Ok(WindowArgs::Down));
+        assert!(
+            window_args(&["down", "now"])
+                .unwrap_err()
+                .contains("unexpected argument")
+        );
+        assert_eq!(window_args(&["downx"]), Ok(WindowArgs::Standalone));
+        assert!(super::USAGE.contains("nulix down"));
+        assert!(super::USAGE.contains("Inside a nulix window"));
+    }
+
+    #[test]
+    fn in_place_switch_decides_between_done_new_window_and_error() {
+        use super::{SwitchAction, SwitchReply, UiMode, switch_action};
+        for mode in [UiMode::Up, UiMode::Classic] {
+            assert_eq!(
+                switch_action(mode, SwitchReply::Switched),
+                SwitchAction::Done
+            );
+            assert_eq!(
+                switch_action(mode, SwitchReply::Refused("no".into())),
+                SwitchAction::Fail("no".into())
+            );
+        }
+        assert_eq!(
+            switch_action(UiMode::Up, SwitchReply::Unreachable),
+            SwitchAction::OpenUpWindow
+        );
+        assert_eq!(
+            switch_action(UiMode::Classic, SwitchReply::Unreachable),
+            SwitchAction::Fail("down only works inside a nulix window".into())
+        );
+    }
+
+    #[test]
+    fn only_a_non_empty_nulix_socket_names_the_enclosing_window() {
+        use std::ffi::OsString;
+        assert_eq!(super::enclosing_socket(None), None);
+        assert_eq!(super::enclosing_socket(Some(OsString::new())), None);
+        assert_eq!(
+            super::enclosing_socket(Some(OsString::from("/run/nulix/nulix-1.sock"))),
+            Some(std::path::PathBuf::from("/run/nulix/nulix-1.sock"))
+        );
+        // Without a socket there is nothing to ask.
+        assert_eq!(
+            super::request_ui_switch(None, UiMode::Up),
+            super::SwitchReply::Unreachable
+        );
     }
 
     #[test]

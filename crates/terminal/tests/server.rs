@@ -16,6 +16,7 @@ use std::{
 
 const SERVER: &str = env!("CARGO_BIN_EXE_nulix-server");
 const CTL: &str = env!("CARGO_BIN_EXE_nulixctl");
+const NULIX: &str = env!("CARGO_BIN_EXE_nulix");
 const WAIT: Duration = Duration::from_secs(10);
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -335,6 +336,81 @@ fn wait_with_a_zero_timeout_still_probes_once() {
     });
     let block = json(&scratch.ctl("probe", &["wait", "--timeout", "0"]));
     assert_eq!(block["exit_status"], 6);
+}
+
+/// Runs the `nulix` window binary with `NULIX_SOCKET` set to `socket` (or
+/// removed). No display is passed, so a regression that opens a window fails
+/// fast instead of showing one.
+fn nulix(scratch: &Scratch, args: &[&str], socket: Option<&std::ffi::OsStr>) -> Output {
+    let mut command = Command::new(NULIX);
+    command
+        .args(args)
+        .env("XDG_RUNTIME_DIR", &scratch.root)
+        .env("NULIX_CONFIG", "/dev/null")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("NULIX_SOCKET")
+        .stdin(Stdio::null());
+    if let Some(socket) = socket {
+        command.env("NULIX_SOCKET", socket);
+    }
+    command.output().unwrap()
+}
+
+const SERVER_UI_REFUSAL: &str = "nulix up is not supported inside a nulix-server session";
+
+#[test]
+fn ui_command_reports_classic_and_refuses_a_mode_switch() {
+    let scratch = Scratch::new();
+    let mut server = scratch.spawn("ui");
+    assert_eq!(
+        json(&scratch.ctl("ui", &["ui"])),
+        serde_json::json!({"mode": "classic"})
+    );
+    for mode in ["up", "classic"] {
+        let output = scratch.ctl("ui", &["ui", mode]);
+        assert_eq!(output.status.code(), Some(1), "ui {mode}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("nulixctl: OPERATION_REFUSED: {SERVER_UI_REFUSAL}\n"),
+            "ui {mode}"
+        );
+    }
+    // `nulix up` / `nulix down` inside the session report the refusal and
+    // open no window.
+    let socket = scratch.socket("ui");
+    for command in ["up", "down"] {
+        let output = nulix(&scratch, &[command], Some(socket.as_os_str()));
+        assert_eq!(output.status.code(), Some(1), "nulix {command}");
+        assert_eq!(output.stdout, b"", "nulix {command}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("nulix: {SERVER_UI_REFUSAL}\n"),
+            "nulix {command}"
+        );
+    }
+    assert!(server.is_running());
+}
+
+#[test]
+fn nulix_down_outside_a_window_is_an_error() {
+    let scratch = Scratch::new();
+    let missing = scratch.root.join("nulix").join("nulix-1.sock");
+    for socket in [
+        None,
+        Some(std::ffi::OsStr::new("")),
+        Some(missing.as_os_str()),
+    ] {
+        let output = nulix(&scratch, &["down"], socket);
+        assert_eq!(output.status.code(), Some(1), "socket {socket:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "nulix: down only works inside a nulix window\n",
+            "socket {socket:?}"
+        );
+    }
+    let extra = nulix(&scratch, &["down", "now"], None);
+    assert_eq!(extra.status.code(), Some(2));
 }
 
 #[test]

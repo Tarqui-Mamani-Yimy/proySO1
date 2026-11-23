@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
-            "Usage: nulixctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], wait [--pane ID] [--after ID] [--timeout SECS] (default 600), shutdown (nulix-server only)"
+            "Usage: nulixctl [--socket PATH] <command> [args]\nCommands: list, new-tab, split --direction right|down [--pane ID], focus --pane ID, close --pane ID, send-text [--pane ID] TEXT, get-text [--pane ID] [--scope screen|last-block], block [--pane ID] [--id N], ui [up|classic] (query or switch the window UI mode), wait [--pane ID] [--after ID] [--timeout SECS] (default 600), shutdown (nulix-server only)"
         );
         return Ok(());
     }
@@ -281,6 +281,7 @@ fn parse_command(
         "send-text" => (true, false, false, true, false),
         "get-text" => (true, false, true, false, false),
         "block" => (true, false, false, false, true),
+        "ui" => return parse_ui(args),
         _ => return Err(format!("unknown command: {command_name}")),
     };
     let mut pane = None;
@@ -373,6 +374,20 @@ fn parse_command(
     }
 }
 
+/// `nulixctl ui [up|classic]`: queries, or switches, the window's UI mode.
+#[cfg(unix)]
+fn parse_ui(args: Vec<String>) -> Result<nulix::control::ControlCommand, String> {
+    use nulix::control::{ControlCommand, ControlUiMode};
+    let mode = match args.as_slice() {
+        [] => None,
+        [mode] if mode == "up" => Some(ControlUiMode::Up),
+        [mode] if mode == "classic" => Some(ControlUiMode::Classic),
+        [mode] => return Err(format!("ui mode must be up or classic, not {mode}")),
+        [_, extra, ..] => return Err(format!("unexpected argument for ui: {extra}")),
+    };
+    Ok(ControlCommand::Ui { mode })
+}
+
 #[cfg(test)]
 mod wait_tests {
     #[cfg(unix)]
@@ -453,7 +468,7 @@ mod tests {
     #[test]
     fn cli_argument_validation_matches_each_command_shape() {
         use super::parse_command;
-        use nulix::control::{ControlCommand, ControlDirection, TextScope};
+        use nulix::control::{ControlCommand, ControlDirection, ControlUiMode, TextScope};
         let cases = [
             ("list", vec![], Ok(ControlCommand::List)),
             ("new-tab", vec![], Ok(ControlCommand::NewTab)),
@@ -509,6 +524,13 @@ mod tests {
                 }),
             ),
         ];
+        for (args, mode) in [
+            (vec![], None),
+            (vec!["up".into()], Some(ControlUiMode::Up)),
+            (vec!["classic".into()], Some(ControlUiMode::Classic)),
+        ] {
+            assert_eq!(parse_command("ui", args), Ok(ControlCommand::Ui { mode }));
+        }
         for (name, args, expected) in cases {
             assert_eq!(parse_command(name, args), expected, "{name}");
         }
@@ -522,6 +544,9 @@ mod tests {
             ("new-tab", vec!["--pane".into(), "1".into()]),
             ("close", vec!["--scope".into(), "screen".into()]),
             ("list", vec!["extra".into()]),
+            ("ui", vec!["down".into()]),
+            ("ui", vec!["up".into(), "classic".into()]),
+            ("ui", vec!["--pane".into(), "1".into()]),
         ] {
             assert!(parse_command(name, args).is_err(), "{name}");
         }

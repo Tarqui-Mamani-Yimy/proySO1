@@ -160,7 +160,7 @@ Kitty graphics ingestion accepts direct RGB, RGBA, PNG, guarded file, and guarde
 
 On Unix, each running `nulix` instance listens on a private Unix-domain socket. The socket is placed at `$XDG_RUNTIME_DIR/nulix/nulix-<pid>.sock` when `XDG_RUNTIME_DIR` is non-empty, otherwise under `<temp-dir>/nulix-<uid>/nulix-<pid>.sock`. The containing directory must be owned by the current user and have no group/other permissions (created as mode 0700); the socket is mode 0600 and is removed on normal exit or SIGTERM. Each peer's effective user ID is checked before requests are served. The protocol is versioned JSON-lines, currently v1, with one request per line and a 1 MiB line limit; it is local-only and never uses TCP. Event-loop requests have a bounded 30-second timeout.
 
-`NULIX_SOCKET` is inherited by every pane shell and tells `nulixctl` which instance to address. Set `NULIX_CONTROL=0` before launching `nulix` to disable the listener. `nulixctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, `get-text` (screen or last finished block output), `block`, `wait`, and `shutdown` (only `nulix-server` accepts it); use `nulixctl --help` for argument syntax. `list` reports for every pane `state` (`unknown` before any shell-integration mark, `idle` at a prompt, `running` between OSC 133 `C` and `D`) and `last_exit_status` (the newest finished command's status, or null). `block [--pane ID] [--id N]` describes one block (default: the newest block that ran a command) as `pane`, `id`, `state`, `command`, `cwd`, `exit_status`, `started_at_ms`, `finished_at_ms` and `duration_ms` (Unix milliseconds, null when unknown); when the command text is no longer retained, `command` is null and `command_unavailable` is `anchors-missing` or `alternate-screen`. Unknown ids return `NOT_FOUND` and blocks discarded with their scrollback return `EVICTED`. `wait [--pane ID] [--after ID] [--timeout SECS]` is client-side: it polls `block` every 50 ms until the newest command block (newer than `--after`, when given) has finished, prints it, and exits 1 with `TIMEOUT` after SECS (default 600). Each request gets at least 250 ms, so `--timeout 0` still probes once; transport errors (for example a missing socket) are reported as they are, never as `TIMEOUT`. To wait for a command you send, read `block` first and pass its id as `--after`, so the previous block is never mistaken for the new one. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `nulixctl` reports that local control is unsupported there.
+`NULIX_SOCKET` is inherited by every pane shell and tells `nulixctl` which instance to address. Set `NULIX_CONTROL=0` before launching `nulix` to disable the listener. `nulixctl` supports `list`, `new-tab`, `split`, `focus`, `close`, `send-text`, `get-text` (screen or last finished block output), `block`, `ui`, `wait`, and `shutdown` (only `nulix-server` accepts it); use `nulixctl --help` for argument syntax. `list` reports for every pane `state` (`unknown` before any shell-integration mark, `idle` at a prompt, `running` between OSC 133 `C` and `D`) and `last_exit_status` (the newest finished command's status, or null). `block [--pane ID] [--id N]` describes one block (default: the newest block that ran a command) as `pane`, `id`, `state`, `command`, `cwd`, `exit_status`, `started_at_ms`, `finished_at_ms` and `duration_ms` (Unix milliseconds, null when unknown); when the command text is no longer retained, `command` is null and `command_unavailable` is `anchors-missing` or `alternate-screen`. Unknown ids return `NOT_FOUND` and blocks discarded with their scrollback return `EVICTED`. `ui [up|classic]` sends `{"v":1,"id":N,"cmd":"ui"}`, optionally with `"mode":"up"|"classic"` (any other value is `INVALID_ARGUMENTS`): without a mode it queries, with one a window switches its chrome; the result is the mode after the request, `{"mode":"up"}` or `{"mode":"classic"}`. `nulix-server` answers a query with `classic` and refuses a mode with `OPERATION_REFUSED`. `wait [--pane ID] [--after ID] [--timeout SECS]` is client-side: it polls `block` every 50 ms until the newest command block (newer than `--after`, when given) has finished, prints it, and exits 1 with `TIMEOUT` after SECS (default 600). Each request gets at least 250 ms, so `--timeout 0` still probes once; transport errors (for example a missing socket) are reported as they are, never as `TIMEOUT`. To wait for a command you send, read `block` first and pass its id as `--after`, so the previous block is never mistaken for the new one. `send-text` writes supplied UTF-8 bytes to the selected PTY, while `get-text` returns visible grid text or anchored last-block output. Sensitive text payloads and results are not logged. Windows has no v1 listener or named-pipe transport; `nulixctl` reports that local control is unsupported there.
 
 ## Nulix Configuration
 
@@ -168,12 +168,25 @@ At startup `nulix` and `nulix-server` read a `key = value` file (`crates/termina
 
 ## Nulix Friendly UI Mode
 
-`nulix up` opens the standalone window in the friendly UI mode meant for
-newcomers and demos (`odd/tasks/nulix-up.md` tracks its parts); any further
-argument is an error (status 2), and `nulix up --session` is not supported yet.
-Before any pane or server process starts, `nulix up` exports `NULIX_UI=up` to
-pane shells, while plain `nulix` and `nulix --session` remove an inherited
-`NULIX_UI`. Plain `nulix` keeps its current look.
+`nulix up` switches nulix to the friendly UI mode meant for newcomers and demos
+(`odd/tasks/nulix-up.md` tracks its parts). Run inside a nulix window (a
+non-empty `NULIX_SOCKET` that answers), it sends the control request `ui` with
+`mode: "up"` and that same window changes its chrome in place; it prints nothing
+and exits 0 without opening a window. `nulix down` sends `mode: "classic"` to
+return the window to the classic look. A control error (for example inside a
+`nulix-server` session, which refuses with `nulix up is not supported inside a
+nulix-server session`) prints `nulix: MESSAGE` and exits 1. Outside a window
+(unset or empty `NULIX_SOCKET`, or a missing or stale socket) `nulix up` opens a
+new standalone window in up mode, while `nulix down` prints `nulix: down only
+works inside a nulix window` and exits 1. Any further argument to `up` or
+`down` is an error (status 2), and `nulix up --session` is not supported yet.
+A switch lays every tab out again through the window-resize path (bar rows and
+the card inset differ, so PTY grids are resized), keeps pane ids and tab order,
+closes the F1 help when leaving up mode, and repeating the current mode is a
+no-op success. Before any pane or server process starts, a `nulix up` that
+opens a new window exports `NULIX_UI=up` to pane shells, while plain `nulix` and
+`nulix --session` remove an inherited `NULIX_UI`; an in-place switch does not
+change the environment of running shells. Plain `nulix` keeps its current look.
 In up mode the tab bar is always visible, even with one tab: tabs are sized to
 their labels (label, then a `×` close button), a `+` button follows the last tab
 and `◆ nulix` sits at the right; when space runs out labels are truncated with

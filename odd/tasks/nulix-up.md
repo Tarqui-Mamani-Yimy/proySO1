@@ -19,9 +19,9 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 |---|---|---|---|---|
 | T1 — `nulix up` argument, `NULIX_UI` env, help, docs | S1 | inline | done (RED: 5 compile errors; GREEN: 30 passed) | 85ca1d0 |
 | T2 — up theme defaults | S2 | folded into T3 (see L5) | dropped | |
-| T3 — up chrome colours + always-visible tab bar + hint bar | S2–S3 | delegated (context backstop) | done (RED: 8 failed + 6 compile errors; GREEN: 41 bin + 81 lib) | next commit |
+| T3 — up chrome colours + always-visible tab bar + hint bar | S2–S3 | delegated (context backstop) | done (RED: 8 failed + 6 compile errors; GREEN: 41 bin + 81 lib) | e80b4c6 |
 | T4 — shellux blank line before prompt | S4 | inline | done (RED: PTY test failed; GREEN: shellux 87+8+116) | 3bdaea7 |
-| T5 — rounded block cards + status meta | S5 | inline | pending | |
+| T5 — rounded block cards + status meta | S5 | delegated (context backstop) | done (RED: 8 + 61 compile errors; GREEN: core 202, nulix bin 50 + lib 81) | next commit |
 | T6 — F1 help overlay | S6 | inline | pending | |
 | T7 — demo guide | S7 | inline | pending | |
 
@@ -33,3 +33,4 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 - **L4** (2026-11-23, user): chain strategy "stacked-to-main (Recommended)". T1 85ca1d0; RDD assess medium, under_budget.
 - **L5**: T2 folded into T3: nulix's default background `#14161C` and foreground `#DCDCDC` already match S2; the other S2 colours are chrome/card colours (not the ANSI palette), so `nulix.conf` colours are untouched by them. T3 delegated to one writer for the parent-context backstop.
 - **L6**: T3 writer returned done. Parent spot check: `cargo test -p nulix` all ok. Visual check (risk item 6: no test renders the bars): screenshot of `nulix up` under X11 showed both bars and the T4 blank row; `⇧` rendered as a wrong glyph, so hints were spelled `Ctrl+Shift+X` and `F1 ayuda` moved first so it is dropped last (tests updated first, RED 2 failed, then GREEN). Closing an inactive tab = select it, close the active one, reselect the previous tab (TabSet only has `close_active`).
+- **L7**: The T5 writer returned partial: the selected-block accent was not wired (it needed a `Model::selected_block_id` accessor outside its surface). The parent added the accessor (tested) and wired it, and kept a running card's blank tail so the cursor row stays inside the card (RED observed first). Screenshots confirmed rounded cards, failure/running borders, meta, the clipped edge and no cards under `less`. Open: a running card's `● elapsed` only updates on redraw (no timer, per S2), and fast commands show `0ms` because both OSC 133 marks arrive in one read. Durations under 1s render as `NNms`.

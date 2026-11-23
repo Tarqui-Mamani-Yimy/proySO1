@@ -1,6 +1,6 @@
 //! Renderer-independent grid layout, terminal color conversion, and kitty image quad projection.
 use crate::{
-    blocks::{BlockList, BlockState, GridAnchor, GridScreen},
+    blocks::{Block, BlockList, BlockState, BlockTimes, GridAnchor, GridScreen},
     model::{CellColor, VisibleCell},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,16 +41,12 @@ pub struct BlockDecoration {
     pub color: BlockDecorationColor,
 }
 
-/// Purely projects block anchors into viewport-relative overlay decorations.
-/// The VT grid remains authoritative and is never modified.
-pub fn project_block_decorations(
-    blocks: &BlockList,
-    viewport: BlockViewport,
-) -> Vec<BlockDecoration> {
+/// Absolute primary lines `first..end` shown by `viewport`, or `None` when
+/// blocks are not drawn (alternate screen or an empty grid).
+fn visible_line_range(viewport: BlockViewport) -> Option<(u64, u64)> {
     if viewport.alternate_screen || viewport.screen_lines == 0 {
-        return Vec::new();
+        return None;
     }
-
     let first_line = viewport.first_visible_line.map_or_else(
         || {
             viewport.evicted_rows.saturating_add(
@@ -61,15 +57,48 @@ pub fn project_block_decorations(
         },
         |line| line.max(0) as u64,
     );
-    let end_line = first_line.saturating_add(viewport.screen_lines as u64);
+    Some((
+        first_line,
+        first_line.saturating_add(viewport.screen_lines as u64),
+    ))
+}
+
+/// The decoration colour of a block's state, shared by the classic markers
+/// and the `nulix up` cards.
+pub fn block_decoration_color(block: &Block) -> BlockDecorationColor {
+    match block.state {
+        BlockState::Prompt | BlockState::Input | BlockState::Running => {
+            BlockDecorationColor::Accent
+        }
+        BlockState::Finished if block.exit_status == Some(0) => BlockDecorationColor::Success,
+        BlockState::Finished if block.exit_status.is_some_and(|status| status != 0) => {
+            BlockDecorationColor::Failure
+        }
+        BlockState::Finished => BlockDecorationColor::Accent,
+        BlockState::Cancelled => BlockDecorationColor::Muted,
+    }
+}
+
+fn primary_line(anchor: Option<GridAnchor>) -> Option<GridAnchor> {
+    anchor.filter(|anchor| anchor.screen == GridScreen::Primary && anchor.line >= 0)
+}
+
+/// Purely projects block anchors into viewport-relative overlay decorations.
+/// The VT grid remains authoritative and is never modified.
+pub fn project_block_decorations(
+    blocks: &BlockList,
+    viewport: BlockViewport,
+) -> Vec<BlockDecoration> {
+    let Some((first_line, end_line)) = visible_line_range(viewport) else {
+        return Vec::new();
+    };
     blocks
         .blocks()
         .iter()
         .filter_map(|block| {
             let anchors = block.grid_anchors;
             let visible_row = |anchor: Option<GridAnchor>| {
-                anchor
-                    .filter(|anchor| anchor.screen == GridScreen::Primary && anchor.line >= 0)
+                primary_line(anchor)
                     .map(|anchor| anchor.line as u64)
                     .filter(|line| *line >= first_line && *line < end_line)
                     .map(|line| (line - first_line) as usize)
@@ -79,24 +108,89 @@ pub fn project_block_decorations(
                 .or_else(|| visible_row(anchors.input_start))
                 .or_else(|| visible_row(anchors.output_start))
                 .or_else(|| visible_row(anchors.end))?;
-            let color = match block.state {
-                BlockState::Prompt | BlockState::Input | BlockState::Running => {
-                    BlockDecorationColor::Accent
-                }
-                BlockState::Finished if block.exit_status == Some(0) => {
-                    BlockDecorationColor::Success
-                }
-                BlockState::Finished if block.exit_status.is_some_and(|status| status != 0) => {
-                    BlockDecorationColor::Failure
-                }
-                BlockState::Finished => BlockDecorationColor::Accent,
-                BlockState::Cancelled => BlockDecorationColor::Muted,
-            };
             Some(BlockDecoration {
                 block_id: block.id,
                 marker_row,
                 separator_row: prompt_row,
-                color,
+                color: block_decoration_color(block),
+            })
+        })
+        .collect()
+}
+
+/// The viewport rows of one block drawn as a `nulix up` card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockCard {
+    pub block_id: u64,
+    /// First visible row of the block.
+    pub top_row: usize,
+    /// Last visible row of the block (inclusive).
+    pub bottom_row: usize,
+    /// The block continues above the viewport.
+    pub clipped_top: bool,
+    /// The block continues below the viewport.
+    pub clipped_bottom: bool,
+    /// Viewport row of the prompt, when visible.
+    pub prompt_row: Option<usize>,
+    pub color: BlockDecorationColor,
+    pub state: BlockState,
+    pub exit_status: Option<i32>,
+    pub times: BlockTimes,
+}
+
+/// Projects every primary-screen block into the rows its card covers: from
+/// its first anchor (normally the prompt) to its last output row. The end
+/// mark sits at column 0 of the row after the output, so that row is left
+/// out; a block that has not ended reaches `live_line` (the cursor line).
+pub fn project_block_cards(
+    blocks: &BlockList,
+    viewport: BlockViewport,
+    live_line: i64,
+) -> Vec<BlockCard> {
+    let Some((first_line, end_line)) = visible_line_range(viewport) else {
+        return Vec::new();
+    };
+    blocks
+        .blocks()
+        .iter()
+        .filter_map(|block| {
+            let anchors = block.grid_anchors;
+            let start = primary_line(anchors.prompt_start)
+                .or_else(|| primary_line(anchors.input_start))
+                .or_else(|| primary_line(anchors.output_start))
+                .or_else(|| primary_line(anchors.end))?
+                .line as u64;
+            let last = match primary_line(anchors.end) {
+                Some(end) if end.column == 0 && end.line as u64 > start => end.line as u64 - 1,
+                Some(end) => end.line as u64,
+                None if matches!(
+                    block.state,
+                    BlockState::Prompt | BlockState::Input | BlockState::Running
+                ) =>
+                {
+                    live_line.max(0) as u64
+                }
+                None => start,
+            }
+            .max(start);
+            if last < first_line || start >= end_line {
+                return None;
+            }
+            let prompt_row = primary_line(anchors.prompt_start)
+                .map(|anchor| anchor.line as u64)
+                .filter(|line| *line >= first_line && *line < end_line)
+                .map(|line| (line - first_line) as usize);
+            Some(BlockCard {
+                block_id: block.id,
+                top_row: (start.max(first_line) - first_line) as usize,
+                bottom_row: (last.min(end_line - 1) - first_line) as usize,
+                clipped_top: start < first_line,
+                clipped_bottom: last >= end_line,
+                prompt_row,
+                color: block_decoration_color(block),
+                state: block.state,
+                exit_status: block.exit_status,
+                times: block.times,
             })
         })
         .collect()
@@ -725,6 +819,86 @@ mod tests {
             .is_empty()
         );
         assert!(project_block_decorations(&BlockList::default(), viewport(0, 4, 0)).is_empty());
+    }
+
+    #[test]
+    fn block_cards_span_prompt_to_last_output_row() {
+        // Prompt at line 10, output from 11, D mark at column 0 of line 13:
+        // the card covers rows 10..=12, so viewport rows 0..=2.
+        let mut blocks = BlockList::default();
+        mark(&mut blocks, crate::osc::SemanticMark::PromptStart, 10);
+        mark(&mut blocks, crate::osc::SemanticMark::InputStart, 10);
+        mark(&mut blocks, crate::osc::SemanticMark::OutputStart, 11);
+        mark(
+            &mut blocks,
+            crate::osc::SemanticMark::CommandFinished {
+                exit_status: Some(0),
+            },
+            13,
+        );
+        let cards = project_block_cards(&blocks, viewport(10, 6, 0), 13);
+        assert_eq!(cards.len(), 1);
+        let card = cards[0];
+        assert_eq!((card.top_row, card.bottom_row), (0, 2));
+        assert_eq!(card.prompt_row, Some(0));
+        assert!(!card.clipped_top && !card.clipped_bottom);
+        assert_eq!(card.color, BlockDecorationColor::Success);
+        assert_eq!(card.state, BlockState::Finished);
+        assert_eq!(card.exit_status, Some(0));
+    }
+
+    #[test]
+    fn block_cards_without_output_keep_the_prompt_row() {
+        // `true`: C and D on the row after the prompt, both at column 0.
+        let card = project_block_cards(&finished_block(Some(0), 4, 5), viewport(4, 4, 0), 5)[0];
+        assert_eq!((card.top_row, card.bottom_row), (0, 0));
+    }
+
+    #[test]
+    fn block_cards_are_clipped_at_the_viewport_edges() {
+        let partial = finished_block(Some(1), 2, 10);
+        let card = project_block_cards(&partial, viewport(8, 4, 0), 10)[0];
+        assert_eq!((card.top_row, card.bottom_row), (0, 1));
+        assert!(card.clipped_top && !card.clipped_bottom);
+        assert_eq!(card.prompt_row, None);
+        assert_eq!(card.color, BlockDecorationColor::Failure);
+
+        let tall = finished_block(Some(0), 9, 20);
+        let card = project_block_cards(&tall, viewport(8, 4, 0), 20)[0];
+        assert_eq!((card.top_row, card.bottom_row), (1, 3));
+        assert!(!card.clipped_top && card.clipped_bottom);
+
+        let offscreen = finished_block(Some(0), 2, 3);
+        assert!(project_block_cards(&offscreen, viewport(8, 4, 0), 3).is_empty());
+    }
+
+    #[test]
+    fn running_block_cards_extend_to_the_cursor_line() {
+        let mut running = BlockList::default();
+        mark(&mut running, crate::osc::SemanticMark::PromptStart, 0);
+        mark(&mut running, crate::osc::SemanticMark::InputStart, 0);
+        mark(&mut running, crate::osc::SemanticMark::OutputStart, 1);
+        let card = project_block_cards(&running, viewport(0, 6, 0), 3)[0];
+        assert_eq!((card.top_row, card.bottom_row), (0, 3));
+        assert_eq!(card.state, BlockState::Running);
+        assert_eq!(card.color, BlockDecorationColor::Accent);
+    }
+
+    #[test]
+    fn block_cards_are_hidden_on_the_alternate_screen() {
+        let visible = finished_block(Some(0), 10, 11);
+        assert!(
+            project_block_cards(
+                &visible,
+                BlockViewport {
+                    alternate_screen: true,
+                    ..viewport(10, 4, 0)
+                },
+                11
+            )
+            .is_empty()
+        );
+        assert!(project_block_cards(&BlockList::default(), viewport(0, 4, 0), 0).is_empty());
     }
 
     #[test]

@@ -726,6 +726,11 @@ impl Model {
         true
     }
 
+    /// The block chosen by `select_block_at_viewport`, while it stays selected.
+    pub fn selected_block_id(&self) -> Option<u64> {
+        self.selected_block_id
+    }
+
     pub fn selected_block_output_text(&self) -> Option<String> {
         let id = self.selected_block_id?;
         let block = self.blocks.blocks().iter().find(|block| block.id == id)?;
@@ -1525,7 +1530,10 @@ mod tests {
             model.block_range_text(block, false).as_deref(),
             Some("a\nb")
         );
+        let block_id = block.id;
+        assert_eq!(model.selected_block_id(), None);
         assert!(model.select_block_at_viewport());
+        assert_eq!(model.selected_block_id(), Some(block_id));
         assert_eq!(model.selected_block_output_text().as_deref(), Some("a\nb"));
         assert_eq!(
             model.last_finished_block_output_text().as_deref(),

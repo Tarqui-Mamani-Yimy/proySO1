@@ -1,3 +1,4 @@
+mod cards;
 mod chrome;
 
 use chrome::UiMode;
@@ -376,6 +377,10 @@ struct GpuState {
     image_vertices: Vec<ImageVertex>,
     image_vertex_buffer: wgpu::Buffer,
     image_vertex_buffer_capacity_bytes: usize,
+    card_pipeline: wgpu::RenderPipeline,
+    card_vertices: Vec<cards::CardVertex>,
+    card_vertex_buffer: wgpu::Buffer,
+    card_vertex_buffer_capacity_bytes: usize,
 }
 
 struct ImageTexture {
@@ -1366,6 +1371,53 @@ impl TerminalWindow {
             multiview_mask: None,
             cache: None,
         });
+        let card_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("nulix up block card shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("card.wgsl").into()),
+        });
+        let card_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("nulix up block card pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &card_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<cards::CardVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2,
+                        1 => Float32x2,
+                        2 => Float32x2,
+                        3 => Float32x2,
+                        4 => Float32x3,
+                        5 => Float32x3
+                    ],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &card_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let card_vertex_buffer_capacity_bytes = 6 * std::mem::size_of::<cards::CardVertex>();
+        let card_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nulix up block card vertex buffer"),
+            size: card_vertex_buffer_capacity_bytes as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let vertex_buffer_capacity_bytes = 1024;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("terminal reusable cell vertex buffer"),
@@ -1414,6 +1466,10 @@ impl TerminalWindow {
             image_vertices: Vec::new(),
             image_vertex_buffer,
             image_vertex_buffer_capacity_bytes,
+            card_pipeline,
+            card_vertices: Vec::new(),
+            card_vertex_buffer,
+            card_vertex_buffer_capacity_bytes,
         });
         Ok(())
     }
@@ -1447,6 +1503,9 @@ impl TerminalWindow {
             .layout()
             .into_iter()
             .find(|layout| layout.pane == pane_id && !layout.hidden)
+            .map(|layout| {
+                chrome::pane_grid_layout(self.ui_mode, layout, physical_cell_width.ceil() as u32)
+            })
             .map(|layout| (layout.cols as usize, layout.rows as usize))
             .unwrap_or_else(|| grid_size(width, height, physical_cell_width, physical_cell_height));
         self.tabs = Some(tabs);
@@ -1526,7 +1585,13 @@ impl TerminalWindow {
             gpu.cell_height,
         );
         tabs.resize_all(pane_rect, cell);
-        let layouts: Vec<_> = tabs.tabs().iter().flat_map(Tab::layout).collect();
+        let ui_mode = self.ui_mode;
+        let layouts: Vec<_> = tabs
+            .tabs()
+            .iter()
+            .flat_map(Tab::layout)
+            .map(|layout| chrome::pane_grid_layout(ui_mode, layout, cell.width))
+            .collect();
         for layout in layouts {
             if let Some(pane) = self.panes.get_mut(&layout.pane) {
                 if !layout.hidden {
@@ -1705,10 +1770,23 @@ impl TerminalWindow {
         if let Some(remote) = &self.remote {
             return remote.view.pane_layouts();
         }
-        self.tabs
+        let layouts = self
+            .tabs
             .as_ref()
             .and_then(TabSet::active)
-            .map_or_else(Vec::new, Tab::layout)
+            .map_or_else(Vec::new, Tab::layout);
+        let Some(cell_width) = self.layout_cell_width() else {
+            return layouts;
+        };
+        layouts
+            .into_iter()
+            .map(|layout| chrome::pane_grid_layout(self.ui_mode, layout, cell_width))
+            .collect()
+    }
+
+    /// Whole-pixel cell width the pane layout uses.
+    fn layout_cell_width(&self) -> Option<u32> {
+        self.gpu.as_ref().map(|gpu| gpu.cell_width.ceil() as u32)
     }
 
     fn pane_and_cell_at_cursor(&self) -> Option<(PaneId, usize, usize)> {
@@ -1851,9 +1929,12 @@ impl TerminalWindow {
             .map(|pane| pane.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let proxy = self.proxy.clone();
+        let ui_mode = self.ui_mode;
+        let cell_width = self.layout_cell_width().unwrap_or(1);
         let result = {
             let tabs = self.tabs.as_mut().ok_or("tab set is not initialized")?;
             create_tab_with(tabs, |pane_id, layout| {
+                let layout = chrome::pane_grid_layout(ui_mode, layout, cell_width);
                 Self::create_pane(
                     pane_id,
                     layout.cols as usize,
@@ -2507,10 +2588,14 @@ impl TerminalWindow {
             pane_image(remote_view, graphics_store, pane, id).is_some()
         });
         let panes = &mut self.panes;
+        // `nulix up` draws command blocks as rounded cards (standalone window only).
+        let up_cards = self.ui_mode == UiMode::Up && remote_view.is_none();
+        let layout_cell_width = gpu.cell_width.ceil() as u32;
+        let now = std::time::SystemTime::now();
         for layout in layouts.iter().filter(|layout| !layout.hidden) {
             // Both window modes reduce a pane to the same render input and the
             // same projected kitty placements, so the GPU code is shared.
-            let (input, glyphs, frame_images) =
+            let (input, glyphs, frame_images, block_cards, selected_block) =
                 if let (Some(view), Some(remote_panes)) = (remote_view, remote_panes.as_mut()) {
                     let Some(pane_view) = view.pane(layout.pane.0) else {
                         continue;
@@ -2519,6 +2604,8 @@ impl TerminalWindow {
                         pane_view.render_input(),
                         &mut remote_panes.entry(layout.pane).or_default().glyphs,
                         pane_view.placements.clone(),
+                        Vec::new(),
+                        None,
                     )
                 } else {
                     let Some(pane) = panes.get_mut(&layout.pane) else {
@@ -2526,14 +2613,81 @@ impl TerminalWindow {
                     };
                     let input = PaneRenderInput::from_model(&pane.model);
                     let images = frame_placements(&pane.graphics.placements, &pane.model);
-                    (input, &mut pane.glyphs, images)
+                    let block_cards = if up_cards {
+                        nulix::block_cards(&pane.model, input.rows.len())
+                    } else {
+                        Vec::new()
+                    };
+                    let selected = pane.model.selected_block_id();
+                    (input, &mut pane.glyphs, images, block_cards, selected)
                 };
-            let cells = input.render_cells(&nulix::config::current().palette);
+            let palette = &nulix::config::current().palette;
+            let cells = input.render_cells(palette);
+            // The whole pane around the grid; equal to `layout.rect` in classic mode.
+            let frame_rect = chrome::pane_frame_rect(self.ui_mode, layout.rect, layout_cell_width);
+            gpu.card_vertices.clear();
+            let mut meta_buffers = Vec::new();
+            for card in &block_cards {
+                let card = cards::trim_blank_tail(*card, |row| {
+                    cells
+                        .get(row)
+                        .is_none_or(|line| line.iter().all(|cell| cell.character == ' '))
+                });
+                cards::push_card_vertices(
+                    &mut gpu.card_vertices,
+                    cards::card_rect(&card, layout.rect, gpu.cell_height, layout_cell_width / 2),
+                    cards::card_style(&card, selected_block == Some(card.block_id)),
+                    gpu.config.width as f32,
+                    gpu.config.height as f32,
+                );
+                let parts = cards::card_meta(&card, now);
+                let Some(row) = card.prompt_row.filter(|_| !parts.is_empty()) else {
+                    continue;
+                };
+                let characters: Vec<char> = cells[row].iter().map(|cell| cell.character).collect();
+                let Some(mut column) = cards::meta_column(&characters, cards::meta_width(&parts))
+                else {
+                    continue;
+                };
+                for part in parts {
+                    let columns = part.text.chars().count();
+                    let mut buffer = Buffer::new(
+                        &mut gpu.font_system,
+                        Metrics::new(gpu.font_size, gpu.cell_height),
+                    );
+                    buffer.set_size(
+                        Some(gpu.cell_width * (columns + 1) as f32),
+                        Some(gpu.cell_height),
+                    );
+                    let [r, g, b] = part.color;
+                    buffer.set_text(
+                        &part.text,
+                        &Attrs::new()
+                            .family(Family::Monospace)
+                            .color(Color::rgb(r, g, b)),
+                        cosmic_text::Shaping::Advanced,
+                        None,
+                    );
+                    buffer.shape_until_scroll(&mut gpu.font_system, true);
+                    meta_buffers.push((
+                        buffer,
+                        layout.rect.x as f32 + column as f32 * gpu.cell_width,
+                        layout.rect.y as f32 + row as f32 * gpu.cell_height,
+                        part.color,
+                    ));
+                    column += columns;
+                }
+            }
             gpu.vertices.clear();
             let width = gpu.config.width as f32;
             let height = gpu.config.height as f32;
             for (row, line) in cells.iter().enumerate() {
                 for (column, cell) in line.iter().enumerate() {
+                    // In up mode default-background cells leave the card fill
+                    // (or the cleared pane background) visible.
+                    if up_cards && cell.background == palette.background {
+                        continue;
+                    }
                     push_overlay_rect(
                         &mut gpu.vertices,
                         layout.rect.x as f32 + column as f32 * gpu.cell_width,
@@ -2547,7 +2701,10 @@ impl TerminalWindow {
                 }
             }
             let background_vertices = gpu.vertices.len();
-            for decoration in &input.decorations {
+            // Up mode draws cards instead of the classic block markers.
+            let decorations: &[nulix::renderer::BlockDecoration] =
+                if up_cards { &[] } else { &input.decorations };
+            for decoration in decorations {
                 let color = match decoration.color {
                     BlockDecorationColor::Accent => [105, 165, 220],
                     BlockDecorationColor::Success => [80, 200, 120],
@@ -2582,10 +2739,10 @@ impl TerminalWindow {
             }
             if focused == Some(layout.pane) {
                 let border = [90, 145, 205];
-                let x = layout.rect.x as f32;
-                let y = layout.rect.y as f32;
-                let right = (x + layout.rect.width as f32).min(width);
-                let bottom = (y + layout.rect.height as f32).min(height);
+                let x = frame_rect.x as f32;
+                let y = frame_rect.y as f32;
+                let right = (x + frame_rect.width as f32).min(width);
+                let bottom = (y + frame_rect.height as f32).min(height);
                 push_overlay_rect(
                     &mut gpu.vertices,
                     x,
@@ -2676,6 +2833,12 @@ impl TerminalWindow {
                     height: gpu.config.height,
                 },
             );
+            let pane_bounds = TextBounds {
+                left: layout.rect.x as i32,
+                top: layout.rect.y as i32,
+                right: layout.rect.right().min(gpu.config.width) as i32,
+                bottom: layout.rect.bottom().min(gpu.config.height) as i32,
+            };
             let areas: Vec<_> = glyphs
                 .positions
                 .iter()
@@ -2685,15 +2848,23 @@ impl TerminalWindow {
                     left: layout.rect.x as f32 + column as f32 * gpu.cell_width,
                     top: layout.rect.y as f32 + row as f32 * gpu.cell_height,
                     scale: 1.0,
-                    bounds: TextBounds {
-                        left: layout.rect.x as i32,
-                        top: layout.rect.y as i32,
-                        right: layout.rect.right().min(gpu.config.width) as i32,
-                        bottom: layout.rect.bottom().min(gpu.config.height) as i32,
-                    },
+                    bounds: pane_bounds,
                     default_color: Color::rgb(220, 220, 220),
                     custom_glyphs: &[],
                 })
+                .chain(
+                    meta_buffers
+                        .iter()
+                        .map(|(buffer, left, top, [r, g, b])| TextArea {
+                            buffer,
+                            left: *left,
+                            top: *top,
+                            scale: 1.0,
+                            bounds: pane_bounds,
+                            default_color: Color::rgb(*r, *g, *b),
+                            custom_glyphs: &[],
+                        }),
+                )
                 .collect();
             gpu.text_renderer
                 .prepare(
@@ -2786,6 +2957,27 @@ impl TerminalWindow {
                     bytemuck::cast_slice(&gpu.image_vertices),
                 );
             }
+            let card_required = gpu.card_vertices.len() * std::mem::size_of::<cards::CardVertex>();
+            if card_required > gpu.card_vertex_buffer_capacity_bytes {
+                gpu.card_vertex_buffer_capacity_bytes =
+                    nulix::renderer::next_vertex_buffer_capacity_bytes(
+                        gpu.card_vertex_buffer_capacity_bytes,
+                        card_required,
+                    );
+                gpu.card_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("nulix up block card vertex buffer"),
+                    size: gpu.card_vertex_buffer_capacity_bytes as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            if card_required > 0 {
+                gpu.queue.write_buffer(
+                    &gpu.card_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&gpu.card_vertices),
+                );
+            }
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
             let capacity = nulix::renderer::next_vertex_buffer_capacity_bytes(
                 gpu.vertex_buffer_capacity_bytes,
@@ -2832,18 +3024,23 @@ impl TerminalWindow {
                     })],
                     ..Default::default()
                 });
-                pass.set_scissor_rect(
-                    layout.rect.x,
-                    layout.rect.y,
-                    layout
-                        .rect
-                        .width
-                        .min(gpu.config.width.saturating_sub(layout.rect.x)),
-                    layout
-                        .rect
-                        .height
-                        .min(gpu.config.height.saturating_sub(layout.rect.y)),
-                );
+                let scissor = |pass: &mut wgpu::RenderPass<'_>, rect: Rect| {
+                    pass.set_scissor_rect(
+                        rect.x,
+                        rect.y,
+                        rect.width.min(gpu.config.width.saturating_sub(rect.x)),
+                        rect.height.min(gpu.config.height.saturating_sub(rect.y)),
+                    );
+                };
+                // Cards go first, over the pane background; they reach into
+                // the grid padding, so they are clipped to the whole pane.
+                if !gpu.card_vertices.is_empty() {
+                    scissor(&mut pass, frame_rect);
+                    pass.set_pipeline(&gpu.card_pipeline);
+                    pass.set_vertex_buffer(0, gpu.card_vertex_buffer.slice(..));
+                    pass.draw(0..gpu.card_vertices.len() as u32, 0..1);
+                }
+                scissor(&mut pass, layout.rect);
                 render_texture_draws(
                     &mut pass,
                     &gpu.image_pipeline,
@@ -2874,6 +3071,8 @@ impl TerminalWindow {
                     &over_text_draws,
                 );
                 if let Some(range) = overlay_vertex_range(background_vertices, gpu.vertices.len()) {
+                    // The focus border follows the whole pane.
+                    scissor(&mut pass, frame_rect);
                     pass.set_pipeline(&gpu.rect_pipeline);
                     pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
                     pass.draw(range, 0..1);

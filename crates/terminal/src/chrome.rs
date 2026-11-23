@@ -8,7 +8,10 @@
 //! hit-testing, and the hint bar with the focused pane's state. Positions are
 //! whole cell columns; the renderer multiplies them by the cell width.
 
-use nulix::{blocks::PaneActivity, layout::Rect};
+use nulix::{
+    blocks::PaneActivity,
+    layout::{PaneLayout, Rect},
+};
 
 /// Which chrome the standalone window draws.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +34,14 @@ pub const MUTED: [u8; 3] = [0x8A, 0x90, 0xA0];
 pub const BORDER: [u8; 3] = [0x2A, 0x2F, 0x3A];
 /// Up-mode accent (active tab underline, running dot, brand mark).
 pub const ACCENT: [u8; 3] = [0x69, 0xA5, 0xDC];
+/// Up-mode block card fill.
+pub const SURFACE: [u8; 3] = [0x1B, 0x1E, 0x26];
+/// Up-mode border of a card whose command failed (red-tinted [`BORDER`]).
+pub const FAILED_BORDER: [u8; 3] = [0x7A, 0x3A, 0x3E];
+/// Up-mode success mark (`✓`).
+pub const SUCCESS: [u8; 3] = [0x50, 0xC8, 0x78];
+/// Up-mode failure mark and exit code (`✗ 1`).
+pub const FAILURE: [u8; 3] = [0xF0, 0x6A, 0x6A];
 /// Height in pixels of the accent line under the active tab.
 pub const ACCENT_LINE_PX: f32 = 2.0;
 
@@ -107,6 +118,40 @@ pub fn content_rect(mode: UiMode, window: Rect, tab_count: usize, cell_height: f
         window.y.saturating_add(top),
         window.width,
         rest - bottom,
+    )
+}
+
+/// The text grid of a pane. Up mode gives up one column so half a cell of
+/// padding is left on each side for the block card borders; classic mode and
+/// hidden panes keep the layout unchanged. `cell_width` is the layout's
+/// whole-pixel cell width.
+pub fn pane_grid_layout(mode: UiMode, layout: PaneLayout, cell_width: u32) -> PaneLayout {
+    if mode == UiMode::Classic || layout.hidden || layout.cols < 2 {
+        return layout;
+    }
+    let cols = layout.cols - 1;
+    PaneLayout {
+        rect: Rect::new(
+            layout.rect.x + cell_width / 2,
+            layout.rect.y,
+            cols * cell_width,
+            layout.rect.height,
+        ),
+        cols,
+        ..layout
+    }
+}
+
+/// The whole pane area around a text grid from [`pane_grid_layout`].
+pub fn pane_frame_rect(mode: UiMode, grid: Rect, cell_width: u32) -> Rect {
+    if mode == UiMode::Classic || grid.width == 0 {
+        return grid;
+    }
+    Rect::new(
+        grid.x.saturating_sub(cell_width / 2),
+        grid.y,
+        grid.width + cell_width,
+        grid.height,
     )
 }
 
@@ -632,5 +677,37 @@ mod tests {
         assert_eq!(find("+").left, 160.0);
         assert_eq!((find("◆").left, find("◆").color), (720.0, ACCENT));
         assert_eq!((find("ejecutando").top, find("●").color), (580.0, ACCENT));
+    }
+
+    fn pane_layout(rect: Rect, cols: u32, rows: u32, hidden: bool) -> PaneLayout {
+        PaneLayout {
+            pane: nulix::layout::PaneId(7),
+            rect,
+            cols,
+            rows,
+            hidden,
+        }
+    }
+
+    #[test]
+    fn classic_pane_grid_is_the_layout_unchanged() {
+        let layout = pane_layout(Rect::new(0, 20, 800, 560), 80, 28, false);
+        assert_eq!(pane_grid_layout(UiMode::Classic, layout, 10), layout);
+        assert_eq!(
+            pane_frame_rect(UiMode::Classic, layout.rect, 10),
+            layout.rect
+        );
+    }
+
+    #[test]
+    fn up_pane_grid_gives_up_one_column_as_half_a_cell_each_side() {
+        let layout = pane_layout(Rect::new(100, 20, 800, 560), 80, 28, false);
+        let grid = pane_grid_layout(UiMode::Up, layout, 10);
+        assert_eq!(grid.rect, Rect::new(105, 20, 790, 560));
+        assert_eq!((grid.cols, grid.rows, grid.pane), (79, 28, layout.pane));
+        assert_eq!(pane_frame_rect(UiMode::Up, grid.rect, 10), layout.rect);
+        // Hidden panes keep their empty layout.
+        let hidden = pane_layout(Rect::new(0, 0, 0, 0), 0, 0, true);
+        assert_eq!(pane_grid_layout(UiMode::Up, hidden, 10), hidden);
     }
 }

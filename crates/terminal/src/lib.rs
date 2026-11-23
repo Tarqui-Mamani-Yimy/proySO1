@@ -36,14 +36,7 @@ impl PaneRenderInput {
     pub fn from_model(model: &model::Model) -> Self {
         let rows = model.visible_cells();
         let cursor = model.cursor();
-        let viewport = renderer::BlockViewport {
-            evicted_rows: model.block_row_base(),
-            history_size: model.history_size(),
-            display_offset: model.display_offset(),
-            first_visible_line: Some(model.visible_top_line()),
-            screen_lines: rows.len(),
-            alternate_screen: model.alternate_screen_active(),
-        };
+        let viewport = block_viewport(model, rows.len());
         let decorations = renderer::project_block_decorations(model.blocks(), viewport);
         Self {
             selected: model.selected_cells(),
@@ -65,6 +58,29 @@ impl PaneRenderInput {
         }
         cells
     }
+}
+
+/// The block viewport of a local model showing `screen_lines` rows, shared by
+/// the classic block decorations and the `nulix up` cards.
+pub fn block_viewport(model: &model::Model, screen_lines: usize) -> renderer::BlockViewport {
+    renderer::BlockViewport {
+        evicted_rows: model.block_row_base(),
+        history_size: model.history_size(),
+        display_offset: model.display_offset(),
+        first_visible_line: Some(model.visible_top_line()),
+        screen_lines,
+        alternate_screen: model.alternate_screen_active(),
+    }
+}
+
+/// Block cards of a local model for `nulix up` (see [`renderer::project_block_cards`]):
+/// a block that has not ended reaches the cursor line.
+pub fn block_cards(model: &model::Model, screen_lines: usize) -> Vec<renderer::BlockCard> {
+    renderer::project_block_cards(
+        model.blocks(),
+        block_viewport(model, screen_lines),
+        model.cursor_anchor().line,
+    )
 }
 
 /// Default interactive-shell command candidates, in preference order.

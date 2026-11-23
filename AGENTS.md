@@ -122,6 +122,8 @@ crates/terminal/
   src/main.rs     nulix window/event loop, per-pane PTYs/models, input routing, and GPU renderer
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
   src/chrome.rs   Window chrome: classic/up bar geometry, up tab bar and hint bar layout
+  src/cards.rs    nulix up block cards: card geometry, state styles, status meta, durations
+  src/card.wgsl   Rounded-rectangle (signed distance) shader for the block cards
   src/config.rs   Startup `key = value` configuration file (fonts, shell, scrollback, palette)
   src/control.rs  Unix-domain control transport, peer credentials, and nulixctl client transport
   src/bin/nulixctl.rs Local control API CLI
@@ -190,6 +192,21 @@ Chrome colours (`crates/terminal/src/chrome.rs`): bars `#0F1116`, active tab
 `#14161C` with a 2 px `#69A5DC` underline, text `#DCDCDC`, muted `#8A90A0`,
 separators `#2A2F3A`. The chrome redraws only with the window; there is no
 animation.
+Each primary-screen block in the viewport is drawn as a rounded card behind its
+text (`crates/terminal/src/cards.rs`, `card.wgsl`): fill `#1B1E26`, 6 px corners,
+from the prompt row to the last output row (a block that has not ended reaches
+the cursor row; trailing blank rows are left out), clipped straight at the
+viewport edges. The pane grid gives up one column so half a cell of padding on
+each side holds the border, and default-background cells are not painted so the
+fill shows. Borders follow the block decoration colours: `#2A2F3A` for finished,
+cancelled and prompt blocks, `#7A3A3E` after a non-zero exit and 2 px `#69A5DC`
+while running. The prompt row shows, right-aligned, `12ms ✓` (`✓` `#50C878`),
+`1.4s ✗ 101` (`✗` and code `#F06A6A`) or `● 3.1s` while running; durations are
+`NNms` under a second, `N.Ns` under a minute and `MmSSs` after, from the times
+the OSC 133 marks were observed. A running block's elapsed time is computed when
+the pane redraws (there is no timer), and the meta is omitted when it would touch
+the prompt row's text. The card replaces the classic block markers; there are no
+cards on the alternate screen, and `nulix --session` keeps the classic look.
 
 ## Nulix Persistent Sessions
 

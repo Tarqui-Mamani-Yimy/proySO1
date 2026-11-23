@@ -290,7 +290,7 @@ pub fn state_label(activity: PaneActivity) -> (&'static str, &'static str) {
     }
 }
 
-fn width(text: &str) -> u32 {
+pub fn width(text: &str) -> u32 {
     text.chars().count() as u32
 }
 

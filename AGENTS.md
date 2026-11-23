@@ -208,6 +208,18 @@ window redraws once a second so its `● elapsed` advances; with nothing running
 there is no timer (classic mode never has one), and the meta is omitted when it would touch
 the prompt row's text. The card replaces the classic block markers; there are no
 cards on the alternate screen, and `nulix --session` keeps the classic look.
+F1 (without modifiers) opens a help overlay (`crates/terminal/src/help.rs`): a
+`#08090C` scrim at 62% over the whole window and a centred rounded panel (fill
+`#1B1E26`, 1 px `#3A4150` border) titled `Atajos de nulix` with `Esc cerrar`,
+listing the real bindings in two columns: PANELES, TABS and COPIAR on the left,
+BLOQUES and SESIÓN (`nulixctl list`, `nulixctl wait`, `nulix --session NAME` in
+`#69A5DC`) on the right, with the macOS `Cmd` variants on macOS. While it is
+open, F1 or Esc closes it, a mouse click closes it, and every other key is
+swallowed (never sent to the PTY); pane grid sizes do not change. On a window
+smaller than the panel, it shrinks to the window less 16 px a side and its text
+is clipped. While the focused pane shows the alternate screen, F1 goes to the
+application and the help does not open; classic mode and `nulix --session`
+always send F1 to the pane. Opening or closing redraws once; no timer.
 
 ## Nulix Persistent Sessions
 

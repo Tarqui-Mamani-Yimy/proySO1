@@ -232,6 +232,41 @@ pub fn push_card_vertices(
     }
 }
 
+/// Appends a translucent full-viewport scrim drawn with the card pipeline.
+///
+/// The rect pipeline is opaque, while `card.wgsl` outputs its antialiasing
+/// coverage as alpha with alpha blending. Giving every vertex the same local
+/// point, at signed distance `0.5 - opacity` from a square-cornered rectangle
+/// without border, makes that coverage (and so the alpha) `opacity` across
+/// the whole quad; fill and border share the colour.
+pub fn push_scrim_vertices(
+    vertices: &mut Vec<CardVertex>,
+    color: [u8; 3],
+    opacity: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) {
+    if viewport_width <= 0.0 || viewport_height <= 0.0 {
+        return;
+    }
+    let opacity = opacity.clamp(0.0, 1.0);
+    let half = [1.0, 1.0];
+    // Inside the edge by `opacity - 0.5` (distance 0.5 - opacity).
+    let local = [0.0, half[1] + 0.5 - opacity];
+    let linear = color.map(nulix::renderer::srgb_to_linear);
+    let corners = [[-1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]];
+    for index in [0, 1, 2, 0, 2, 3] {
+        vertices.push(CardVertex {
+            position: corners[index],
+            local,
+            half_size: half,
+            shape: [0.0, 0.0],
+            fill: linear,
+            border: linear,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,5 +490,43 @@ mod tests {
         );
         push_card_vertices(&mut vertices, rect, style, 0.0, 100.0);
         assert_eq!(vertices.len(), 6);
+    }
+
+    /// Mirror of `card.wgsl`'s fragment alpha (`coverage`).
+    fn shader_coverage(vertex: &CardVertex) -> f32 {
+        let [r, _] = vertex.shape;
+        let q = [
+            vertex.local[0].abs() - vertex.half_size[0] + r,
+            vertex.local[1].abs() - vertex.half_size[1] + r,
+        ];
+        let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)).sqrt();
+        let distance = outside + q[0].max(q[1]).min(0.0) - r;
+        (0.5 - distance).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn scrim_covers_the_viewport_with_a_uniform_translucent_colour() {
+        let mut vertices = Vec::new();
+        push_scrim_vertices(&mut vertices, [8, 9, 12], 0.62, 800.0, 600.0);
+        assert_eq!(vertices.len(), 6);
+        let colour = [8u8, 9, 12].map(nulix::renderer::srgb_to_linear);
+        let xs: Vec<f32> = vertices.iter().map(|v| v.position[0]).collect();
+        let ys: Vec<f32> = vertices.iter().map(|v| v.position[1]).collect();
+        assert_eq!(xs.iter().cloned().fold(f32::MAX, f32::min), -1.0);
+        assert_eq!(xs.iter().cloned().fold(f32::MIN, f32::max), 1.0);
+        assert_eq!(ys.iter().cloned().fold(f32::MAX, f32::min), -1.0);
+        assert_eq!(ys.iter().cloned().fold(f32::MIN, f32::max), 1.0);
+        for vertex in &vertices {
+            // Every vertex carries the same local point, so the interpolated
+            // coverage (the fragment alpha) is the opacity everywhere.
+            assert_eq!(vertex.local, vertices[0].local);
+            assert!((shader_coverage(vertex) - 0.62).abs() < 1e-5);
+            assert_eq!(vertex.fill, colour);
+            assert_eq!(vertex.border, colour);
+            assert_eq!(vertex.shape, [0.0, 0.0]);
+        }
+        let mut none = Vec::new();
+        push_scrim_vertices(&mut none, [0, 0, 0], 0.5, 0.0, 600.0);
+        assert!(none.is_empty());
     }
 }

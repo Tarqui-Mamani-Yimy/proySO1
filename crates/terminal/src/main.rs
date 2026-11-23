@@ -1,7 +1,9 @@
 mod cards;
 mod chrome;
+mod help;
 
 use chrome::UiMode;
+use help::HelpRoute;
 use nulix::blocks::PaneActivity;
 
 use alacritty_terminal::selection::SelectionType;
@@ -98,6 +100,8 @@ struct TerminalWindow {
     remote: Option<RemoteClient>,
     /// Chrome of the window: classic, or `nulix up`'s bars (standalone only).
     ui_mode: UiMode,
+    /// Up mode: the F1 help overlay is shown (see `help.rs`).
+    help_open: bool,
 }
 
 /// Window state of `nulix --session NAME`: the server owns PTYs and models,
@@ -383,6 +387,164 @@ struct GpuState {
     card_vertices: Vec<cards::CardVertex>,
     card_vertex_buffer: wgpu::Buffer,
     card_vertex_buffer_capacity_bytes: usize,
+}
+
+impl GpuState {
+    /// Copies `card_vertices` into the card vertex buffer, growing it first.
+    fn upload_card_vertices(&mut self) {
+        let required = self.card_vertices.len() * std::mem::size_of::<cards::CardVertex>();
+        if required > self.card_vertex_buffer_capacity_bytes {
+            self.card_vertex_buffer_capacity_bytes =
+                nulix::renderer::next_vertex_buffer_capacity_bytes(
+                    self.card_vertex_buffer_capacity_bytes,
+                    required,
+                );
+            self.card_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("nulix up block card vertex buffer"),
+                size: self.card_vertex_buffer_capacity_bytes as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if required > 0 {
+            self.queue.write_buffer(
+                &self.card_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&self.card_vertices),
+            );
+        }
+    }
+
+    /// Shapes window-chrome text runs and prepares them for `text_renderer`
+    /// over the whole window viewport.
+    fn prepare_overlay_texts(
+        &mut self,
+        texts: &[chrome::OverlayText],
+    ) -> Result<(), glyphon::PrepareError> {
+        let mut buffers = Vec::with_capacity(texts.len());
+        for item in texts {
+            let mut buffer = Buffer::new(
+                &mut self.font_system,
+                Metrics::new(self.font_size, self.cell_height),
+            );
+            buffer.set_size(Some(item.width.max(1.0)), Some(item.height));
+            let attrs = Attrs::new().family(Family::Monospace).color(Color::rgb(
+                item.color[0],
+                item.color[1],
+                item.color[2],
+            ));
+            buffer.set_text(&item.text, &attrs, cosmic_text::Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut self.font_system, true);
+            buffers.push(buffer);
+        }
+        let areas: Vec<_> = buffers
+            .iter()
+            .zip(texts)
+            .map(|(buffer, item)| TextArea {
+                buffer,
+                left: item.left,
+                top: item.top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: item.clip[0],
+                    top: item.clip[1],
+                    right: item.clip[2],
+                    bottom: item.clip[3],
+                },
+                default_color: Color::rgb(item.color[0], item.color[1], item.color[2]),
+                custom_glyphs: &[],
+            })
+            .collect();
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        );
+        self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            areas,
+            &mut self.swash_cache,
+        )
+    }
+}
+
+/// Draws `nulix up`'s F1 help over the finished frame: the translucent scrim
+/// and the rounded panel through the card pipeline, then the panel text.
+fn draw_help_overlay(gpu: &mut GpuState, view: &wgpu::TextureView) -> Result<(), String> {
+    let (width, height) = (gpu.config.width, gpu.config.height);
+    let layout = help::help_layout(
+        &help::help_groups(cfg!(target_os = "macos")),
+        width,
+        height,
+        gpu.cell_width,
+        gpu.cell_height,
+    );
+    gpu.card_vertices.clear();
+    cards::push_scrim_vertices(
+        &mut gpu.card_vertices,
+        help::SCRIM,
+        help::SCRIM_OPACITY,
+        width as f32,
+        height as f32,
+    );
+    cards::push_card_vertices(
+        &mut gpu.card_vertices,
+        cards::CardRect {
+            x0: layout.x0,
+            y0: layout.y0,
+            x1: layout.x1,
+            y1: layout.y1,
+        },
+        cards::CardStyle {
+            fill: chrome::SURFACE,
+            border: help::PANEL_BORDER,
+            border_px: 1.0,
+        },
+        width as f32,
+        height as f32,
+    );
+    gpu.upload_card_vertices();
+    let panel_visible = layout.x1 > layout.x0 && layout.y1 > layout.y0;
+    if panel_visible {
+        gpu.prepare_overlay_texts(&layout.texts)
+            .map_err(|error| format!("could not prepare the help text: {error}"))?;
+    }
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("nulix up help"),
+        });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("help scrim, panel and text"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&gpu.card_pipeline);
+        pass.set_vertex_buffer(0, gpu.card_vertex_buffer.slice(..));
+        pass.draw(0..gpu.card_vertices.len() as u32, 0..1);
+        if panel_visible {
+            gpu.text_renderer
+                .render(&gpu.atlas, &gpu.viewport, &mut pass)
+                .map_err(|error| format!("could not render the help text: {error}"))?;
+        }
+    }
+    gpu.queue.submit([encoder.finish()]);
+    Ok(())
 }
 
 struct ImageTexture {
@@ -1194,6 +1356,7 @@ impl TerminalWindow {
             _control_server: control_server,
             remote: session_socket.map(RemoteClient::new),
             ui_mode,
+            help_open: false,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -2960,27 +3123,7 @@ impl TerminalWindow {
                     bytemuck::cast_slice(&gpu.image_vertices),
                 );
             }
-            let card_required = gpu.card_vertices.len() * std::mem::size_of::<cards::CardVertex>();
-            if card_required > gpu.card_vertex_buffer_capacity_bytes {
-                gpu.card_vertex_buffer_capacity_bytes =
-                    nulix::renderer::next_vertex_buffer_capacity_bytes(
-                        gpu.card_vertex_buffer_capacity_bytes,
-                        card_required,
-                    );
-                gpu.card_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("nulix up block card vertex buffer"),
-                    size: gpu.card_vertex_buffer_capacity_bytes as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-            }
-            if card_required > 0 {
-                gpu.queue.write_buffer(
-                    &gpu.card_vertex_buffer,
-                    0,
-                    bytemuck::cast_slice(&gpu.card_vertices),
-                );
-            }
+            gpu.upload_card_vertices();
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
             let capacity = nulix::renderer::next_vertex_buffer_capacity_bytes(
                 gpu.vertex_buffer_capacity_bytes,
@@ -3210,22 +3353,6 @@ impl TerminalWindow {
                     rect.color,
                 );
             }
-            let mut label_buffers = Vec::with_capacity(chrome_texts.len());
-            for item in &chrome_texts {
-                let mut buffer = Buffer::new(
-                    &mut gpu.font_system,
-                    Metrics::new(gpu.font_size, gpu.cell_height),
-                );
-                buffer.set_size(Some(item.width.max(1.0)), Some(item.height));
-                let attrs = Attrs::new().family(Family::Monospace).color(Color::rgb(
-                    item.color[0],
-                    item.color[1],
-                    item.color[2],
-                ));
-                buffer.set_text(&item.text, &attrs, cosmic_text::Shaping::Advanced, None);
-                buffer.shape_until_scroll(&mut gpu.font_system, true);
-                label_buffers.push(buffer);
-            }
             let required = gpu.vertices.len() * std::mem::size_of::<RectVertex>();
             if required > gpu.vertex_buffer_capacity_bytes {
                 let capacity = nulix::renderer::next_vertex_buffer_capacity_bytes(
@@ -3244,41 +3371,7 @@ impl TerminalWindow {
                 gpu.queue
                     .write_buffer(&gpu.vertex_buffer, 0, bytemuck::cast_slice(&gpu.vertices));
             }
-            let areas: Vec<_> = label_buffers
-                .iter()
-                .zip(&chrome_texts)
-                .map(|(buffer, item)| TextArea {
-                    buffer,
-                    left: item.left,
-                    top: item.top,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: item.clip[0],
-                        top: item.clip[1],
-                        right: item.clip[2],
-                        bottom: item.clip[3],
-                    },
-                    default_color: Color::rgb(item.color[0], item.color[1], item.color[2]),
-                    custom_glyphs: &[],
-                })
-                .collect();
-            gpu.viewport.update(
-                &gpu.queue,
-                Resolution {
-                    width: gpu.config.width,
-                    height: gpu.config.height,
-                },
-            );
-            gpu.text_renderer
-                .prepare(
-                    &gpu.device,
-                    &gpu.queue,
-                    &mut gpu.font_system,
-                    &mut gpu.atlas,
-                    &gpu.viewport,
-                    areas,
-                    &mut gpu.swash_cache,
-                )
+            gpu.prepare_overlay_texts(&chrome_texts)
                 .map_err(|error| format!("could not prepare tab labels: {error}"))?;
             let mut encoder = gpu
                 .device
@@ -3307,6 +3400,9 @@ impl TerminalWindow {
                     .map_err(|error| format!("could not render tab labels: {error}"))?;
             }
             gpu.queue.submit([encoder.finish()]);
+        }
+        if self.help_open && self.ui_mode == UiMode::Up {
+            draw_help_overlay(gpu, &view)?;
         }
         gpu.queue.present(frame);
         Ok(FrameRecovery::WaitForEvent)
@@ -3465,7 +3561,9 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 self.ime_gate.preedit(&preedit);
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
-                if let Some(modes) = self.focused_modes() {
+                if self.help_open {
+                    // The help swallows typed input like any other key.
+                } else if let Some(modes) = self.focused_modes() {
                     let bytes = encode_ime_commit_with_flags(&text, modes.keyboard_flags);
                     let _ = self.write_focused(&bytes);
                     self.scroll_focused_to_bottom();
@@ -3519,6 +3617,26 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                     }
                 }
                 let mods = key_modifiers(self.modifiers, self.caps_lock, self.num_lock);
+                let help_route = help::route_help_key(
+                    self.ui_mode,
+                    self.help_open,
+                    self.focused_modes()
+                        .is_some_and(|modes| modes.alternate_screen),
+                    help::help_key(&event.logical_key, mods),
+                );
+                match help_route {
+                    HelpRoute::Open | HelpRoute::Close => {
+                        self.help_open = help_route == HelpRoute::Open;
+                        self.consumed_keys.mark(event.physical_key);
+                        self.request_redraw();
+                        return;
+                    }
+                    HelpRoute::Swallow => {
+                        self.consumed_keys.mark(event.physical_key);
+                        return;
+                    }
+                    HelpRoute::PassThrough => {}
+                }
                 let tab_count = self.tab_count();
                 let active_tab_index = self.active_tab_index();
                 if let Some(action) = tab_shortcut(
@@ -3664,6 +3782,12 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 } else {
                     PointerState::Released
                 };
+                if self.help_open && state == PointerState::Pressed {
+                    // A click anywhere closes the help and does nothing else.
+                    self.help_open = false;
+                    self.request_redraw();
+                    return;
+                }
                 if state == PointerState::Pressed
                     && button == PointerButton::Primary
                     && self.up_chrome_click(event_loop)
@@ -3903,7 +4027,9 @@ Opens a nulix window running a local shell.
 
 Commands:
   up              Open the window in the friendly UI mode for newcomers
-                  and demos. Pane shells see NULIX_UI=up.
+                  and demos. Pane shells see NULIX_UI=up. F1 shows the
+                  shortcut help (Esc or F1 closes it); inside full-screen
+                  apps F1 goes to the app.
 
 Options:
   --session NAME  Attach the window to the persistent nulix-server session

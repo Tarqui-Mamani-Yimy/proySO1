@@ -22,8 +22,8 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 | T3 — up chrome colours + always-visible tab bar + hint bar | S2–S3 | delegated (context backstop) | done (RED: 8 failed + 6 compile errors; GREEN: 41 bin + 81 lib) | e80b4c6 |
 | T4 — shellux blank line before prompt | S4 | inline | done (RED: PTY test failed; GREEN: shellux 87+8+116) | 3bdaea7 |
 | T5 — rounded block cards + status meta | S5 | delegated (context backstop) | done (RED: 8 + 61 compile errors; GREEN: core 202, nulix bin 50 + lib 81) | e3e2788 |
-| T6 — F1 help overlay | S6 | delegated (context backstop) | in progress | |
-| T7 — demo guide | S7 | inline | done (structural readback; commands checked against `nulixctl --help` and AGENTS.md) | next commit |
+| T6 — F1 help overlay | S6 | delegated (context backstop) | done (RED: 9 failed + 2 compile errors; GREEN: nulix bin 61) | next commit |
+| T7 — demo guide | S7 | inline | done (structural readback; commands checked against `nulixctl --help` and AGENTS.md) | 67b7d0f |
 
 ## Log
 
@@ -35,3 +35,4 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 - **L6**: T3 writer returned done. Parent spot check: `cargo test -p nulix` all ok. Visual check (risk item 6: no test renders the bars): screenshot of `nulix up` under X11 showed both bars and the T4 blank row; `⇧` rendered as a wrong glyph, so hints were spelled `Ctrl+Shift+X` and `F1 ayuda` moved first so it is dropped last (tests updated first, RED 2 failed, then GREEN). Closing an inactive tab = select it, close the active one, reselect the previous tab (TabSet only has `close_active`).
 - **L7**: The T5 writer returned partial: the selected-block accent was not wired (it needed a `Model::selected_block_id` accessor outside its surface). The parent added the accessor (tested) and wired it, and kept a running card's blank tail so the cursor row stays inside the card (RED observed first). Screenshots confirmed rounded cards, failure/running borders, meta, the clipped edge and no cards under `less`. Open: fast commands show `0ms` because both OSC 133 marks arrive in one read. Durations under 1s render as `NNms`.
 - **L8** (2026-11-23, user): "ok" to a once-a-second redraw only while a visible pane runs a block (S2 amended: no timer otherwise). `chrome::running_tick` (RED: missing function; GREEN: nulix bin 51); screenshots 2 s apart showed `● 3.0s` then `● 5.0s`.
+- **L9**: T6 writer returned done. Parent spot check: `cargo test -p nulix` ok (bin 61, lib 81), clippy and fmt clean; screenshot shows the centred two-column panel over a 62% scrim (drawn through the alpha-blended card pipeline). Keys are swallowed while it is open, the alternate screen passes F1 through, and classic mode routes F1 to the PTY. Known gap: the mouse wheel still scrolls the pane behind the open help.

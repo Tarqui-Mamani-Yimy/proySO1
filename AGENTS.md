@@ -121,6 +121,7 @@ crates/shell/
 crates/terminal/
   src/main.rs     nulix window/event loop, per-pane PTYs/models, input routing, and GPU renderer
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
+  src/chrome.rs   Window chrome: classic/up bar geometry, up tab bar and hint bar layout
   src/config.rs   Startup `key = value` configuration file (fonts, shell, scrollback, palette)
   src/control.rs  Unix-domain control transport, peer credentials, and nulixctl client transport
   src/bin/nulixctl.rs Local control API CLI
@@ -171,6 +172,24 @@ argument is an error (status 2), and `nulix up --session` is not supported yet.
 Before any pane or server process starts, `nulix up` exports `NULIX_UI=up` to
 pane shells, while plain `nulix` and `nulix --session` remove an inherited
 `NULIX_UI`. Plain `nulix` keeps its current look.
+In up mode the tab bar is always visible, even with one tab: tabs are sized to
+their labels (label, then a `×` close button), a `+` button follows the last tab
+and `◆ nulix` sits at the right; when space runs out labels are truncated with
+`…`, then `◆ nulix` is dropped. Clicking a tab selects it, `×` closes that tab
+(the active tab stays selected when another tab closes) and `+` opens a new
+tab. A bottom hint bar shows the focused pane's state (`● ejecutando` while its
+newest block runs, `○ listo` otherwise) and, right-aligned,
+`F1 ayuda  Ctrl+Shift+D dividir  Ctrl+Shift+T tab  Ctrl+Shift+A bloque
+Ctrl+Shift+O copiar` (`Cmd+Shift+D/T/A` on macOS); keys are spelled out because
+common monospace fonts lack `⇧`. Hints are dropped from the right end when the
+window is narrow, so `F1 ayuda` stays longest, and clicks on the bar do nothing.
+Both bars take one cell row each from the pane area. With `NULIX_UI=up`,
+shellux prints one blank line before each primary prompt, outside every OSC 133
+block, so consecutive command blocks never touch.
+Chrome colours (`crates/terminal/src/chrome.rs`): bars `#0F1116`, active tab
+`#14161C` with a 2 px `#69A5DC` underline, text `#DCDCDC`, muted `#8A90A0`,
+separators `#2A2F3A`. The chrome redraws only with the window; there is no
+animation.
 
 ## Nulix Persistent Sessions
 

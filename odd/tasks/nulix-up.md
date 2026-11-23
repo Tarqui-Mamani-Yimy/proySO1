@@ -17,10 +17,10 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 
 | ID | Specs | Route | Status | Commit |
 |---|---|---|---|---|
-| T1 — `nulix up` argument, `NULIX_UI` env, help, docs | S1 | inline | done (RED: 5 compile errors; GREEN: 30 passed) | see git log |
-| T2 — up theme defaults | S2 | inline | pending | |
-| T3 — always-visible tab bar + hint bar | S3 | inline | pending | |
-| T4 — shellux blank line before prompt | S4 | inline | pending | |
+| T1 — `nulix up` argument, `NULIX_UI` env, help, docs | S1 | inline | done (RED: 5 compile errors; GREEN: 30 passed) | 85ca1d0 |
+| T2 — up theme defaults | S2 | folded into T3 (see L5) | dropped | |
+| T3 — up chrome colours + always-visible tab bar + hint bar | S2–S3 | delegated (context backstop) | done (RED: 8 failed + 6 compile errors; GREEN: 41 bin + 81 lib) | next commit |
+| T4 — shellux blank line before prompt | S4 | inline | done (RED: PTY test failed; GREEN: shellux 87+8+116) | 3bdaea7 |
 | T5 — rounded block cards + status meta | S5 | inline | pending | |
 | T6 — F1 help overlay | S6 | inline | pending | |
 | T7 — demo guide | S7 | inline | pending | |
@@ -30,3 +30,6 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 - **L1** (2026-11-23, user): "a un jurado en donde bueno, quisiera que se vea mas o menos algo amigable y que la UI se vea algo mejor, pero sin perder mucho rendimiento, como un comando que active la UI del proyecto, en donde para conocedores, utilicen solo los comandos y los que no puedan ejecuten un comando como por ejemplo \"nulix up\" o algo asi, seria algo dificil de implementar o no"
 - **L2** (2026-11-23, user): "me parece bien el nombre" · rounded cards: "si" · design: "me parece bien el diseño" · plan T1–T7 approved: "si".
 - **L3**: Routes are inline: no unit has a Writer-trigger reason (units are sequential and share `crates/terminal/src/main.rs`).
+- **L4** (2026-11-23, user): chain strategy "stacked-to-main (Recommended)". T1 85ca1d0; RDD assess medium, under_budget.
+- **L5**: T2 folded into T3: nulix's default background `#14161C` and foreground `#DCDCDC` already match S2; the other S2 colours are chrome/card colours (not the ANSI palette), so `nulix.conf` colours are untouched by them. T3 delegated to one writer for the parent-context backstop.
+- **L6**: T3 writer returned done. Parent spot check: `cargo test -p nulix` all ok. Visual check (risk item 6: no test renders the bars): screenshot of `nulix up` under X11 showed both bars and the T4 blank row; `⇧` rendered as a wrong glyph, so hints were spelled `Ctrl+Shift+X` and `F1 ayuda` moved first so it is dropped last (tests updated first, RED 2 failed, then GREEN). Closing an inactive tab = select it, close the active one, reselect the previous tab (TabSet only has `close_active`).

@@ -1,3 +1,8 @@
+mod chrome;
+
+use chrome::UiMode;
+use nulix::blocks::PaneActivity;
+
 use alacritty_terminal::selection::SelectionType;
 use arboard::Clipboard;
 use cosmic_text::{Attrs, Buffer, Family, Metrics, Weight};
@@ -88,6 +93,8 @@ struct TerminalWindow {
     _control_server: Option<ControlServer>,
     /// Attached-client state; `None` for the standalone window.
     remote: Option<RemoteClient>,
+    /// Chrome of the window: classic, or `nulix up`'s bars (standalone only).
+    ui_mode: UiMode,
 }
 
 /// Window state of `nulix --session NAME`: the server owns PTYs and models,
@@ -566,22 +573,15 @@ enum TabAction {
     Select(usize),
 }
 
+/// Classic tab bar height: one cell row, only while several tabs exist.
 fn tab_bar_height(tab_count: usize, cell_height: f32) -> u32 {
-    if tab_count <= 1 {
-        0
-    } else {
-        cell_height.ceil().max(1.0) as u32
-    }
+    chrome::top_bar_height(UiMode::Classic, tab_count, cell_height)
 }
 
+/// Classic pane area below the tab bar.
+#[cfg(test)]
 fn tab_content_rect(window: Rect, tab_count: usize, cell_height: f32) -> Rect {
-    let height = tab_bar_height(tab_count, cell_height).min(window.height);
-    Rect::new(
-        window.x,
-        window.y.saturating_add(height),
-        window.width,
-        window.height.saturating_sub(height),
-    )
+    chrome::content_rect(UiMode::Classic, window, tab_count, cell_height)
 }
 
 fn tab_index_at(x: f64, width: u32, count: usize) -> Option<usize> {
@@ -627,6 +627,46 @@ fn tab_style(active: bool) -> ([u8; 3], [u8; 3]) {
     } else {
         ([34, 39, 47], [174, 184, 196])
     }
+}
+
+/// The classic tab bar: equal-width tabs filling the window width, as drawn
+/// before `nulix up` existed.
+fn classic_tab_bar_overlay(
+    labels: &[String],
+    active: usize,
+    width: u32,
+    bar_height: u32,
+) -> (Vec<chrome::OverlayRect>, Vec<chrome::OverlayText>) {
+    let count = labels.len();
+    let tab_width = width as f32 / count as f32;
+    let mut rects = Vec::with_capacity(count);
+    let mut texts = Vec::with_capacity(count);
+    for (index, label) in labels.iter().enumerate() {
+        let left = index as f32 * tab_width;
+        let right = if index + 1 == count {
+            width as f32
+        } else {
+            (index + 1) as f32 * tab_width
+        };
+        let (background, foreground) = tab_style(index == active);
+        rects.push(chrome::OverlayRect {
+            x0: left,
+            y0: 0.0,
+            x1: right,
+            y1: bar_height as f32,
+            color: background,
+        });
+        texts.push(chrome::OverlayText {
+            left: left + 5.0,
+            top: 0.0,
+            width: right - left - 10.0,
+            height: bar_height as f32,
+            clip: [0, 0, width as i32, bar_height as i32],
+            text: label.clone(),
+            color: foreground,
+        });
+    }
+    (rects, texts)
 }
 
 fn selection_target(
@@ -1097,7 +1137,17 @@ fn invalidate_glyph_cache<T>(
 impl TerminalWindow {
     /// `session_socket` selects client mode: no local PTYs, models or control
     /// listener; the window attaches to that session server instead.
-    fn new(proxy: EventLoopProxy<UserEvent>, session_socket: Option<PathBuf>) -> Self {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        session_socket: Option<PathBuf>,
+        ui_mode: UiMode,
+    ) -> Self {
+        // Session clients render the server's layout and keep the classic chrome.
+        let ui_mode = if session_socket.is_some() {
+            UiMode::Classic
+        } else {
+            ui_mode
+        };
         let now = Instant::now();
         let control_server = if session_socket.is_some() {
             None
@@ -1135,6 +1185,7 @@ impl TerminalWindow {
             graphics: SharedGraphics::default(),
             _control_server: control_server,
             remote: session_socket.map(RemoteClient::new),
+            ui_mode,
         }
     }
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -1375,7 +1426,12 @@ impl TerminalWindow {
         physical_cell_height: f32,
     ) -> Result<(), String> {
         let tabs = TabSet::new(
-            Rect::new(0, 0, width, height),
+            chrome::content_rect(
+                self.ui_mode,
+                Rect::new(0, 0, width, height),
+                1,
+                physical_cell_height,
+            ),
             CellSize::new(
                 physical_cell_width.ceil() as u32,
                 physical_cell_height.ceil() as u32,
@@ -1463,7 +1519,12 @@ impl TerminalWindow {
             return;
         };
         let cell = CellSize::new(gpu.cell_width.ceil() as u32, gpu.cell_height.ceil() as u32);
-        let pane_rect = tab_content_rect(Rect::new(0, 0, w, h), tabs.tabs().len(), gpu.cell_height);
+        let pane_rect = chrome::content_rect(
+            self.ui_mode,
+            Rect::new(0, 0, w, h),
+            tabs.tabs().len(),
+            gpu.cell_height,
+        );
         tabs.resize_all(pane_rect, cell);
         let layouts: Vec<_> = tabs.tabs().iter().flat_map(Tab::layout).collect();
         for layout in layouts {
@@ -1752,6 +1813,21 @@ impl TerminalWindow {
         self.request_redraw();
     }
 
+    /// Labels of the standalone window's tabs: each active pane's title.
+    fn local_tab_labels(&self) -> Vec<String> {
+        self.tabs.as_ref().map_or_else(Vec::new, |tabs| {
+            tabs.tabs()
+                .iter()
+                .map(|tab| {
+                    self.panes
+                        .get(&tab.active_pane())
+                        .map(|pane| pane.title.clone())
+                        .unwrap_or_else(|| "shellux".into())
+                })
+                .collect()
+        })
+    }
+
     fn refresh_window_title(&self) {
         let Some(window) = &self.window else { return };
         if let Some(remote) = &self.remote {
@@ -2025,6 +2101,51 @@ impl TerminalWindow {
         }
         self.refresh_window_title();
         self.request_redraw();
+    }
+
+    /// Handles a primary press on `nulix up`'s bars: select, close (`×`) or
+    /// create (`+`) tabs through the tab actions; the hint bar ignores clicks.
+    /// Returns whether the press landed on a bar.
+    fn up_chrome_click(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if self.ui_mode != UiMode::Up || self.remote.is_some() {
+            return false;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+        let (x, y) = (self.cursor_position.x, self.cursor_position.y);
+        let window_height = f64::from(gpu.config.height);
+        let top = chrome::top_bar_height(UiMode::Up, self.tab_count(), gpu.cell_height);
+        let bottom = chrome::bottom_bar_height(UiMode::Up, gpu.cell_height);
+        if y >= window_height - f64::from(bottom) && y < window_height {
+            return true;
+        }
+        if !(0.0..f64::from(top)).contains(&y) {
+            return false;
+        }
+        let Some(column) = chrome::column_at(x, gpu.cell_width, gpu.config.width) else {
+            return true;
+        };
+        let columns = (gpu.config.width as f32 / gpu.cell_width).floor() as u32;
+        let labels = self.local_tab_labels();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let bar = chrome::up_tab_bar(&labels, columns);
+        match chrome::up_tab_bar_hit(&bar, column) {
+            Some(chrome::TabBarHit::Select(index)) => {
+                self.apply_tab_action(TabAction::Select(index), event_loop);
+            }
+            Some(chrome::TabBarHit::Close(index)) => {
+                let active = self.active_tab_index();
+                self.apply_tab_action(TabAction::Select(index), event_loop);
+                self.apply_tab_action(TabAction::Close, event_loop);
+                if let Some(previous) = chrome::active_after_closing(index, active) {
+                    self.apply_tab_action(TabAction::Select(previous), event_loop);
+                }
+            }
+            Some(chrome::TabBarHit::New) => self.apply_tab_action(TabAction::New, event_loop),
+            None => {}
+        }
+        true
     }
 
     fn apply_tab_action(&mut self, action: TabAction, event_loop: &ActiveEventLoop) {
@@ -2341,19 +2462,11 @@ impl TerminalWindow {
             let dividers = tabs.and_then(TabSet::active).map_or_else(Vec::new, |tab| {
                 tab.layout_tree().divider_rects(tab.active_pane())
             });
-            let tab_labels = tabs.map_or_else(Vec::new, |tabs| {
-                tabs.tabs()
-                    .iter()
-                    .map(|tab| {
-                        self.panes
-                            .get(&tab.active_pane())
-                            .map(|pane| pane.title.clone())
-                            .unwrap_or_else(|| "shellux".into())
-                    })
-                    .collect()
-            });
-            (dividers, tab_labels)
+            (dividers, self.local_tab_labels())
         };
+        let focused_activity = focused
+            .and_then(|pane| self.panes.get(&pane))
+            .map_or(PaneActivity::Unknown, |pane| pane.model.blocks().activity());
         let Some(gpu) = self.gpu.as_mut() else {
             return Ok(FrameRecovery::WaitForEvent);
         };
@@ -2861,42 +2974,53 @@ impl TerminalWindow {
             }
             gpu.queue.submit([encoder.finish()]);
         }
-        if tab_count > 1 && tab_bar_height > 0 {
+        // Window chrome: the classic tab bar (several tabs only) or `nulix up`'s bars.
+        let (chrome_rects, chrome_texts) = match self.ui_mode {
+            UiMode::Up => chrome::up_overlay(&chrome::UpChrome {
+                labels: &tab_labels,
+                active: active_tab_index,
+                activity: focused_activity,
+                macos: cfg!(target_os = "macos"),
+                width: gpu.config.width,
+                height: gpu.config.height,
+                cell_width: gpu.cell_width,
+                cell_height: gpu.cell_height,
+            }),
+            UiMode::Classic if tab_count > 1 && tab_bar_height > 0 => classic_tab_bar_overlay(
+                &tab_labels,
+                active_tab_index,
+                gpu.config.width,
+                tab_bar_height,
+            ),
+            UiMode::Classic => (Vec::new(), Vec::new()),
+        };
+        if !chrome_rects.is_empty() || !chrome_texts.is_empty() {
             gpu.vertices.clear();
-            let tab_width = gpu.config.width as f32 / tab_count as f32;
-            let mut label_buffers = Vec::with_capacity(tab_labels.len());
-            for (index, label) in tab_labels.iter().enumerate() {
-                let left = index as f32 * tab_width;
-                let right = if index + 1 == tab_count {
-                    gpu.config.width as f32
-                } else {
-                    (index + 1) as f32 * tab_width
-                };
-                let (background, foreground) = tab_style(index == active_tab_index);
+            for rect in &chrome_rects {
                 push_overlay_rect(
                     &mut gpu.vertices,
-                    left,
-                    0.0,
-                    right,
-                    tab_bar_height as f32,
+                    rect.x0,
+                    rect.y0,
+                    rect.x1,
+                    rect.y1,
                     gpu.config.width as f32,
                     gpu.config.height as f32,
-                    background,
+                    rect.color,
                 );
+            }
+            let mut label_buffers = Vec::with_capacity(chrome_texts.len());
+            for item in &chrome_texts {
                 let mut buffer = Buffer::new(
                     &mut gpu.font_system,
                     Metrics::new(gpu.font_size, gpu.cell_height),
                 );
-                buffer.set_size(
-                    Some((right - left - 10.0).max(1.0)),
-                    Some(tab_bar_height as f32),
-                );
+                buffer.set_size(Some(item.width.max(1.0)), Some(item.height));
                 let attrs = Attrs::new().family(Family::Monospace).color(Color::rgb(
-                    foreground[0],
-                    foreground[1],
-                    foreground[2],
+                    item.color[0],
+                    item.color[1],
+                    item.color[2],
                 ));
-                buffer.set_text(label, &attrs, cosmic_text::Shaping::Advanced, None);
+                buffer.set_text(&item.text, &attrs, cosmic_text::Shaping::Advanced, None);
                 buffer.shape_until_scroll(&mut gpu.font_system, true);
                 label_buffers.push(buffer);
             }
@@ -2920,22 +3044,19 @@ impl TerminalWindow {
             }
             let areas: Vec<_> = label_buffers
                 .iter()
-                .enumerate()
-                .map(|(index, buffer)| TextArea {
+                .zip(&chrome_texts)
+                .map(|(buffer, item)| TextArea {
                     buffer,
-                    left: index as f32 * tab_width + 5.0,
-                    top: 0.0,
+                    left: item.left,
+                    top: item.top,
                     scale: 1.0,
                     bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: gpu.config.width as i32,
-                        bottom: tab_bar_height as i32,
+                        left: item.clip[0],
+                        top: item.clip[1],
+                        right: item.clip[2],
+                        bottom: item.clip[3],
                     },
-                    default_color: {
-                        let foreground = tab_style(index == active_tab_index).1;
-                        Color::rgb(foreground[0], foreground[1], foreground[2])
-                    },
+                    default_color: Color::rgb(item.color[0], item.color[1], item.color[2]),
                     custom_glyphs: &[],
                 })
                 .collect();
@@ -2976,12 +3097,6 @@ impl TerminalWindow {
                     })],
                     ..Default::default()
                 });
-                pass.set_scissor_rect(
-                    0,
-                    0,
-                    gpu.config.width,
-                    tab_bar_height.min(gpu.config.height),
-                );
                 pass.set_pipeline(&gpu.rect_pipeline);
                 pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
                 pass.draw(0..gpu.vertices.len() as u32, 0..1);
@@ -3347,6 +3462,12 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                 } else {
                     PointerState::Released
                 };
+                if state == PointerState::Pressed
+                    && button == PointerButton::Primary
+                    && self.up_chrome_click(event_loop)
+                {
+                    return;
+                }
                 if state == PointerState::Pressed && button == PointerButton::Primary {
                     let tab_count = self.tab_count();
                     if let Some(remote) = self.remote.as_mut()
@@ -3648,9 +3769,13 @@ fn main() {
             print!("{USAGE}");
             0
         }
-        Ok(WindowArgs::Standalone | WindowArgs::Up) => {
+        Ok(WindowArgs::Standalone) => {
             nulix::config::init();
-            run_terminal(None)
+            run_terminal(None, UiMode::Classic)
+        }
+        Ok(WindowArgs::Up) => {
+            nulix::config::init();
+            run_terminal(None, UiMode::Up)
         }
         Ok(WindowArgs::Session(session)) => {
             // The client applies fonts and colours; the server reads the same
@@ -3677,7 +3802,7 @@ fn run_session_client(session: &str) -> i32 {
         return 1;
     }
     match nulix::remote::ensure_server(session) {
-        Ok(socket) => run_terminal(Some(socket)),
+        Ok(socket) => run_terminal(Some(socket), UiMode::Classic),
         Err(error) => {
             eprintln!("nulix: could not reach session {session}: {error}");
             1
@@ -3685,7 +3810,7 @@ fn run_session_client(session: &str) -> i32 {
     }
 }
 
-fn run_terminal(session_socket: Option<PathBuf>) -> i32 {
+fn run_terminal(session_socket: Option<PathBuf>, ui_mode: UiMode) -> i32 {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
@@ -3693,7 +3818,7 @@ fn run_terminal(session_socket: Option<PathBuf>) -> i32 {
             return 1;
         }
     };
-    let mut app = TerminalWindow::new(event_loop.create_proxy(), session_socket);
+    let mut app = TerminalWindow::new(event_loop.create_proxy(), session_socket, ui_mode);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("nulix: window event loop failed: {error}");
         return 1;
@@ -4122,6 +4247,29 @@ mod tests {
                 .take_events()
                 .contains(&ModelEvent::Title("hello".into()))
         );
+    }
+
+    #[test]
+    fn classic_tab_bar_overlay_keeps_equal_width_tabs_and_tab_styles() {
+        let labels = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let (rects, texts) = super::classic_tab_bar_overlay(&labels, 1, 900, 20);
+        let spans: Vec<_> = rects
+            .iter()
+            .map(|rect| (rect.x0, rect.x1, rect.y1))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (0.0, 300.0, 20.0),
+                (300.0, 600.0, 20.0),
+                (600.0, 900.0, 20.0)
+            ]
+        );
+        assert_eq!(rects[1].color, tab_style(true).0);
+        assert_eq!(rects[0].color, tab_style(false).0);
+        assert_eq!((texts[1].left, texts[1].width), (305.0, 290.0));
+        assert_eq!(texts[1].color, tab_style(true).1);
+        assert_eq!(texts[2].clip, [0, 0, 900, 20]);
     }
 
     #[test]

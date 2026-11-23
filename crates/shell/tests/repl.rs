@@ -3143,6 +3143,16 @@ mod aliases {
 }
 
 fn text_between_command_end_and_next_prompt(nulix_ui: Option<&str>) -> String {
+    let envs: Vec<(&str, &str)> = nulix_ui
+        .map(|value| ("NULIX_UI", value))
+        .into_iter()
+        .collect();
+    prompt_gaps(&envs).1
+}
+
+/// Runs `true` at the first prompt and returns the text written before the
+/// first primary prompt and between that command's end and the next prompt.
+fn prompt_gaps(envs: &[(&str, &str)]) -> (String, String) {
     let _guard = serialize_pty_test();
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_shellux"));
@@ -3156,11 +3166,14 @@ fn text_between_command_end_and_next_prompt(nulix_ui: Option<&str>) -> String {
         .env("SHELLUX_HIGHLIGHT", "0")
         .env("SHELLUX_KITTY_KEYBOARD", "0")
         .current_dir(dir.path());
-    if let Some(value) = nulix_ui {
-        command.env("NULIX_UI", value);
+    for (name, value) in envs {
+        command.env(name, value);
     }
     let mut session = spawn_pty(command);
-    capture_primary_prompt(&mut session);
+    let (before_first, _) = session
+        .exp_any(vec![ReadUntil::String(OSC133_A.to_owned())])
+        .unwrap();
+    expect_sequence(&mut session, OSC133_B);
     session.send_line("true").unwrap();
     expect_sequence(&mut session, OSC133_D0);
     let (between, _) = session
@@ -3168,7 +3181,59 @@ fn text_between_command_end_and_next_prompt(nulix_ui: Option<&str>) -> String {
         .unwrap();
     session.send_line("exit").unwrap();
     session.exp_eof().unwrap();
-    between
+    (before_first, between)
+}
+
+/// A fake nulix window control socket: the n-th `ui` query is answered with
+/// `modes[n]` (the last mode repeats). Returns the received request lines.
+fn fake_nulix_ui_socket(
+    path: &std::path::Path,
+    modes: &'static [&'static str],
+) -> std::sync::Arc<Mutex<Vec<String>>> {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for (index, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            seen.lock().unwrap().push(line);
+            let mode = modes[index.min(modes.len() - 1)];
+            let reply =
+                format!("{{\"v\":1,\"id\":1,\"ok\":true,\"result\":{{\"mode\":\"{mode}\"}}}}\n");
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    requests
+}
+
+#[test]
+fn nulix_ui_query_lets_the_blank_line_follow_a_runtime_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("nulix.sock");
+    let requests = fake_nulix_ui_socket(&socket, &["classic", "up"]);
+    let socket = socket.to_str().unwrap();
+    let (before_first, between) = prompt_gaps(&[("NULIX_SOCKET", socket)]);
+    assert!(!before_first.contains('\n'), "{before_first:?}");
+    assert!(between.contains('\n'), "{between:?}");
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 2, "{requests:?}");
+    for request in requests.iter() {
+        assert_eq!(request, "{\"v\":1,\"id\":1,\"cmd\":\"ui\"}\n");
+    }
+}
+
+#[test]
+fn nulix_ui_query_falls_back_to_nulix_ui_when_the_socket_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("missing.sock");
+    let socket = socket.to_str().unwrap();
+    let (_, up) = prompt_gaps(&[("NULIX_SOCKET", socket), ("NULIX_UI", "up")]);
+    assert!(up.contains('\n'), "{up:?}");
+    let (_, plain) = prompt_gaps(&[("NULIX_SOCKET", socket)]);
+    assert!(!plain.contains('\n'), "{plain:?}");
 }
 
 #[test]

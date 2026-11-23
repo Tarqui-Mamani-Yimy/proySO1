@@ -30,15 +30,26 @@ only (macOS and Windows builds are not released yet).
 
 ## The demo
 
-### 1. Open the friendly mode (30 s)
+### 1. From the classic terminal to the friendly mode (1 min)
+
+Open the classic terminal and run a command or two:
+
+```sh
+nulix
+ls
+```
+
+Then, inside that same window:
 
 ```sh
 nulix up
 ```
 
-Point out the system banner, the prompt (user, host, folder, git branch), the
-tab bar at the top and the shortcut bar at the bottom. Plain `nulix` opens the
-same terminal without these extras, for people who already know the keys.
+The window turns into the friendly mode in place: tab bar at the top, shortcut
+bar at the bottom, and every new command drawn as a card. `nulix down` brings
+the classic look back, so people who already know the keys can stay in it.
+(Run from any other terminal, `nulix up` opens a new window already in the
+friendly mode.)
 
 ### 2. Commands become cards (1 min)
 

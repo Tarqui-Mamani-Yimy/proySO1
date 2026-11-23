@@ -200,7 +200,14 @@ common monospace fonts lack `⇧`. Hints are dropped from the right end when the
 window is narrow, so `F1 ayuda` stays longest, and clicks on the bar do nothing.
 Both bars take one cell row each from the pane area. With `NULIX_UI=up`,
 shellux prints one blank line before each primary prompt, outside every OSC 133
-block, so consecutive command blocks never touch.
+block, so consecutive command blocks never touch. When `NULIX_SOCKET` is non-empty (Unix), the
+interactive REPL asks the nulix window for its UI mode before each primary
+prompt: it sends only `{"v":1,"id":1,"cmd":"ui"}`, reads one reply line (at most
+4 KiB) and closes, all within about 100 ms; `"mode":"up"` prints the blank line
+and `"classic"` suppresses it, so the spacing follows `nulix up`/`nulix down` in
+place. Any failure (missing socket, timeout, an error reply such as
+`UNKNOWN_COMMAND` from an older nulix, a malformed reply) silently falls back to
+`NULIX_UI=up` (`crates/shell/src/nulix_ui.rs`).
 Chrome colours (`crates/terminal/src/chrome.rs`): bars `#0F1116`, active tab
 `#14161C` with a 2 px `#69A5DC` underline, text `#DCDCDC`, muted `#8A90A0`,
 separators `#2A2F3A`. The chrome redraws only with the window; there is no

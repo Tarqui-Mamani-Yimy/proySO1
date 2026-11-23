@@ -13,6 +13,8 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 - **S6** — F1 help overlay: centred panel grouping Paneles/Tabs/Bloques/Copiar/Sesión shortcuts; Esc or F1 closes. While the alternate screen is active, F1 goes to the application.
 - **S7** — Demo guide `docs/demo.md` with the exact steps for the jury.
 
+- **S8** — In-place switch (user, verbatim, 2026-11-23): "mi idea era conservar la amterior version de la terminal, pero que cuando se ejecutara \"nulix up\", se convirtiese en la version que hemos aprobado" / confirmed: "si, eso justamente es lo que queria" to: `nulix up` run inside a nulix window transforms that same window into up mode, and `nulix down` returns it to classic. Run outside any nulix window, `nulix up` keeps opening a new up-mode window; `nulix down` outside a window is an error. Protocol: control command `ui` (`{"v":1,"id":N,"cmd":"ui"}` queries, `"mode":"up"|"classic"` sets; result `{"mode":"up"|"classic"}`); `nulix-server` answers queries with `classic` and refuses setting. shellux learns the current mode before each prompt by querying `ui` over `NULIX_SOCKET` (short timeout, falling back to `NULIX_UI`), so the blank line follows the switch.
+
 ## Tasks
 
 | ID | Specs | Route | Status | Commit |
@@ -23,6 +25,8 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 | T4 — shellux blank line before prompt | S4 | inline | done (RED: PTY test failed; GREEN: shellux 87+8+116) | 3bdaea7 |
 | T5 — rounded block cards + status meta | S5 | delegated (context backstop) | done (RED: 8 + 61 compile errors; GREEN: core 202, nulix bin 50 + lib 81) | e3e2788 |
 | T6 — F1 help overlay | S6 | delegated (context backstop) | done (RED: 9 failed + 2 compile errors; GREEN: nulix bin 61) | 4dcdc38 |
+| T8 — `ui` control command, in-place `nulix up`/`nulix down` | S8 | delegated (parallel unit A) | done (RED: 6 + 18 compile errors; GREEN: core 203, nulix bin 66, server 18) | 9730f8e |
+| T9 — shellux queries the window's UI mode before each prompt | S8 (S4) | delegated (parallel unit B) | done (RED: PTY switch test + 3/7 unit; GREEN: shellux 94+8+118) | next commit |
 | T7 — demo guide | S7 | inline | done (structural readback; commands checked against `nulixctl --help` and AGENTS.md) | 67b7d0f |
 
 ## Log
@@ -37,3 +41,5 @@ Branch: `feat/nulix-up`. Delivery: ask-on-risk (forecast ~1500–2000 authored l
 - **L8** (2026-11-23, user): "ok" to a once-a-second redraw only while a visible pane runs a block (S2 amended: no timer otherwise). `chrome::running_tick` (RED: missing function; GREEN: nulix bin 51); screenshots 2 s apart showed `● 3.0s` then `● 5.0s`.
 - **L9**: T6 writer returned done. Parent spot check: `cargo test -p nulix` ok (bin 61, lib 81), clippy and fmt clean; screenshot shows the centred two-column panel over a 62% scrim (drawn through the alpha-blended card pipeline). Keys are swallowed while it is open, the alternate screen passes F1 through, and classic mode routes F1 to the PTY. Known gap: the mouse wheel still scrolls the pane behind the open help.
 - **L10**: Closure `make ci`: every cargo suite, clippy and fmt passed; mksh conformance 167 passed, 1 unexpected failure `regression-37` (`time -p sleep 1` → `time: not found`, status 127). It is environmental: `/usr/bin/time` is not installed on this machine, and the branch changes no epsh source or conformance file.
+- **L11** (2026-11-23, user): "no entiendo que hace el comando nulix up, mi idea era conservar la amterior version de la terminal, pero que cuando se ejecutara \"nulix up\", se convirtiese en la version que hemos aprobado" — then "si, eso justamente es lo que queria". S8 added; S1 stays for the outside-window case. T8 and T9 run as parallel writers with disjoint surfaces (writer reason: parallelism); the parent adds T9's docs to AGENTS.md at the end and updates docs/demo.md.
+- **L12**: T8 and T9 returned done; the parent spot-checked `cargo test -p nulix`. Seam check, live: a classic window, then `ls crates`, `nulix up`, `ls crates`, `false` typed through nulixctl. The same single window switched to up, and the commands after the switch are cards with blank rows. Rows from before the switch keep no card, because the up inset reflows the grid and drops their anchors. docs/demo.md step 1 now shows the in-place switch.

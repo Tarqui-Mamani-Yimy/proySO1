@@ -120,6 +120,7 @@ crates/shell/
   tests/cli.rs    Non-interactive CLI compatibility tests
 crates/terminal/
   src/main.rs     nulix window/event loop, per-pane PTYs/models, input routing, and GPU renderer
+  src/glyph_cache.rs Content-keyed, LRU-bounded cache of shaped text buffers shared by all panes
   src/lib.rs      Public term-core re-exports, shell selection, and surface helpers
   src/chrome.rs   Window chrome: classic/up bar geometry, up tab bar and hint bar layout
   src/cards.rs    nulix up block cards: card geometry, state styles, status meta, durations
@@ -548,8 +549,14 @@ perpendicular center, top/left position, and PaneId. Pane IDs are globally
 monotonic across trees. Tab navigation wraps; closing the active tab selects the tab now occupying
 its index, or the previous final tab when the removed tab was last.
 
-Each pane owns one PTY, VT `Model`, view state, wakeup gate, and glyph cache;
-PTY output notifications carry its globally unique `PaneId`. `Ctrl+Shift+D`
+Each pane owns one PTY, VT `Model`, view state, and wakeup gate;
+PTY output notifications carry its globally unique `PaneId`. Shaped glyphs are cached
+by content (character, colour, bold, cell width) once per window and shared by every
+cell and pane; chrome, help and card-meta text runs are cached the same way. Both
+caches drop everything when font metrics change and are trimmed to their bound
+(4096 glyphs, 256 runs) by least-recent use, keeping what the last frame showed.
+Classic mode skips default-background cell rects unless a kitty image sits beneath
+the cell backgrounds. `Ctrl+Shift+D`
 splits right, `Ctrl+Shift+E` splits down, `Ctrl+Shift+W` closes the focused pane,
 and `Ctrl+Alt+Arrow` moves focus by geometry. On macOS, use `Cmd+Shift+D/E/W`
 and `Cmd+Option+Arrow`. Tabs use a single-row bar at the top only while more

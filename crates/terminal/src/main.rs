@@ -1,8 +1,10 @@
 mod cards;
 mod chrome;
+mod glyph_cache;
 mod help;
 
 use chrome::UiMode;
+use glyph_cache::{FontMetricsKey, GlyphKey, ShapedBufferCache, TextKey};
 use help::HelpRoute;
 use nulix::blocks::PaneActivity;
 
@@ -123,7 +125,6 @@ struct RemoteClient {
 
 #[derive(Default)]
 struct RemotePaneState {
-    glyphs: GlyphCache,
     selection_router: SelectionRouter,
     wheel: WheelAccumulator,
 }
@@ -205,20 +206,6 @@ struct FocusedModes {
     alternate_screen: bool,
 }
 
-/// Shaped glyph buffers for one pane, reused across frames.
-#[derive(Default)]
-struct GlyphCache {
-    buffers: Vec<Buffer>,
-    keys: Vec<Option<GlyphKey>>,
-    positions: Vec<(usize, usize)>,
-}
-
-impl GlyphCache {
-    fn invalidate(&mut self) {
-        invalidate_glyph_cache(&mut self.buffers, &mut self.keys, &mut self.positions);
-    }
-}
-
 #[derive(Default)]
 struct ConsumedKeyPresses(HashSet<winit::keyboard::PhysicalKey>);
 
@@ -245,7 +232,6 @@ struct Pane {
     wakeup: Arc<WakeupGate>,
     wheel: WheelAccumulator,
     selection_router: SelectionRouter,
-    glyphs: GlyphCache,
 }
 
 impl Pane {
@@ -387,9 +373,24 @@ struct GpuState {
     card_vertices: Vec<cards::CardVertex>,
     card_vertex_buffer: wgpu::Buffer,
     card_vertex_buffer_capacity_bytes: usize,
+    /// Shaped grid glyphs keyed by content, shared by every pane.
+    glyph_buffers: ShapedBufferCache<GlyphKey, Buffer>,
+    /// Shaped chrome, help and card meta text runs keyed by content.
+    text_buffers: ShapedBufferCache<TextKey, Buffer>,
+    /// Per-pane scratch: grid positions with a glyph and their cache keys.
+    glyph_positions: Vec<(usize, usize)>,
+    glyph_keys: Vec<GlyphKey>,
 }
 
 impl GpuState {
+    /// Starts a draw for the shaped-buffer caches; they drop everything when
+    /// the font metrics changed (for example on a device scale change).
+    fn begin_text_frame(&mut self) {
+        let metrics = FontMetricsKey::new(self.font_size, self.cell_width, self.cell_height);
+        self.glyph_buffers.begin_frame(metrics);
+        self.text_buffers.begin_frame(metrics);
+    }
+
     /// Copies `card_vertices` into the card vertex buffer, growing it first.
     fn upload_card_vertices(&mut self) {
         let required = self.card_vertices.len() * std::mem::size_of::<cards::CardVertex>();
@@ -421,27 +422,22 @@ impl GpuState {
         &mut self,
         texts: &[chrome::OverlayText],
     ) -> Result<(), glyphon::PrepareError> {
-        let mut buffers = Vec::with_capacity(texts.len());
-        for item in texts {
-            let mut buffer = Buffer::new(
-                &mut self.font_system,
-                Metrics::new(self.font_size, self.cell_height),
-            );
-            buffer.set_size(Some(item.width.max(1.0)), Some(item.height));
-            let attrs = Attrs::new().family(Family::Monospace).color(Color::rgb(
-                item.color[0],
-                item.color[1],
-                item.color[2],
-            ));
-            buffer.set_text(&item.text, &attrs, cosmic_text::Shaping::Advanced, None);
-            buffer.shape_until_scroll(&mut self.font_system, true);
-            buffers.push(buffer);
+        let metrics = Metrics::new(self.font_size, self.cell_height);
+        let keys: Vec<TextKey> = texts
+            .iter()
+            .map(|item| TextKey::new(&item.text, item.color, item.width.max(1.0), item.height))
+            .collect();
+        for key in &keys {
+            let font_system = &mut self.font_system;
+            self.text_buffers
+                .ensure(key, || shape_text_key(font_system, metrics, key));
         }
-        let areas: Vec<_> = buffers
+        let text_buffers = &self.text_buffers;
+        let areas: Vec<_> = keys
             .iter()
             .zip(texts)
-            .map(|(buffer, item)| TextArea {
-                buffer,
+            .map(|(key, item)| TextArea {
+                buffer: text_buffers.get(key).expect("text run shaped this frame"),
                 left: item.left,
                 top: item.top,
                 scale: 1.0,
@@ -694,8 +690,6 @@ struct ImageVertex {
     position: [f32; 2],
     uv: [f32; 2],
 }
-
-type GlyphKey = (char, [u8; 3], bool, usize);
 
 fn overlay_vertex_range(
     background_vertices: usize,
@@ -1290,18 +1284,36 @@ fn push_overlay_rect(
     }
 }
 
-fn glyph_key_requires_reshape(cached: Option<GlyphKey>, next: Option<GlyphKey>) -> bool {
-    cached != next
+/// Shapes one text run into a new buffer of the given bounds.
+fn shape_text_buffer(
+    font_system: &mut FontSystem,
+    metrics: Metrics,
+    bounds: (f32, f32),
+    text: &str,
+    attrs: &Attrs<'_>,
+) -> Buffer {
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(Some(bounds.0), Some(bounds.1));
+    buffer.set_text(text, attrs, cosmic_text::Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, true);
+    buffer
 }
 
-fn invalidate_glyph_cache<T>(
-    glyph_buffers: &mut Vec<T>,
-    glyph_keys: &mut Vec<Option<GlyphKey>>,
-    glyph_positions: &mut Vec<(usize, usize)>,
-) {
-    glyph_buffers.clear();
-    glyph_keys.clear();
-    glyph_positions.clear();
+/// Shapes a chrome or card text run in its colour (see [`TextKey`]).
+fn shape_text_key(font_system: &mut FontSystem, metrics: Metrics, key: &TextKey) -> Buffer {
+    let [r, g, b] = key.color;
+    shape_text_buffer(
+        font_system,
+        metrics,
+        (
+            f32::from_bits(key.width_bits),
+            f32::from_bits(key.height_bits),
+        ),
+        &key.text,
+        &Attrs::new()
+            .family(Family::Monospace)
+            .color(Color::rgb(r, g, b)),
+    )
 }
 impl TerminalWindow {
     /// `session_socket` selects client mode: no local PTYs, models or control
@@ -1634,6 +1646,10 @@ impl TerminalWindow {
             image_vertex_buffer_capacity_bytes,
             card_pipeline,
             card_vertices: Vec::new(),
+            glyph_buffers: ShapedBufferCache::new(glyph_cache::GLYPH_CAPACITY),
+            text_buffers: ShapedBufferCache::new(glyph_cache::TEXT_CAPACITY),
+            glyph_positions: Vec::new(),
+            glyph_keys: Vec::new(),
             card_vertex_buffer,
             card_vertex_buffer_capacity_bytes,
         });
@@ -1717,7 +1733,6 @@ impl TerminalWindow {
             wakeup,
             wheel: WheelAccumulator::default(),
             selection_router: SelectionRouter::default(),
-            glyphs: GlyphCache::default(),
         })
     }
 
@@ -1734,9 +1749,6 @@ impl TerminalWindow {
                 return;
             }
             // The server adopts the window metrics and answers with layout and full frames.
-            for state in remote.panes.values_mut() {
-                state.glyphs.invalidate();
-            }
             remote.send(WindowMetrics::new(w, h, gpu.cell_width, gpu.cell_height).resize());
             return;
         }
@@ -1752,21 +1764,20 @@ impl TerminalWindow {
             gpu.cell_height,
         );
         for layout in layouts {
-            if let Some(pane) = self.panes.get_mut(&layout.pane) {
-                if !layout.hidden {
-                    pane.graphics.resize_model(
-                        &mut pane.model,
-                        layout.cols as usize,
-                        layout.rows as usize,
-                    );
-                    let _ = pane.pty.resize(
-                        layout.cols.min(u16::MAX as u32) as u16,
-                        layout.rows.min(u16::MAX as u32) as u16,
-                        layout.rect.width.min(u16::MAX as u32) as u16,
-                        layout.rect.height.min(u16::MAX as u32) as u16,
-                    );
-                }
-                pane.glyphs.invalidate();
+            if let Some(pane) = self.panes.get_mut(&layout.pane)
+                && !layout.hidden
+            {
+                pane.graphics.resize_model(
+                    &mut pane.model,
+                    layout.cols as usize,
+                    layout.rows as usize,
+                );
+                let _ = pane.pty.resize(
+                    layout.cols.min(u16::MAX as u32) as u16,
+                    layout.rows.min(u16::MAX as u32) as u16,
+                    layout.rect.width.min(u16::MAX as u32) as u16,
+                    layout.rect.height.min(u16::MAX as u32) as u16,
+                );
             }
         }
     }
@@ -2762,14 +2773,12 @@ impl TerminalWindow {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut rendered_any = false;
         let graphics_store = &self.graphics.store;
-        let (remote_view, mut remote_panes) = match self.remote.as_mut() {
-            Some(remote) => (Some(&remote.view), Some(&mut remote.panes)),
-            None => (None, None),
-        };
+        let remote_view = self.remote.as_ref().map(|remote| &remote.view);
         retain_live_textures(&mut gpu.textures, |pane, id| {
             pane_image(remote_view, graphics_store, pane, id).is_some()
         });
-        let panes = &mut self.panes;
+        let panes = &self.panes;
+        gpu.begin_text_frame();
         // `nulix up` draws command blocks as rounded cards (standalone window only).
         let up_cards = self.ui_mode == UiMode::Up && remote_view.is_none();
         let layout_cell_width = gpu.cell_width.ceil() as u32;
@@ -2777,32 +2786,31 @@ impl TerminalWindow {
         for layout in layouts.iter().filter(|layout| !layout.hidden) {
             // Both window modes reduce a pane to the same render input and the
             // same projected kitty placements, so the GPU code is shared.
-            let (input, glyphs, frame_images, block_cards, selected_block) =
-                if let (Some(view), Some(remote_panes)) = (remote_view, remote_panes.as_mut()) {
-                    let Some(pane_view) = view.pane(layout.pane.0) else {
-                        continue;
-                    };
-                    (
-                        pane_view.render_input(),
-                        &mut remote_panes.entry(layout.pane).or_default().glyphs,
-                        pane_view.placements.clone(),
-                        Vec::new(),
-                        None,
-                    )
-                } else {
-                    let Some(pane) = panes.get_mut(&layout.pane) else {
-                        continue;
-                    };
-                    let input = PaneRenderInput::from_model(&pane.model);
-                    let images = frame_placements(&pane.graphics.placements, &pane.model);
-                    let block_cards = if up_cards {
-                        nulix::block_cards(&pane.model, input.rows.len())
-                    } else {
-                        Vec::new()
-                    };
-                    let selected = pane.model.selected_block_id();
-                    (input, &mut pane.glyphs, images, block_cards, selected)
+            let (input, frame_images, block_cards, selected_block) = if let Some(view) = remote_view
+            {
+                let Some(pane_view) = view.pane(layout.pane.0) else {
+                    continue;
                 };
+                (
+                    pane_view.render_input(),
+                    pane_view.placements.clone(),
+                    Vec::new(),
+                    None,
+                )
+            } else {
+                let Some(pane) = panes.get(&layout.pane) else {
+                    continue;
+                };
+                let input = PaneRenderInput::from_model(&pane.model);
+                let images = frame_placements(&pane.graphics.placements, &pane.model);
+                let block_cards = if up_cards {
+                    nulix::block_cards(&pane.model, input.rows.len())
+                } else {
+                    Vec::new()
+                };
+                let selected = pane.model.selected_block_id();
+                (input, images, block_cards, selected)
+            };
             let palette = &nulix::config::current().palette;
             let cells = input.render_cells(palette);
             // The whole pane around the grid; equal to `layout.rect` in classic mode.
@@ -2833,26 +2841,18 @@ impl TerminalWindow {
                 };
                 for part in parts {
                     let columns = part.text.chars().count();
-                    let mut buffer = Buffer::new(
-                        &mut gpu.font_system,
-                        Metrics::new(gpu.font_size, gpu.cell_height),
-                    );
-                    buffer.set_size(
-                        Some(gpu.cell_width * (columns + 1) as f32),
-                        Some(gpu.cell_height),
-                    );
-                    let [r, g, b] = part.color;
-                    buffer.set_text(
+                    let key = TextKey::new(
                         &part.text,
-                        &Attrs::new()
-                            .family(Family::Monospace)
-                            .color(Color::rgb(r, g, b)),
-                        cosmic_text::Shaping::Advanced,
-                        None,
+                        part.color,
+                        gpu.cell_width * (columns + 1) as f32,
+                        gpu.cell_height,
                     );
-                    buffer.shape_until_scroll(&mut gpu.font_system, true);
+                    let font_system = &mut gpu.font_system;
+                    let metrics = Metrics::new(gpu.font_size, gpu.cell_height);
+                    gpu.text_buffers
+                        .ensure(&key, || shape_text_key(font_system, metrics, &key));
                     meta_buffers.push((
-                        buffer,
+                        key,
                         layout.rect.x as f32 + column as f32 * gpu.cell_width,
                         layout.rect.y as f32 + row as f32 * gpu.cell_height,
                         part.color,
@@ -2860,14 +2860,29 @@ impl TerminalWindow {
                     column += columns;
                 }
             }
+            // Placements arrive sorted by z and placement order, so the list
+            // position breaks z ties exactly like the placement insertion order.
+            let layer_items: Vec<_> = frame_images
+                .iter()
+                .enumerate()
+                .map(|(index, placement)| nulix::renderer::ImageLayerItem {
+                    z: placement.z,
+                    insertion: index as u64,
+                })
+                .collect();
+            let buckets = nulix::renderer::bucket_image_layers(&layer_items);
             gpu.vertices.clear();
             let width = gpu.config.width as f32;
             let height = gpu.config.height as f32;
+            // In up mode default-background cells leave the card fill (or the
+            // cleared pane background) visible. In classic mode the pane area
+            // still holds the surface clear colour (the palette background),
+            // so the rect would change nothing, unless an image drawn beneath
+            // the cell backgrounds must be covered.
+            let skip_default_background = up_cards || buckets.under_background.is_empty();
             for (row, line) in cells.iter().enumerate() {
                 for (column, cell) in line.iter().enumerate() {
-                    // In up mode default-background cells leave the card fill
-                    // (or the cleared pane background) visible.
-                    if up_cards && cell.background == palette.background {
+                    if skip_default_background && cell.background == palette.background {
                         continue;
                     }
                     push_overlay_rect(
@@ -2966,47 +2981,42 @@ impl TerminalWindow {
                     border,
                 );
             }
-            collect_glyph_positions(&cells, &mut glyphs.positions);
-            glyphs.keys.resize(glyphs.positions.len(), None);
-            for (index, &(row, column)) in glyphs.positions.iter().enumerate() {
+            // Glyphs are shaped once per distinct content and shared by
+            // every cell and pane that shows it (see `glyph_cache.rs`).
+            collect_glyph_positions(&cells, &mut gpu.glyph_positions);
+            gpu.glyph_keys.clear();
+            let metrics = Metrics::new(gpu.font_size, gpu.cell_height);
+            for &(row, column) in &gpu.glyph_positions {
                 let cell = cells[row][column];
-                if index == glyphs.buffers.len() {
-                    glyphs.buffers.push(Buffer::new(
-                        &mut gpu.font_system,
-                        Metrics::new(gpu.font_size, gpu.cell_height),
-                    ));
-                }
-                let width_cells = unicode_cell_width(cell.character).max(1);
-                let key = (cell.character, cell.foreground, cell.bold, width_cells);
-                if !glyph_key_requires_reshape(glyphs.keys[index], Some(key)) {
-                    continue;
-                }
-                let buffer = &mut glyphs.buffers[index];
-                buffer.set_size(
-                    Some(gpu.cell_width * width_cells as f32),
-                    Some(gpu.cell_height),
-                );
-                let attrs = Attrs::new()
-                    .family(Family::Monospace)
-                    .color(Color::rgb(
-                        cell.foreground[0],
-                        cell.foreground[1],
-                        cell.foreground[2],
-                    ))
-                    .weight(if cell.bold {
-                        Weight::BOLD
-                    } else {
-                        Weight::NORMAL
-                    });
-                let mut text = [0; 4];
-                buffer.set_text(
-                    cell.character.encode_utf8(&mut text),
-                    &attrs,
-                    cosmic_text::Shaping::Advanced,
-                    None,
-                );
-                buffer.shape_until_scroll(&mut gpu.font_system, true);
-                glyphs.keys[index] = Some(key);
+                let key = GlyphKey {
+                    character: cell.character,
+                    foreground: cell.foreground,
+                    bold: cell.bold,
+                    width_cells: unicode_cell_width(cell.character).max(1),
+                };
+                let font_system = &mut gpu.font_system;
+                let cell_width = gpu.cell_width;
+                let cell_height = gpu.cell_height;
+                gpu.glyph_buffers.ensure(&key, || {
+                    let [r, g, b] = key.foreground;
+                    let attrs = Attrs::new()
+                        .family(Family::Monospace)
+                        .color(Color::rgb(r, g, b))
+                        .weight(if key.bold {
+                            Weight::BOLD
+                        } else {
+                            Weight::NORMAL
+                        });
+                    let mut text = [0; 4];
+                    shape_text_buffer(
+                        font_system,
+                        metrics,
+                        (cell_width * key.width_cells as f32, cell_height),
+                        key.character.encode_utf8(&mut text),
+                        &attrs,
+                    )
+                });
+                gpu.glyph_keys.push(key);
             }
             gpu.viewport.update(
                 &gpu.queue,
@@ -3021,12 +3031,14 @@ impl TerminalWindow {
                 right: layout.rect.right().min(gpu.config.width) as i32,
                 bottom: layout.rect.bottom().min(gpu.config.height) as i32,
             };
-            let areas: Vec<_> = glyphs
-                .positions
+            let glyph_buffers = &gpu.glyph_buffers;
+            let text_buffers = &gpu.text_buffers;
+            let areas: Vec<_> = gpu
+                .glyph_positions
                 .iter()
-                .enumerate()
-                .map(|(index, &(row, column))| TextArea {
-                    buffer: &glyphs.buffers[index],
+                .zip(&gpu.glyph_keys)
+                .map(|(&(row, column), key)| TextArea {
+                    buffer: glyph_buffers.get(key).expect("glyph shaped this frame"),
                     left: layout.rect.x as f32 + column as f32 * gpu.cell_width,
                     top: layout.rect.y as f32 + row as f32 * gpu.cell_height,
                     scale: 1.0,
@@ -3037,8 +3049,8 @@ impl TerminalWindow {
                 .chain(
                     meta_buffers
                         .iter()
-                        .map(|(buffer, left, top, [r, g, b])| TextArea {
-                            buffer,
+                        .map(|(key, left, top, [r, g, b])| TextArea {
+                            buffer: text_buffers.get(key).expect("card meta shaped this frame"),
                             left: *left,
                             top: *top,
                             scale: 1.0,
@@ -3059,17 +3071,6 @@ impl TerminalWindow {
                     &mut gpu.swash_cache,
                 )
                 .map_err(|error| format!("could not prepare pane text: {error}"))?;
-            // Placements arrive sorted by z and placement order, so the list
-            // position breaks z ties exactly like the placement insertion order.
-            let layer_items: Vec<_> = frame_images
-                .iter()
-                .enumerate()
-                .map(|(index, placement)| nulix::renderer::ImageLayerItem {
-                    z: placement.z,
-                    insertion: index as u64,
-                })
-                .collect();
-            let buckets = nulix::renderer::bucket_image_layers(&layer_items);
             gpu.image_vertices.clear();
             let mut draw_layer = |indices: &[usize]| -> Vec<TextureDraw> {
                 let mut draws = Vec::new();
@@ -3956,15 +3957,8 @@ impl ApplicationHandler<UserEvent> for TerminalWindow {
                         gpu.logical_cell_height,
                         scale_factor,
                     );
-                    // Buffers retain their Metrics, so discard them when the device scale changes.
-                    for pane in self.panes.values_mut() {
-                        pane.glyphs.invalidate();
-                    }
-                    if let Some(remote) = self.remote.as_mut() {
-                        for state in remote.panes.values_mut() {
-                            state.glyphs.invalidate();
-                        }
-                    }
+                    // Shaped buffers keep their Metrics; the text caches drop
+                    // them at the next draw because the metrics changed.
                 }
                 if let Some(window) = self.window.as_ref() {
                     let size = window.inner_size();
@@ -4342,14 +4336,13 @@ fn start_control_server(proxy: EventLoopProxy<UserEvent>) -> Option<ControlServe
 mod tests {
     use super::UiMode;
     use super::{
-        BlockShortcut, ConsumedKeyPresses, GlyphKey, KeyEventKind, KeyboardFlags, PaneAction,
-        TabAction, TerminalKey, apply_title_event, block_marker_bounds, block_shortcut,
-        close_pane_lifecycle, create_tab_with, cwd_basename_title, encode_key_with_flags,
-        glyph_key_requires_reshape, invalidate_glyph_cache, key_from_winit, modifier_event_state,
-        overlay_vertex_range, pane_action, pane_cell_at, pane_exit_needs_redraw,
-        pane_is_in_active_tab, pane_tab_title, retain_live_textures, route_block_shortcut,
-        selection_target, tab_action_changes_geometry, tab_bar_height, tab_content_rect,
-        tab_index_at, tab_shortcut, tab_style,
+        BlockShortcut, ConsumedKeyPresses, KeyEventKind, KeyboardFlags, PaneAction, TabAction,
+        TerminalKey, apply_title_event, block_marker_bounds, block_shortcut, close_pane_lifecycle,
+        create_tab_with, cwd_basename_title, encode_key_with_flags, key_from_winit,
+        modifier_event_state, overlay_vertex_range, pane_action, pane_cell_at,
+        pane_exit_needs_redraw, pane_is_in_active_tab, pane_tab_title, retain_live_textures,
+        route_block_shortcut, selection_target, tab_action_changes_geometry, tab_bar_height,
+        tab_content_rect, tab_index_at, tab_shortcut, tab_style,
     };
     use nulix::keyboard::Modifiers;
     use nulix::layout::{PaneId, PaneLayout, Rect};
@@ -5088,29 +5081,5 @@ mod tests {
     #[test]
     fn block_marker_uses_the_first_cell_trailing_padding() {
         assert_eq!(block_marker_bounds(8.0, 20.0), [5.5, 2.0, 8.0, 18.0]);
-    }
-
-    #[test]
-    fn glyph_cache_reshapes_only_when_a_visible_glyph_changes() {
-        let key = Some(('日', [255, 0, 0], true, 2));
-        assert!(glyph_key_requires_reshape(None, key));
-        assert!(!glyph_key_requires_reshape(key, key));
-        assert!(glyph_key_requires_reshape(
-            key,
-            Some(('日', [0, 255, 0], true, 2))
-        ));
-    }
-
-    #[test]
-    fn scale_change_invalidates_buffers_with_stale_font_metrics() {
-        let mut buffers = vec![7_u8, 8];
-        let mut keys: Vec<Option<GlyphKey>> = vec![Some(('x', [1, 2, 3], false, 1))];
-        let mut positions = vec![(0, 0), (1, 0)];
-
-        invalidate_glyph_cache(&mut buffers, &mut keys, &mut positions);
-
-        assert!(buffers.is_empty());
-        assert!(keys.is_empty());
-        assert!(positions.is_empty());
     }
 }
